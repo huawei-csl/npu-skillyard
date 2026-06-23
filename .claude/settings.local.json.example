@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)",
+      "Bash(python -c ' *)",
+      "Bash(echo *)",
+      "Bash(chmod 700 *)",
+      "Bash(claude mcp *)",
+      "Bash(source /usr/local/Ascend/cann/set_env.sh*)",
+      "Bash(bisheng *)",
+      "Bash(msprof *)",
+      "mcp__npu-coding-mcp__get_constraints",
+      "mcp__npu-coding-mcp__get_cpp_intrinsic",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:huggingface.co)"
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "npu-skillyard",
+  "owner": {
+    "name": "Endri Bezati",
+    "email": "endri.bezati@gmail.com"
+  },
+  "description": "Torch-to-PTO kernel toolkit: skills, agents, and a bundled npu-coding MCP server for turning PyTorch algorithms into validated Ascend PTO-ISA kernels.",
+  "plugins": [
+    {
+      "name": "npu-skillyard",
+      "source": ".",
+      "description": "PyTorch algorithm -> Ascend PTO-ISA kernel generation pipeline (decompose, generate, validate, benchmark, optimize, fuse)."
+    }
+  ]
+}

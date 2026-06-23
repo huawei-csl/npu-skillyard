@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "npu-coding-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/huawei-csl/npu-coding-mcp.git@main",
+        "npu-coding-mcp",
+        "serve",
+        "--stdio"
+      ]
+    }
+  }
+}
