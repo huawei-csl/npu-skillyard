@@ -582,11 +582,15 @@ modify kernels, re-validate, or re-benchmark here.
    - `reports/` -- `benchmarks.json`, `bench_*.json`, and the graphs below
 2. **Graphs** (only if benchmarks exist) -- ensure `matplotlib` in the resolved python
    (`<py> -c "import matplotlib"` else `<py> -m pip install --quiet matplotlib`; if it
-   cannot be installed, SKIP graphs and note it -- do not fail). Write PNGs into
-   `reports/`: per-stage latency vs the contract sweep axis; stage latency breakdown at
-   the production size (dominant-stage bar); fused-vs-chain speedup (if fusion ran);
-   per-stage accuracy (rel-err vs tolerance). Label axes + units; plot only what the data
-   supports.
+   cannot be installed, SKIP graphs and note it -- do not fail). `benchmarks.json` is schema
+   `benchmarks_v1`: `sweep_axis:{dim D, values}` and `stages.<name>.{ "per_"+D:{ "<val>":
+   {mean,min,max,median,p95,stddev} ns }, slope_per_unit_ns, optimized?:{before_slope_ns,
+   after_slope_ns,speedup_x} }`. Write PNGs into `reports/` (ns -> us on axes): latency vs
+   sweep (line/stage); stage breakdown at the largest sweep value (dominant-stage bar);
+   `slope_per_unit_ns` per stage (bar); before/after slope for any `optimized` stage;
+   fused-vs-chain speedup (from the fusion result, if fusion ran); per-stage accuracy
+   (rel-err vs tolerance, from each stage's `accuracy`, NOT benchmarks.json). Label axes +
+   units; plot only what the data supports.
 3. **`reports/report.md`** -- the `shape_contract`, a per-stage table (result | rel-err vs
    tol | headroom% | repair_attempts | last_error), a benchmark table, the embedded graphs,
    fusion classification + speedups, optimization outcomes.

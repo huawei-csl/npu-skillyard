@@ -489,14 +489,26 @@ ${JSON.stringify(pipelineSummary)}
    - src/      : kernel_*.cpp, kernel_*.so, kernel_fused_*.{cpp,so}, validation_*.py, benchmark_*.py
    - reports/  : benchmarks.json and bench_*.json
    Update any path references you write so they point at the new locations.
-3. Graphs (only if make graphs is true AND benchmarks.json exists): ensure matplotlib in ${PY}
-   (\`${PY} -c "import matplotlib"\` else \`${PY} -m pip install --quiet matplotlib\`). If it cannot be
-   installed (e.g. no network), SKIP graphs and note it -- do NOT fail. Write PNGs into reports/:
-   - per-stage latency vs the contract sweep axis (line, one series per stage),
-   - stage latency breakdown at the production size (bar -- highlights the dominant stage),
-   - fused-vs-chain speedup across the sweep (only if fusion ran),
-   - per-stage accuracy: relative error vs tolerance (bar).
-   Label axes + units (ns/us); give each a title. Plot only what the data supports; skip the rest.
+3. Graphs (only if make graphs is true AND benchmarks.json exists). benchmarks.json is schema
+   "benchmarks_v1": { sweep_axis:{dim:D, values:[...]}, stages:{ <name>:{ "per_"+D : { "<val>":
+   {mean,min,max,median,p95,stddev} in ns }, slope_per_unit_ns, optimized?:{before_slope_ns,
+   after_slope_ns,speedup_x,kept} } } }. Read the per-stage series from the "per_<D>" map (the key
+   is literally "per_" + sweep_axis.dim). Ensure matplotlib in ${PY} (\`${PY} -c "import matplotlib"\`
+   else \`${PY} -m pip install --quiet matplotlib\`); if it cannot be installed (e.g. no network) SKIP
+   graphs and note it -- do NOT fail. Convert ns -> us for axes. Write PNGs into reports/ (plot only
+   what the data supports; skip any with no data):
+   - latency_vs_sweep.png  : x = sweep values D, y = mean latency (us), one line per stage.
+   - stage_breakdown.png   : bar of mean latency at the LARGEST sweep value, one bar per stage,
+                             sorted descending (highlights the dominant stage).
+   - slope_by_stage.png    : bar of slope_per_unit_ns per stage (the per-work-unit production cost).
+   - optimized_before_after.png : for stages with an "optimized" block, grouped before/after
+                             slope bars annotated with speedup_x (skip if no stage was optimized).
+   - fused_vs_chain.png    : ONLY if the summary's fusion has speedup_vs_chain -- fused vs chain per
+                             sweep point (data from the summary above, NOT benchmarks.json).
+   - accuracy_vs_tol.png   : per-stage relative error vs tolerance from the summary's
+                             stages[].accuracy {value,tolerance,headroom_pct} (NOT benchmarks.json);
+                             log-scale y if the errors span orders of magnitude.
+   Label axes + units and title each.
 4. reports/report.md: the shape_contract, a per-stage table (result | rel-err vs tol | headroom% |
    repair_attempts | last_error), a benchmark table, the graphs embedded via ![](relative.png),
    the fusion classification + speedups, and the optimization outcomes.
