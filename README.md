@@ -85,9 +85,14 @@ plugin):
 
 - CANN toolkit at `/usr/local/Ascend/cann` (source `set_env.sh`; `bisheng` compiler).
 - A Python interpreter with `torch_npu`.
-- `pto-isa` headers and a dir containing `kernel_common.h`.
+- `pto-isa` headers (auto-cloned by Preflight when a repo URL is set).
 - Real Ascend NPU hardware (the authoritative validation gate) + the msprof simulator
   (advisory pre-filter).
+
+> `kernel_common.h` (the single boilerplate header every kernel includes) is **bundled** in
+> the plugin at `include/kernel_common.h` -- Preflight drops it into the run dir, so you do
+> **not** need an external example include directory. It only pulls CANN + pto-isa headers,
+> both resolved above.
 
 **Paths are not hardcoded.** Both drivers start with a **Preflight** step that resolves
 each path in priority order (**explicit arg → env var → autodetect → documented default**)
@@ -97,7 +102,7 @@ and validates it before any work:
 |---|---|---|---|
 | python (torch_npu) | `pto_python` | `$PTO_PYTHON` | `./.venv/bin/python` |
 | pto-isa root | `pto_isa_root` | `$PTO_LIB_PATH` | `./third_party/pto-isa` |
-| include dir | `include_dir` | `$PTO_INCLUDE_DIR` | `./examples/megakda-pto/include` |
+| include dir (`kernel_common.h`) | `include_dir` | `$PTO_INCLUDE_DIR` | bundled `include/` (copied into the run dir) |
 | pto-isa clone URL | `pto_isa_repo` | `$PTO_ISA_REPO` | (none) |
 
 CANN, `bisheng`, `torch_npu`, and the NPU device **cannot be auto-installed** -- if any is
@@ -117,6 +122,7 @@ npu-skillyard/
     marketplace.json     # single-entry marketplace (source ".")
   skills/                # the four PTO skills
   agents/                # stage-pipeline, pto-stage-worker
+  include/               # bundled kernel_common.h (the only build header kernels include)
   .mcp.json              # bundled npu-coding-mcp (needs launch config)
   .claude/
     workflows/           # pto-pipeline-parallel.js (clone-or-copy, not installable)

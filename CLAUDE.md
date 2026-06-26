@@ -20,6 +20,8 @@ Components are at the **repo root** (plugin layout), not under `.claude/`:
 - `.claude-plugin/marketplace.json` — single-entry marketplace, `"source": "."`.
 - `skills/` — the four PTO skills.
 - `agents/` — `stage-pipeline` (installable orchestrator) and `pto-stage-worker`.
+- `include/kernel_common.h` — the single boilerplate header every kernel includes, **bundled**
+  so no external example include dir is needed (Preflight drops it into the run dir).
 - `.mcp.json` — bundles `npu-coding-mcp`, fetched+run from GitHub via `uvx --from git+…`
   (requires `uv` on the host; builds its doc indexes on first `serve`, no API key).
 - `.claude/workflows/pto-pipeline-parallel.js` — **not** an installable plugin component;
@@ -153,7 +155,8 @@ gaps.
 
 (Full detail: the C-rules in `pto-stage-kernel-generator-v2/SKILL.md`.)
 
-- `#include "kernel_common.h"` only — no other includes.
+- `#include "kernel_common.h"` only — no other includes (the header is bundled at
+  `include/kernel_common.h`; it pulls CANN + pto-isa headers and defines `AICORE`).
 - **ASCII-only** source and comments (bisheng rejects em-dashes, arrows, unicode).
 - GM access only through MTE (`TLOAD`/`TSTORE`) — never scalar-index a `__gm__` pointer.
 - UB budget: 192 KB (A2/A3) / 256 KB (A5); `static_assert` static UB layouts.

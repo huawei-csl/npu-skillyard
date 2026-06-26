@@ -28,8 +28,12 @@ auto-installed. `pto-isa` is just source, so clone it if absent.
 - **pto_isa_root:** arg `pto_isa_root` > `$PTO_LIB_PATH` > `./third_party/pto-isa`. If absent
   and a clone URL is available (arg `pto_isa_repo` > `$PTO_ISA_REPO`), `git clone` it there;
   if absent and no URL, STOP.
-- **include dir (`kernel_common.h`):** arg `include_dir` > `$PTO_INCLUDE_DIR` >
-  `./examples/megakda-pto/include`. Verify it exists and contains `kernel_common.h`; else STOP.
+- **include dir (`kernel_common.h`):** the plugin **ships** this header, so this never STOPs.
+  If arg `include_dir` / `$PTO_INCLUDE_DIR` already contains `kernel_common.h`, use it; otherwise
+  create `<output_dir>/include/` and put `kernel_common.h` there (copy the bundled
+  `$CLAUDE_PLUGIN_ROOT/include/kernel_common.h`, or this plugin's `include/kernel_common.h`), then set
+  `include_dir` to that dir. The header only needs CANN (`acl`/`rt_ffts`) and pto-isa (`pto-inst.hpp`)
+  on the `-I` path -- both already validated above -- so it is never the thing that's missing.
 
 Carry the resolved ABSOLUTE paths through every later phase. If preflight cannot satisfy a
 prerequisite, return a short "environment not ready" message listing what is missing rather

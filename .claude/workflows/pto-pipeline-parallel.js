@@ -133,9 +133,33 @@ project root as cwd. Resolve each path in priority order: explicit hint > enviro
    If the resolved dir is ABSENT and a clone URL is available (hint=${PTO_ISA_REPO ?? 'none'}, else
    $PTO_ISA_REPO): git clone <url> <resolved_path> and set cloned_pto_isa=true. If absent and NO URL,
    add 'pto-isa' to \`missing\`. Verify the dir exists afterward.
-4. include dir (must contain kernel_common.h): hint=${INCLUDE_HINT ?? 'none'}, else $PTO_INCLUDE_DIR,
-   else ./examples/megakda-pto/include. Verify it exists and contains kernel_common.h; else add
-   'include_dir' to \`missing\`.
+4. include dir (must contain kernel_common.h -- the plugin SHIPS this header, so this NEVER STOPs):
+   if hint=${INCLUDE_HINT ?? 'none'} or $PTO_INCLUDE_DIR points to a dir that already contains
+   kernel_common.h, use it verbatim. OTHERWISE create <output_dir>/include/ and put kernel_common.h
+   there: copy it from the bundled plugin header ($CLAUDE_PLUGIN_ROOT/include/kernel_common.h if that
+   env var is set), else write this exact content to <output_dir>/include/kernel_common.h --
+   ----------------------------------------------------------------------
+   #pragma once
+   #ifndef __CPU_SIM
+   #include "acl/acl.h"
+   #include <runtime/runtime/rt_ffts.h>
+   #endif
+   #include <cmath>
+   #include <cstdint>
+   #if defined(__CCE_AICORE__)
+   #include <pto/pto-inst.hpp>
+   using namespace pto;
+   #elif defined(__CPU_SIM)
+   #include <pto/pto-inst.hpp>
+   using namespace pto;
+   #endif
+   #ifndef AICORE
+   #define AICORE [aicore]
+   #endif
+   ----------------------------------------------------------------------
+   Set include_dir to that absolute dir. kernel_common.h only needs CANN (acl/rt_ffts, resolved from
+   $ASCEND_HOME_PATH) and pto-isa (pto-inst.hpp, resolved from pto_isa_root) on the -I path, both of
+   which steps 1 and 3 already validated -- so include_dir is never in \`missing\`.
 
 Return ABSOLUTE resolved paths in \`resolved\` {ascend_home, bisheng, python, pto_isa_root, include_dir},
 the \`missing\` list, cloned_pto_isa, and ok = (missing is empty). Your final message IS the structured
