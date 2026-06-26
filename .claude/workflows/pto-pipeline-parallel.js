@@ -24,7 +24,7 @@ export const meta = {
 // args.include_dir (optional) PATH HINT: dir holding kernel_common.h. Resolved by Preflight
 //                  (hint > $PTO_INCLUDE_DIR > ./examples/megakda-pto/include).
 // args.pto_isa_repo (optional) git URL to clone pto-isa from when pto_isa_root is absent
-//                  (else $PTO_ISA_REPO). If unset and the path is missing, Preflight STOPs.
+//                  (priority: arg > $PTO_ISA_REPO > default gitcode.com/cann/pto-isa).
 // args.devices    (optional) list of NPU device indices to spread workers across (default ["0"])
 // args.optimize   (optional) run the Optimize phase (pto-kernel-optimizer on the dominant
 //                  stages) after Benchmark; default true. Set false to ship the correct
@@ -45,6 +45,8 @@ const PY_HINT = ARGS?.pto_python ?? null
 const PTO_ISA_HINT = ARGS?.pto_isa_root ?? null
 const INCLUDE_HINT = ARGS?.include_dir ?? null
 const PTO_ISA_REPO = ARGS?.pto_isa_repo ?? null
+// Canonical public pto-isa source (the bundled npu-coding-mcp uses the same upstream).
+const PTO_ISA_REPO_DEFAULT = 'https://gitcode.com/cann/pto-isa.git'
 const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
@@ -130,9 +132,10 @@ project root as cwd. Resolve each path in priority order: explicit hint > enviro
    <py> -c "import torch, torch_npu; print(torch.npu.device_count())". If it errors or prints 0, add
    'torch_npu python' (and/or 'npu device') to \`missing\`.
 3. pto-isa root: hint=${PTO_ISA_HINT ?? 'none'}, else $PTO_LIB_PATH, else ./third_party/pto-isa.
-   If the resolved dir is ABSENT and a clone URL is available (hint=${PTO_ISA_REPO ?? 'none'}, else
-   $PTO_ISA_REPO): git clone <url> <resolved_path> and set cloned_pto_isa=true. If absent and NO URL,
-   add 'pto-isa' to \`missing\`. Verify the dir exists afterward.
+   If the resolved dir is ABSENT, clone it: URL = hint ${PTO_ISA_REPO ?? '(none)'} > $PTO_ISA_REPO >
+   default ${PTO_ISA_REPO_DEFAULT}. Run git clone <url> <resolved_path> and set cloned_pto_isa=true;
+   verify pto-inst.hpp exists under <resolved_path> afterward. Only add 'pto-isa' to \`missing\` if the
+   clone itself fails (e.g. no network).
 4. include dir (must contain kernel_common.h -- the plugin SHIPS this header, so this NEVER STOPs):
    if hint=${INCLUDE_HINT ?? 'none'} or $PTO_INCLUDE_DIR points to a dir that already contains
    kernel_common.h, use it verbatim. OTHERWISE create <output_dir>/include/ and put kernel_common.h

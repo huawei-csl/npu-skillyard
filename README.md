@@ -85,7 +85,7 @@ plugin):
 
 - CANN toolkit at `/usr/local/Ascend/cann` (source `set_env.sh`; `bisheng` compiler).
 - A Python interpreter with `torch_npu`.
-- `pto-isa` headers (auto-cloned by Preflight when a repo URL is set).
+- `pto-isa` headers (auto-cloned by Preflight from `gitcode.com/cann/pto-isa` by default).
 - Real Ascend NPU hardware (the authoritative validation gate) + the msprof simulator
   (advisory pre-filter).
 
@@ -103,12 +103,12 @@ and validates it before any work:
 | python (torch_npu) | `pto_python` | `$PTO_PYTHON` | `./.venv/bin/python` |
 | pto-isa root | `pto_isa_root` | `$PTO_LIB_PATH` | `./third_party/pto-isa` |
 | include dir (`kernel_common.h`) | `include_dir` | `$PTO_INCLUDE_DIR` | bundled `include/` (copied into the run dir) |
-| pto-isa clone URL | `pto_isa_repo` | `$PTO_ISA_REPO` | (none) |
+| pto-isa clone URL | `pto_isa_repo` | `$PTO_ISA_REPO` | `https://gitcode.com/cann/pto-isa.git` |
 
 CANN, `bisheng`, `torch_npu`, and the NPU device **cannot be auto-installed** -- if any is
 missing, Preflight STOPs early with a clear message instead of failing mid-run. `pto-isa` is
-just source: if its path is absent and a `pto_isa_repo` / `$PTO_ISA_REPO` URL is set,
-Preflight clones it automatically.
+just source: if its path is absent, Preflight clones it automatically (from
+`pto_isa_repo` > `$PTO_ISA_REPO` > the default `gitcode.com/cann/pto-isa`).
 
 See [CLAUDE.md](./CLAUDE.md) for the architecture, the phase model, and the non-negotiable
 rules (provenance boundary, real-NPU gate, CPU-fp64 reference, coverage gate).

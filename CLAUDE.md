@@ -71,8 +71,8 @@ agents and the workflow — learn it once:
 Both drivers begin with a **Preflight** step that resolves every path in priority order
 (**explicit arg → env var → autodetect → documented default**) and validates it before any
 work. Un-provisionable prerequisites (CANN, `bisheng`, `torch_npu`, the NPU device) are
-detected and **STOP the run** with guidance — never auto-installed; `pto-isa` is cloned if
-absent and a `pto_isa_repo` / `$PTO_ISA_REPO` URL is set. This keeps Phase 0 pure (contract
+detected and **STOP the run** with guidance — never auto-installed; `pto-isa` is auto-cloned
+if absent (from `pto_isa_repo` > `$PTO_ISA_REPO` > default `gitcode.com/cann/pto-isa`). This keeps Phase 0 pure (contract
 only) and turns "environment not ready" into an early, actionable failure. Env vars:
 `$PTO_PYTHON`, `$PTO_LIB_PATH` (pto-isa), `$PTO_INCLUDE_DIR`, `$PTO_ISA_REPO`.
 

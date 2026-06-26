@@ -25,9 +25,9 @@ auto-installed. `pto-isa` is just source, so clone it if absent.
 - **python (torch_npu):** arg `pto_python` > `$PTO_PYTHON` > `./.venv/bin/python`. Verify it
   imports `torch_npu` and sees an NPU (`<py> -c "import torch, torch_npu; print(torch.npu.device_count())"`).
   Do NOT create a venv here -- if it fails, STOP and report what is missing.
-- **pto_isa_root:** arg `pto_isa_root` > `$PTO_LIB_PATH` > `./third_party/pto-isa`. If absent
-  and a clone URL is available (arg `pto_isa_repo` > `$PTO_ISA_REPO`), `git clone` it there;
-  if absent and no URL, STOP.
+- **pto_isa_root:** arg `pto_isa_root` > `$PTO_LIB_PATH` > `./third_party/pto-isa`. If absent,
+  `git clone` it there from arg `pto_isa_repo` > `$PTO_ISA_REPO` > default
+  `https://gitcode.com/cann/pto-isa.git`; only STOP if the clone itself fails (e.g. no network).
 - **include dir (`kernel_common.h`):** the plugin **ships** this header, so this never STOPs.
   If arg `include_dir` / `$PTO_INCLUDE_DIR` already contains `kernel_common.h`, use it; otherwise
   create `<output_dir>/include/` and put `kernel_common.h` there (copy the bundled
