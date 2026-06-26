@@ -121,6 +121,29 @@ STOPs if the result can't see the NPU.
 See [CLAUDE.md](./CLAUDE.md) for the architecture, the phase model, and the non-negotiable
 rules (provenance boundary, real-NPU gate, CPU-fp64 reference, coverage gate).
 
+## Run output
+
+A final **Report** phase organizes the run directory and writes a human report (not just
+JSON). It always runs -- a partial or failed run still gets a README explaining the blockers
+and what was tried:
+
+```
+<output_dir>/
+  README.md            # narrative: what was achieved, blockers + tries, how to reproduce
+  pipeline_results.json
+  ref/                 # inputs: the source algorithm, stage_plan.json, spec_*.json
+  src/                 # generated: kernel_*.cpp/.so, kernel_fused_*, validation_*/benchmark_*.py
+  reports/
+    report.md          # per-stage accuracy + benchmark tables, embedded graphs
+    benchmarks.json    # raw aggregated benchmark data
+    *.png              # latency-vs-sweep, dominant-stage breakdown, fused-vs-chain, accuracy
+  .tmp/                # scratch (per-stage timestamps + results)
+```
+
+Graphs are plotted with `matplotlib` (pip-installed into the resolved python; if unavailable
+the run still completes with a graph-less report). Disable with `report: false` /
+`make_graphs: false`.
+
 ## Repository layout
 
 ```

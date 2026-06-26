@@ -568,11 +568,38 @@ Steps:
    chain and record the outcome -- do NOT discard the passing per-stage kernels and
    do NOT fail the pipeline.
 
+### Phase 8: Report & Packaging (always runs last)
+
+After every other phase, organize the run directory and write a human report --
+even on a partial/failed run (the blockers + what was tried are the point). Do NOT
+modify kernels, re-validate, or re-benchmark here.
+
+1. **Structure the run dir** -- create `ref/`, `src/`, `reports/` under the output
+   dir and MOVE files into them (leave `.tmp/` where it is):
+   - `ref/` -- a COPY of the source algorithm, plus `stage_plan.json` and `spec_*.json`
+   - `src/` -- `kernel_*.cpp`, `kernel_*.so`, `kernel_fused_*.{cpp,so}`,
+     `validation_*.py`, `benchmark_*.py`
+   - `reports/` -- `benchmarks.json`, `bench_*.json`, and the graphs below
+2. **Graphs** (only if benchmarks exist) -- ensure `matplotlib` in the resolved python
+   (`<py> -c "import matplotlib"` else `<py> -m pip install --quiet matplotlib`; if it
+   cannot be installed, SKIP graphs and note it -- do not fail). Write PNGs into
+   `reports/`: per-stage latency vs the contract sweep axis; stage latency breakdown at
+   the production size (dominant-stage bar); fused-vs-chain speedup (if fusion ran);
+   per-stage accuracy (rel-err vs tolerance). Label axes + units; plot only what the data
+   supports.
+3. **`reports/report.md`** -- the `shape_contract`, a per-stage table (result | rel-err vs
+   tol | headroom% | repair_attempts | last_error), a benchmark table, the embedded graphs,
+   fusion classification + speedups, optimization outcomes.
+4. **`<output_dir>/README.md`** -- the top-level narrative a human reads first: what the run
+   ACHIEVED, the BLOCKERS and what was TRIED (per failed stage: repair_attempts +
+   last_error; locked-dim contract amendments; sim advisory-mismatches; optimizer
+   markers/floors; fusion fallbacks), how to REPRODUCE, and the final directory layout.
+
 ## Output
 
-Write a `pipeline_results.json` summary. When the all-pass gate is met, each
-stage also carries its Phase 6 benchmark numbers; otherwise `benchmarking` is
-recorded as skipped:
+Write a `pipeline_results.json` summary (alongside the Phase 8 README). When the
+all-pass gate is met, each stage also carries its Phase 6 benchmark numbers;
+otherwise `benchmarking` is recorded as skipped:
 ```json
 {
   "algorithm": "<name>",

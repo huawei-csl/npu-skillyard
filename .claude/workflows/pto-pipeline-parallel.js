@@ -9,6 +9,7 @@ export const meta = {
     { title: 'Benchmark' },
     { title: 'Optimize' },
     { title: 'Fuse' },
+    { title: 'Report' },
   ],
 }
 
@@ -37,6 +38,10 @@ export const meta = {
 //                  stages) after Benchmark; default true. Set false to ship the correct
 //                  baseline chain without the device-in-the-loop optimization campaign.
 // args.optimize_top_n (optional) how many dominant stages to optimize (default 2)
+// args.report     (optional, default true) final Report phase: organize the run dir into
+//                  ref/ src/ reports/, plot benchmark graphs, and write a README + report.md.
+// args.make_graphs (optional, default true) plot PNG graphs from the benchmarks (needs
+//                  matplotlib; pip-installed into the resolved python, else graphs are skipped).
 // args may arrive as a parsed object or as a JSON string depending on how the
 // workflow is invoked; accept both.
 const ARGS = (typeof args === 'string') ? JSON.parse(args) : (args ?? {})
@@ -61,6 +66,8 @@ const TORCH_NPU_VERSION = ARGS?.torch_npu_version ?? null
 const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
+const REPORT = ARGS?.report !== false                // default ON; organize run dir + write report
+const MAKE_GRAPHS = ARGS?.make_graphs !== false      // default ON; plot benchmark graphs (needs matplotlib)
 const PLAN_PATH = `${OUT}/stage_plan.json`
 
 const STAGE_SCHEMA = {
@@ -120,6 +127,20 @@ const PREFLIGHT_SCHEMA = {
     missing: { type: 'array', items: { type: 'string' } },
     cloned_pto_isa: { type: ['boolean', 'null'] },
     bootstrapped_venv: { type: ['boolean', 'null'] },
+    note: { type: ['string', 'null'] },
+  },
+}
+
+const REPORT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['ok'],
+  properties: {
+    ok: { type: 'boolean' },
+    structure: { type: ['object', 'null'] },
+    graphs: { type: 'array', items: { type: 'string' } },
+    readme: { type: ['string', 'null'] },
+    report: { type: ['string', 'null'] },
     note: { type: ['string', 'null'] },
   },
 }
@@ -428,9 +449,9 @@ Return the fusion result object: {result, classification, launch_count:{target,a
 }
 
 // ---------------------------------------------------------------------------
-// Assemble pipeline_results-style summary (the orchestrator can persist it)
+// Assemble the machine summary (also handed to the Report phase, and persisted)
 // ---------------------------------------------------------------------------
-return {
+const pipelineSummary = {
   algorithm: SRC,
   platform: PLATFORM,
   output_dir: OUT,
@@ -441,3 +462,63 @@ return {
   optimization: optimization ?? (OPTIMIZE ? (allPass && benchmark ? 'attempted' : 'skipped (gate not met)') : 'skipped (disabled)'),
   fusion: fusion ?? (allPass ? 'skipped (no benchmark baseline)' : 'skipped (not all stages passed)'),
 }
+
+// ---------------------------------------------------------------------------
+// Phase: Report -- always runs last. Organize the flat run dir into ref/ src/
+// reports/, plot benchmark graphs, and write a human README + report.md. A
+// failed/partial run still gets a report (blockers + what was tried).
+// ---------------------------------------------------------------------------
+phase('Report')
+
+let report = null
+if (REPORT) {
+  const reportPrompt = `You are the REPORT & PACKAGING step (the FINAL phase) of the PTO pipeline. Do NOT
+modify kernels, re-run validation, or re-benchmark. Organize the run directory, generate benchmark
+graphs, and write a human-readable report from the data that already exists.
+
+- output_dir: ${OUT}
+- source algorithm: ${SRC}
+- python (for plotting): ${PY}
+- make graphs: ${MAKE_GRAPHS}
+- Pipeline summary (AUTHORITATIVE -- use these numbers, do not re-derive):
+${JSON.stringify(pipelineSummary)}
+
+1. Create subdirs under output_dir: ref/, src/, reports/.
+2. Organize files (MOVE, do not duplicate; leave .tmp/ where it is):
+   - ref/      : a COPY of the source algorithm (${SRC}), plus stage_plan.json and spec_*.json
+   - src/      : kernel_*.cpp, kernel_*.so, kernel_fused_*.{cpp,so}, validation_*.py, benchmark_*.py
+   - reports/  : benchmarks.json and bench_*.json
+   Update any path references you write so they point at the new locations.
+3. Graphs (only if make graphs is true AND benchmarks.json exists): ensure matplotlib in ${PY}
+   (\`${PY} -c "import matplotlib"\` else \`${PY} -m pip install --quiet matplotlib\`). If it cannot be
+   installed (e.g. no network), SKIP graphs and note it -- do NOT fail. Write PNGs into reports/:
+   - per-stage latency vs the contract sweep axis (line, one series per stage),
+   - stage latency breakdown at the production size (bar -- highlights the dominant stage),
+   - fused-vs-chain speedup across the sweep (only if fusion ran),
+   - per-stage accuracy: relative error vs tolerance (bar).
+   Label axes + units (ns/us); give each a title. Plot only what the data supports; skip the rest.
+4. reports/report.md: the shape_contract, a per-stage table (result | rel-err vs tol | headroom% |
+   repair_attempts | last_error), a benchmark table, the graphs embedded via ![](relative.png),
+   the fusion classification + speedups, and the optimization outcomes.
+5. output_dir/README.md: a top-level NARRATIVE -- what the run ACHIEVED (stages passed, the headline
+   benchmark, fusion result), the BLOCKERS and what was TRIED (per failed stage: repair_attempts +
+   last_error; any locked-dim contract amendments; sim advisory-mismatches; optimizer markers/floors;
+   fallbacks taken in fusion), how to REPRODUCE (the validate/benchmark commands), and the final
+   directory layout (ref/ src/ reports/). Be honest about partial or failed runs -- this is the
+   primary artifact a human reads first.
+
+Return ok, the created structure, the list of graph PNGs, and the README + report.md paths.
+Your final message IS the structured result -- no prose.`
+
+  report = await agent(reportPrompt, {
+    label: 'report',
+    phase: 'Report',
+    schema: REPORT_SCHEMA,
+    agentType: 'general-purpose',
+  })
+  if (report) log(`Report written -- ${OUT}/README.md (${(report.graphs ?? []).length} graph(s))`)
+} else {
+  log('Skipping report (args.report = false).')
+}
+
+return { ...pipelineSummary, report: report ?? (REPORT ? 'attempted' : 'skipped (disabled)') }

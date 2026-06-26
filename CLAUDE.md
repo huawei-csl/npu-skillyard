@@ -56,6 +56,10 @@ agents and the workflow — learn it once:
   at the contract's production sweep.
 - **Phase 6.5 — Optimize** (workflow only). Drive dominant stages toward their strong form.
 - **Phase 7 — Fusion.** Stitch validated per-stage kernels into one deliverable.
+- **Phase 8 — Report & Packaging.** Always runs last: organize the run dir into
+  `ref/` (inputs) + `src/` (generated kernels/harnesses) + `reports/` (graphs + `report.md`),
+  plot benchmark graphs (matplotlib), and write a top-level `README.md` narrating what was
+  achieved, the blockers, and what was tried. A failed/partial run still gets a report.
 
 ### Two ways to drive it
 
@@ -66,7 +70,7 @@ agents and the workflow — learn it once:
    decompose once, fan out one **`pto-stage-worker`** agent per stage in parallel, then
    benchmark *serially* (device timing must not contend), optimize, fuse. Invoke with
    `args: {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?,
-   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?}`.
+   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?, report?}`.
 
 Both drivers begin with a **Preflight** step that resolves every path in priority order
 (**explicit arg → env var → autodetect → documented default**) and validates it before any
