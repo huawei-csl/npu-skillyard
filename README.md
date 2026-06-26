@@ -115,8 +115,9 @@ CANN release -- a wrong pin can silently produce wrong numerics, so the default 
 your own). To provision it automatically, pass `bootstrap_venv: true`: when no working
 torch_npu python is found, Preflight creates a venv (`bootstrap_venv_path`, default
 `./.venv-npu`) and installs `torch`/`torch_npu` matched to the detected CANN version
-(`torch_version` / `torch_npu_version` override the pins), then **re-validates** and still
-STOPs if the result can't see the NPU.
+(`torch_version` / `torch_npu_version` override the pins) plus `matplotlib` (so the Report
+graphs work out of the box), then **re-validates** and still STOPs if the result can't see
+the NPU.
 
 See [CLAUDE.md](./CLAUDE.md) for the architecture, the phase model, and the non-negotiable
 rules (provenance boundary, real-NPU gate, CPU-fp64 reference, coverage gate).

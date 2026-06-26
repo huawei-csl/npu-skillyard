@@ -174,7 +174,9 @@ project root as cwd. Resolve each path in priority order: explicit hint > enviro
           (torch=${TORCH_VERSION ?? 'derive'}, torch_npu=${TORCH_NPU_VERSION ?? 'derive'}); otherwise
           select the torch_npu release that targets the detected CANN version from the official Ascend
           pytorch install table. If you CANNOT determine a safe CANN<->torch_npu match, do NOT guess --
-          add 'torch_npu version (unknown CANN match)' to \`missing\` and STOP.
+          add 'torch_npu version (unknown CANN match)' to \`missing\` and STOP. ALSO pip install
+          matplotlib into the same venv (the Report phase needs it for graphs) -- a matplotlib failure
+          is non-fatal, do not STOP on it.
        d. RE-VALIDATE with the SAME import+device_count check on ${BOOTSTRAP_VENV_PATH}/bin/python.
           Accept it (set resolved.python, set bootstrapped_venv=true) ONLY if it now prints > 0;
           otherwise add 'torch_npu python (bootstrap failed)' to \`missing\`. Never proceed on a
