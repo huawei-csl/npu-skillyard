@@ -84,10 +84,26 @@ The pipeline runs against a **host project** that supplies the build environment
 plugin):
 
 - CANN toolkit at `/usr/local/Ascend/cann` (source `set_env.sh`; `bisheng` compiler).
-- A Python venv with `torch_npu` (`.venv/bin/python`).
-- `third_party/pto-isa` and an example include dir (e.g. `examples/megakda-pto/include`).
+- A Python interpreter with `torch_npu`.
+- `pto-isa` headers and a dir containing `kernel_common.h`.
 - Real Ascend NPU hardware (the authoritative validation gate) + the msprof simulator
   (advisory pre-filter).
+
+**Paths are not hardcoded.** Both drivers start with a **Preflight** step that resolves
+each path in priority order (**explicit arg → env var → autodetect → documented default**)
+and validates it before any work:
+
+| Path | arg | env var | default |
+|---|---|---|---|
+| python (torch_npu) | `pto_python` | `$PTO_PYTHON` | `./.venv/bin/python` |
+| pto-isa root | `pto_isa_root` | `$PTO_LIB_PATH` | `./third_party/pto-isa` |
+| include dir | `include_dir` | `$PTO_INCLUDE_DIR` | `./examples/megakda-pto/include` |
+| pto-isa clone URL | `pto_isa_repo` | `$PTO_ISA_REPO` | (none) |
+
+CANN, `bisheng`, `torch_npu`, and the NPU device **cannot be auto-installed** -- if any is
+missing, Preflight STOPs early with a clear message instead of failing mid-run. `pto-isa` is
+just source: if its path is absent and a `pto_isa_repo` / `$PTO_ISA_REPO` URL is set,
+Preflight clones it automatically.
 
 See [CLAUDE.md](./CLAUDE.md) for the architecture, the phase model, and the non-negotiable
 rules (provenance boundary, real-NPU gate, CPU-fp64 reference, coverage gate).

@@ -10,16 +10,30 @@ You are a PTO kernel pipeline agent. Given a PyTorch algorithm source file, you
 decompose it into stages, generate validation artifacts, generate kernels, and
 validate them against the reference model using the Ascend simulator.
 
-## Setup
+## Setup (Preflight -- resolve + validate the environment ONCE, before Phase 0)
 
-Resolve these once at the start and reuse them throughout:
+Nothing below is hardcoded. Resolve each path in priority order
+**explicit arg > environment variable > autodetect > documented default**, then VERIFY
+it before starting Phase 0. Un-provisionable prerequisites (CANN, `bisheng`, `torch_npu`,
+the NPU device) are detected and **STOP the run with guidance** -- they cannot be
+auto-installed. `pto-isa` is just source, so clone it if absent.
 
-- Source the CANN environment first: `source /usr/local/Ascend/cann/set_env.sh`.
-  This sets `$ASCEND_HOME_PATH` (default: `cann-9.0.0`). Resolve `bisheng` and all
-  toolkit includes from `$ASCEND_HOME_PATH` -- never hardcode a CANN version path.
-- `pto_isa_root` = `third_party/pto-isa` (or `$PTO_LIB_PATH` if set).
-- example include dir = `examples/megakda-pto/include`.
-- python interpreter = the project venv python (`.venv/bin/python`) with `torch_npu` available.
+- **CANN (cannot auto-install):** `source /usr/local/Ascend/cann/set_env.sh`. Verify
+  `$ASCEND_HOME_PATH` is set, `bisheng` resolves from it, and the simulator lib dir exists
+  (`$ASCEND_HOME_PATH/tools/simulator/Ascend910B1/lib`). Resolve `bisheng` and all toolkit
+  includes from `$ASCEND_HOME_PATH` -- never hardcode a CANN version path. If missing, STOP.
+- **python (torch_npu):** arg `pto_python` > `$PTO_PYTHON` > `./.venv/bin/python`. Verify it
+  imports `torch_npu` and sees an NPU (`<py> -c "import torch, torch_npu; print(torch.npu.device_count())"`).
+  Do NOT create a venv here -- if it fails, STOP and report what is missing.
+- **pto_isa_root:** arg `pto_isa_root` > `$PTO_LIB_PATH` > `./third_party/pto-isa`. If absent
+  and a clone URL is available (arg `pto_isa_repo` > `$PTO_ISA_REPO`), `git clone` it there;
+  if absent and no URL, STOP.
+- **include dir (`kernel_common.h`):** arg `include_dir` > `$PTO_INCLUDE_DIR` >
+  `./examples/megakda-pto/include`. Verify it exists and contains `kernel_common.h`; else STOP.
+
+Carry the resolved ABSOLUTE paths through every later phase. If preflight cannot satisfy a
+prerequisite, return a short "environment not ready" message listing what is missing rather
+than entering Phase 0.
 
 ## Skills
 

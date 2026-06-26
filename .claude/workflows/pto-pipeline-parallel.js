@@ -1,8 +1,9 @@
 export const meta = {
   name: 'pto-pipeline-parallel',
   description: 'Parallel PTO kernel pipeline: decompose once, fan out per-stage kernel gen + compile + validate (one pto-stage-worker per stage), then benchmark serially and fuse. The parallel variant of the stage-pipeline agent; leaves stage-pipeline untouched.',
-  whenToUse: 'When a stage_plan has multiple independent stages and you want per-stage kernel generation to run concurrently instead of one-at-a-time. Pass {source, output_dir, platform?, contract?, pto_python?, devices?} as args.',
+  whenToUse: 'When a stage_plan has multiple independent stages and you want per-stage kernel generation to run concurrently instead of one-at-a-time. Pass {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?, include_dir?, pto_isa_repo?, devices?} as args.',
   phases: [
+    { title: 'Preflight' },
     { title: 'Decompose' },
     { title: 'Stages' },
     { title: 'Benchmark' },
@@ -16,7 +17,14 @@ export const meta = {
 // args.output_dir (required) run directory; stage_plan.json + all artifacts land here
 // args.platform   (optional) target platform tag, e.g. "a2a3"
 // args.contract   (optional) a pre-agreed shape_contract object; if given, Phase 0 uses it verbatim
-// args.pto_python (optional) venv python with torch_npu (default ".venv/bin/python")
+// args.pto_python (optional) PATH HINT: venv python with torch_npu. Resolved by Preflight
+//                  (hint > $PTO_PYTHON > ./.venv/bin/python). Never auto-installed.
+// args.pto_isa_root (optional) PATH HINT: pto-isa root. Resolved by Preflight
+//                  (hint > $PTO_LIB_PATH > ./third_party/pto-isa); cloned if absent (see pto_isa_repo).
+// args.include_dir (optional) PATH HINT: dir holding kernel_common.h. Resolved by Preflight
+//                  (hint > $PTO_INCLUDE_DIR > ./examples/megakda-pto/include).
+// args.pto_isa_repo (optional) git URL to clone pto-isa from when pto_isa_root is absent
+//                  (else $PTO_ISA_REPO). If unset and the path is missing, Preflight STOPs.
 // args.devices    (optional) list of NPU device indices to spread workers across (default ["0"])
 // args.optimize   (optional) run the Optimize phase (pto-kernel-optimizer on the dominant
 //                  stages) after Benchmark; default true. Set false to ship the correct
@@ -31,9 +39,12 @@ if (!SRC || !OUT) {
   throw new Error('pto-pipeline-parallel requires args.source and args.output_dir')
 }
 const PLATFORM = ARGS?.platform ?? 'unspecified'
-const PY = ARGS?.pto_python ?? '.venv/bin/python'
-const PTO_ISA = 'third_party/pto-isa'
-const INCLUDE = 'examples/megakda-pto/include'
+// Path HINTS only -- the Preflight phase resolves these to absolute, validated paths
+// (priority: explicit arg > env var > autodetect > documented default).
+const PY_HINT = ARGS?.pto_python ?? null
+const PTO_ISA_HINT = ARGS?.pto_isa_root ?? null
+const INCLUDE_HINT = ARGS?.include_dir ?? null
+const PTO_ISA_REPO = ARGS?.pto_isa_repo ?? null
 const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
@@ -76,6 +87,81 @@ const DECOMPOSE_SCHEMA = {
     note: { type: ['string', 'null'] },
   },
 }
+
+const PREFLIGHT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['ok', 'resolved', 'missing'],
+  properties: {
+    ok: { type: 'boolean' },
+    resolved: {
+      type: 'object',
+      properties: {
+        ascend_home: { type: ['string', 'null'] },
+        bisheng: { type: ['string', 'null'] },
+        python: { type: ['string', 'null'] },
+        pto_isa_root: { type: ['string', 'null'] },
+        include_dir: { type: ['string', 'null'] },
+      },
+    },
+    missing: { type: 'array', items: { type: 'string' } },
+    cloned_pto_isa: { type: ['boolean', 'null'] },
+    note: { type: ['string', 'null'] },
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Phase: Preflight -- resolve + VALIDATE the build environment ONCE, before any
+// decomposition. Un-provisionable prerequisites (CANN, bisheng, torch_npu, NPU)
+// are detected and STOP the run with guidance; pto-isa is cloned if absent.
+// ---------------------------------------------------------------------------
+phase('Preflight')
+
+const preflightPrompt = `You are the PREFLIGHT step of the PTO pipeline. Resolve and VALIDATE the
+build environment ONCE. Do NOT decompose, generate kernels, or benchmark. Work from the host
+project root as cwd. Resolve each path in priority order: explicit hint > environment variable
+> autodetect > documented default, then VERIFY it actually exists/works.
+
+1. CANN (cannot be auto-installed): source /usr/local/Ascend/cann/set_env.sh. Verify $ASCEND_HOME_PATH
+   is set, \`bisheng\` resolves from it, and the simulator lib dir exists
+   ($ASCEND_HOME_PATH/tools/simulator/Ascend910B1/lib). If any is missing, add it to \`missing\`.
+2. Python with torch_npu (do NOT create a venv this run): hint=${PY_HINT ?? 'none'}, else $PTO_PYTHON,
+   else ./.venv/bin/python. Verify it works AND sees an NPU:
+   <py> -c "import torch, torch_npu; print(torch.npu.device_count())". If it errors or prints 0, add
+   'torch_npu python' (and/or 'npu device') to \`missing\`.
+3. pto-isa root: hint=${PTO_ISA_HINT ?? 'none'}, else $PTO_LIB_PATH, else ./third_party/pto-isa.
+   If the resolved dir is ABSENT and a clone URL is available (hint=${PTO_ISA_REPO ?? 'none'}, else
+   $PTO_ISA_REPO): git clone <url> <resolved_path> and set cloned_pto_isa=true. If absent and NO URL,
+   add 'pto-isa' to \`missing\`. Verify the dir exists afterward.
+4. include dir (must contain kernel_common.h): hint=${INCLUDE_HINT ?? 'none'}, else $PTO_INCLUDE_DIR,
+   else ./examples/megakda-pto/include. Verify it exists and contains kernel_common.h; else add
+   'include_dir' to \`missing\`.
+
+Return ABSOLUTE resolved paths in \`resolved\` {ascend_home, bisheng, python, pto_isa_root, include_dir},
+the \`missing\` list, cloned_pto_isa, and ok = (missing is empty). Your final message IS the structured
+result -- no prose.`
+
+const pf = await agent(preflightPrompt, {
+  label: 'preflight',
+  phase: 'Preflight',
+  schema: PREFLIGHT_SCHEMA,
+  agentType: 'general-purpose',
+})
+
+if (!pf || !pf.ok) {
+  log('Preflight failed -- environment not ready.')
+  return {
+    status: 'needs-setup',
+    missing: pf?.missing ?? ['preflight agent failed'],
+    note: pf?.note ?? 'Resolve the missing prerequisites and re-run. CANN, bisheng, torch_npu, and the NPU device cannot be auto-installed; pass pto_isa_repo (or set $PTO_ISA_REPO) to auto-clone pto-isa.',
+  }
+}
+
+// Resolved, validated, absolute paths -- everything downstream uses these.
+const PY = pf.resolved.python
+const PTO_ISA = pf.resolved.pto_isa_root
+const INCLUDE = pf.resolved.include_dir
+log(`Preflight OK -- python=${PY}, pto_isa=${PTO_ISA}, include=${INCLUDE}${pf.cloned_pto_isa ? ' (pto-isa cloned)' : ''}`)
 
 // ---------------------------------------------------------------------------
 // Phase: Decompose (Phase 0 contract + Phase 1 stage plan) -- runs once

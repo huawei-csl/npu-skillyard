@@ -24,9 +24,10 @@ or write another stage's files.
 - `output_dir` -- the run directory; read `stage_plan.json` and write all your files here.
 - `plan_path` -- absolute path to `stage_plan.json` (contains `shape_contract` + all stages).
 - `stage_name` -- the single stage you own. Load only that stage's entry.
-- `pto_python` -- the venv python with `torch_npu` (the project `.venv/bin/python`).
-- `pto_isa_root` -- `third_party/pto-isa` (or `$PTO_LIB_PATH`).
-- `include_dir` -- example include dir (`examples/megakda-pto/include`).
+- `pto_python` -- absolute path to the python with `torch_npu`. **Already resolved + validated
+  by the orchestrator's preflight** -- use it verbatim; do NOT re-default to `.venv/bin/python`.
+- `pto_isa_root` -- absolute path to pto-isa (preflight-resolved/cloned). Use verbatim.
+- `include_dir` -- absolute path to the dir holding `kernel_common.h` (preflight-resolved). Use verbatim.
 
 ## Setup
 
@@ -35,6 +36,9 @@ Resolve once and reuse:
 - Source the CANN environment first: `source /usr/local/Ascend/cann/set_env.sh`.
   This sets `$ASCEND_HOME_PATH` (default `cann-9.0.0`). Resolve `bisheng` and all
   toolkit includes from `$ASCEND_HOME_PATH` -- never hardcode a CANN version path.
+- Use the `pto_python` / `pto_isa_root` / `include_dir` paths from the task prompt verbatim
+  (the orchestrator's preflight already resolved + validated them). If any is unexpectedly
+  absent, STOP and report it -- do not silently fall back to a relative default.
 - Read `stage_plan.json` from `plan_path`. Pull the top-level `shape_contract` and
   the entry for `stage_name`. Every shape, dtype, tolerance, and validation dim you
   use comes from the contract + your stage entry -- do not re-infer them.
