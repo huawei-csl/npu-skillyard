@@ -105,10 +105,18 @@ and validates it before any work:
 | include dir (`kernel_common.h`) | `include_dir` | `$PTO_INCLUDE_DIR` | bundled `include/` (copied into the run dir) |
 | pto-isa clone URL | `pto_isa_repo` | `$PTO_ISA_REPO` | `https://gitcode.com/cann/pto-isa.git` |
 
-CANN, `bisheng`, `torch_npu`, and the NPU device **cannot be auto-installed** -- if any is
-missing, Preflight STOPs early with a clear message instead of failing mid-run. `pto-isa` is
-just source: if its path is absent, Preflight clones it automatically (from
-`pto_isa_repo` > `$PTO_ISA_REPO` > the default `gitcode.com/cann/pto-isa`).
+CANN, `bisheng`, and the NPU device **cannot be auto-installed** -- if any is missing,
+Preflight STOPs early with a clear message instead of failing mid-run. `pto-isa` is just
+source: if its path is absent, Preflight clones it automatically (from `pto_isa_repo` >
+`$PTO_ISA_REPO` > the default `gitcode.com/cann/pto-isa`).
+
+**`torch_npu` is detect-and-stop by default** (it's tightly version-coupled to the installed
+CANN release -- a wrong pin can silently produce wrong numerics, so the default is to bring
+your own). To provision it automatically, pass `bootstrap_venv: true`: when no working
+torch_npu python is found, Preflight creates a venv (`bootstrap_venv_path`, default
+`./.venv-npu`) and installs `torch`/`torch_npu` matched to the detected CANN version
+(`torch_version` / `torch_npu_version` override the pins), then **re-validates** and still
+STOPs if the result can't see the NPU.
 
 See [CLAUDE.md](./CLAUDE.md) for the architecture, the phase model, and the non-negotiable
 rules (provenance boundary, real-NPU gate, CPU-fp64 reference, coverage gate).

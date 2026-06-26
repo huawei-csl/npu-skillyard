@@ -24,7 +24,11 @@ auto-installed. `pto-isa` is just source, so clone it if absent.
   includes from `$ASCEND_HOME_PATH` -- never hardcode a CANN version path. If missing, STOP.
 - **python (torch_npu):** arg `pto_python` > `$PTO_PYTHON` > `./.venv/bin/python`. Verify it
   imports `torch_npu` and sees an NPU (`<py> -c "import torch, torch_npu; print(torch.npu.device_count())"`).
-  Do NOT create a venv here -- if it fails, STOP and report what is missing.
+  If it fails: by default STOP and report what is missing (do NOT create a venv). Only when
+  `bootstrap_venv` is set, create a venv (default `./.venv-npu`) and `pip install` torch/torch_npu
+  **matched to the detected CANN version** (explicit `torch_version`/`torch_npu_version` pins win;
+  if no safe CANN<->torch_npu match can be determined, STOP rather than guess), then **re-validate**
+  the same import+device_count check and accept it ONLY if it now sees the NPU.
 - **pto_isa_root:** arg `pto_isa_root` > `$PTO_LIB_PATH` > `./third_party/pto-isa`. If absent,
   `git clone` it there from arg `pto_isa_repo` > `$PTO_ISA_REPO` > default
   `https://gitcode.com/cann/pto-isa.git`; only STOP if the clone itself fails (e.g. no network).

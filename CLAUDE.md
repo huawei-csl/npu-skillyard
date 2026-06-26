@@ -66,15 +66,18 @@ agents and the workflow — learn it once:
    decompose once, fan out one **`pto-stage-worker`** agent per stage in parallel, then
    benchmark *serially* (device timing must not contend), optimize, fuse. Invoke with
    `args: {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?,
-   include_dir?, pto_isa_repo?, devices?, optimize?}`.
+   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?}`.
 
 Both drivers begin with a **Preflight** step that resolves every path in priority order
 (**explicit arg → env var → autodetect → documented default**) and validates it before any
-work. Un-provisionable prerequisites (CANN, `bisheng`, `torch_npu`, the NPU device) are
-detected and **STOP the run** with guidance — never auto-installed; `pto-isa` is auto-cloned
-if absent (from `pto_isa_repo` > `$PTO_ISA_REPO` > default `gitcode.com/cann/pto-isa`). This keeps Phase 0 pure (contract
-only) and turns "environment not ready" into an early, actionable failure. Env vars:
-`$PTO_PYTHON`, `$PTO_LIB_PATH` (pto-isa), `$PTO_INCLUDE_DIR`, `$PTO_ISA_REPO`.
+work. CANN, `bisheng`, and the NPU device are detected and **STOP the run** with guidance —
+never auto-installed. `pto-isa` is auto-cloned if absent (from `pto_isa_repo` >
+`$PTO_ISA_REPO` > default `gitcode.com/cann/pto-isa`). `torch_npu` is **detect-and-stop by
+default** (version-coupled to CANN; a wrong pin silently corrupts numerics) — opt in with
+`bootstrap_venv: true` to create a venv and install torch/torch_npu matched to the detected
+CANN version, then re-validate (still STOPs if it can't see the NPU). This keeps Phase 0 pure
+(contract only) and turns "environment not ready" into an early, actionable failure. Env
+vars: `$PTO_PYTHON`, `$PTO_LIB_PATH` (pto-isa), `$PTO_INCLUDE_DIR`, `$PTO_ISA_REPO`.
 
 The skills (`torch-algorithm-to-pto-stages`, `pto-stage-artifact-generator-local`,
 `pto-stage-kernel-generator-v2`, `pto-kernel-optimizer`) are the *per-phase* building

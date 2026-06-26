@@ -18,7 +18,14 @@ export const meta = {
 // args.platform   (optional) target platform tag, e.g. "a2a3"
 // args.contract   (optional) a pre-agreed shape_contract object; if given, Phase 0 uses it verbatim
 // args.pto_python (optional) PATH HINT: venv python with torch_npu. Resolved by Preflight
-//                  (hint > $PTO_PYTHON > ./.venv/bin/python). Never auto-installed.
+//                  (hint > $PTO_PYTHON > ./.venv/bin/python). NOT auto-installed unless
+//                  bootstrap_venv is set (see below).
+// args.bootstrap_venv (optional, default FALSE) when no working torch_npu python is found,
+//                  create a venv + pip install torch/torch_npu MATCHED to the detected CANN
+//                  version, then RE-VALIDATE (STOP if it still can't see the NPU). Opt-in.
+// args.bootstrap_venv_path (optional) where to create that venv (default ./.venv-npu).
+// args.torch_version / args.torch_npu_version (optional) explicit pins for the bootstrap;
+//                  if omitted, derive the torch_npu release from the detected CANN version.
 // args.pto_isa_root (optional) PATH HINT: pto-isa root. Resolved by Preflight
 //                  (hint > $PTO_LIB_PATH > ./third_party/pto-isa); cloned if absent (see pto_isa_repo).
 // args.include_dir (optional) PATH HINT: dir holding kernel_common.h. Resolved by Preflight
@@ -47,6 +54,10 @@ const INCLUDE_HINT = ARGS?.include_dir ?? null
 const PTO_ISA_REPO = ARGS?.pto_isa_repo ?? null
 // Canonical public pto-isa source (the bundled npu-coding-mcp uses the same upstream).
 const PTO_ISA_REPO_DEFAULT = 'https://gitcode.com/cann/pto-isa.git'
+const BOOTSTRAP_VENV = ARGS?.bootstrap_venv === true   // opt-in; default OFF (detect-and-stop)
+const BOOTSTRAP_VENV_PATH = ARGS?.bootstrap_venv_path ?? './.venv-npu'
+const TORCH_VERSION = ARGS?.torch_version ?? null
+const TORCH_NPU_VERSION = ARGS?.torch_npu_version ?? null
 const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
@@ -108,6 +119,7 @@ const PREFLIGHT_SCHEMA = {
     },
     missing: { type: 'array', items: { type: 'string' } },
     cloned_pto_isa: { type: ['boolean', 'null'] },
+    bootstrapped_venv: { type: ['boolean', 'null'] },
     note: { type: ['string', 'null'] },
   },
 }
@@ -127,10 +139,25 @@ project root as cwd. Resolve each path in priority order: explicit hint > enviro
 1. CANN (cannot be auto-installed): source /usr/local/Ascend/cann/set_env.sh. Verify $ASCEND_HOME_PATH
    is set, \`bisheng\` resolves from it, and the simulator lib dir exists
    ($ASCEND_HOME_PATH/tools/simulator/Ascend910B1/lib). If any is missing, add it to \`missing\`.
-2. Python with torch_npu (do NOT create a venv this run): hint=${PY_HINT ?? 'none'}, else $PTO_PYTHON,
-   else ./.venv/bin/python. Verify it works AND sees an NPU:
-   <py> -c "import torch, torch_npu; print(torch.npu.device_count())". If it errors or prints 0, add
-   'torch_npu python' (and/or 'npu device') to \`missing\`.
+2. Python with torch_npu. Resolve hint=${PY_HINT ?? 'none'}, else $PTO_PYTHON, else ./.venv/bin/python.
+   VALIDATE: <py> -c "import torch, torch_npu; print(torch.npu.device_count())".
+   - If it imports AND prints > 0: use it (set resolved.python to its ABSOLUTE path).
+   - If it FAILS and bootstrap_venv is ${BOOTSTRAP_VENV ? 'TRUE' : 'FALSE'}:
+     * FALSE (default): add 'torch_npu python' (and/or 'npu device' if import works but count==0)
+       to \`missing\` -- do NOT create a venv.
+     * TRUE: BOOTSTRAP, then re-validate --
+       a. Detect the CANN version from $ASCEND_HOME_PATH (the version dir name, or
+          $ASCEND_HOME_PATH/version.cfg / .../ascend_toolkit_install.info).
+       b. Create a venv at ${BOOTSTRAP_VENV_PATH} using the system python3 (>=3.9), upgrade pip.
+       c. pip install torch + torch_npu MATCHED to that CANN version. Use explicit pins if given
+          (torch=${TORCH_VERSION ?? 'derive'}, torch_npu=${TORCH_NPU_VERSION ?? 'derive'}); otherwise
+          select the torch_npu release that targets the detected CANN version from the official Ascend
+          pytorch install table. If you CANNOT determine a safe CANN<->torch_npu match, do NOT guess --
+          add 'torch_npu version (unknown CANN match)' to \`missing\` and STOP.
+       d. RE-VALIDATE with the SAME import+device_count check on ${BOOTSTRAP_VENV_PATH}/bin/python.
+          Accept it (set resolved.python, set bootstrapped_venv=true) ONLY if it now prints > 0;
+          otherwise add 'torch_npu python (bootstrap failed)' to \`missing\`. Never proceed on a
+          failed/partial install.
 3. pto-isa root: hint=${PTO_ISA_HINT ?? 'none'}, else $PTO_LIB_PATH, else ./third_party/pto-isa.
    If the resolved dir is ABSENT, clone it: URL = hint ${PTO_ISA_REPO ?? '(none)'} > $PTO_ISA_REPO >
    default ${PTO_ISA_REPO_DEFAULT}. Run git clone <url> <resolved_path> and set cloned_pto_isa=true;
@@ -188,7 +215,7 @@ if (!pf || !pf.ok) {
 const PY = pf.resolved.python
 const PTO_ISA = pf.resolved.pto_isa_root
 const INCLUDE = pf.resolved.include_dir
-log(`Preflight OK -- python=${PY}, pto_isa=${PTO_ISA}, include=${INCLUDE}${pf.cloned_pto_isa ? ' (pto-isa cloned)' : ''}`)
+log(`Preflight OK -- python=${PY}, pto_isa=${PTO_ISA}, include=${INCLUDE}${pf.cloned_pto_isa ? ' (pto-isa cloned)' : ''}${pf.bootstrapped_venv ? ' (venv bootstrapped)' : ''}`)
 
 // ---------------------------------------------------------------------------
 // Phase: Decompose (Phase 0 contract + Phase 1 stage plan) -- runs once
