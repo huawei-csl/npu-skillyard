@@ -64,6 +64,10 @@ const BOOTSTRAP_VENV_PATH = ARGS?.bootstrap_venv_path ?? './.venv-npu'
 const TORCH_VERSION = ARGS?.torch_version ?? null
 const TORCH_NPU_VERSION = ARGS?.torch_npu_version ?? null
 const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
+// The per-stage worker agent. Defaults to the bare name (works when running inside the
+// cloned repo or when the agent is registered unqualified); pass the plugin-namespaced
+// name (e.g. "npu-skillyard:pto-stage-worker") if your install exposes it that way.
+const WORKER_AGENT = ARGS?.worker_agent ?? 'pto-stage-worker'
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
 const REPORT = ARGS?.report !== false                // default ON; organize run dir + write report
@@ -318,7 +322,7 @@ const stageResults = await parallel(
       label: `stage:${s}`,
       phase: 'Stages',
       schema: STAGE_SCHEMA,
-      agentType: 'pto-stage-worker',
+      agentType: WORKER_AGENT,
     })
   )
 )
