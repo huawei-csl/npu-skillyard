@@ -55,7 +55,9 @@ agents and the workflow — learn it once:
 - **Phase 6 — Benchmarking.** Gated on all stages passing; device-side `npu.Event` timing
   at the contract's production sweep.
 - **Phase 6.5 — Optimize** (workflow only). Drive dominant stages toward their strong form.
-- **Phase 7 — Fusion.** Stitch validated per-stage kernels into one deliverable.
+- **Phase 7 — Fusion (opt-in).** Runs only when fusion is requested (`fuse`); even then it
+  ships a fused kernel *only* if it is `compute-fused` and measurably beats the chain
+  (packaging-only fusion is neither built nor shipped). The per-stage chain is canonical.
 - **Phase 8 — Report & Packaging.** Always runs last: organize the run dir into
   `ref/` (inputs) + `src/` (generated kernels/harnesses) + `reports/` (graphs + `report.md`),
   plot benchmark graphs (matplotlib), and write a top-level `README.md` narrating what was
@@ -65,12 +67,12 @@ agents and the workflow — learn it once:
 
 1. **`stage-pipeline` agent** (`agents/stage-pipeline.md`) — full pipeline in one
    agent; fans Phase 3–5 out to one `stage-pipeline` sub-agent per stage (scoped to
-   single-stage mode), then runs Phase 6/7 once.
+   single-stage mode), then runs Phase 6 once (Phase 7 only if fusion is requested).
 2. **`pto-pipeline-parallel` workflow** (`.claude/workflows/pto-pipeline-parallel.js`) —
    decompose once, fan out one **`pto-stage-worker`** agent per stage in parallel, then
-   benchmark *serially* (device timing must not contend), optimize, fuse. Invoke with
+   benchmark *serially* (device timing must not contend), optimize, and (opt-in) fuse. Invoke with
    `args: {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?,
-   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?, report?}`.
+   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?, fuse?, report?}`.
 
 Both drivers begin with a **Preflight** step that resolves every path in priority order
 (**explicit arg → env var → autodetect → documented default**) and validates it before any

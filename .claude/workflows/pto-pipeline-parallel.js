@@ -1,7 +1,7 @@
 export const meta = {
   name: 'pto-pipeline-parallel',
   description: 'Parallel PTO kernel pipeline: decompose once, fan out per-stage kernel gen + compile + validate (one pto-stage-worker per stage), then benchmark serially and fuse. The parallel variant of the stage-pipeline agent; leaves stage-pipeline untouched.',
-  whenToUse: 'When a stage_plan has multiple independent stages and you want per-stage kernel generation to run concurrently instead of one-at-a-time. Pass {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?, include_dir?, pto_isa_repo?, devices?} as args.',
+  whenToUse: 'When a stage_plan has multiple independent stages and you want per-stage kernel generation to run concurrently instead of one-at-a-time. Pass {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?, include_dir?, pto_isa_repo?, devices?, optimize?, fuse?} as args.',
   phases: [
     { title: 'Preflight' },
     { title: 'Decompose' },
@@ -38,6 +38,9 @@ export const meta = {
 //                  stages) after Benchmark; default true. Set false to ship the correct
 //                  baseline chain without the device-in-the-loop optimization campaign.
 // args.optimize_top_n (optional) how many dominant stages to optimize (default 2)
+// args.fuse       (optional, default FALSE) OPT-IN Phase 7 fusion. Only runs when set true;
+//                  even then it ships a fused kernel ONLY if it is compute-fused AND beats the
+//                  chain (packaging-only fusion is not built/shipped). Default keeps the chain.
 // args.report     (optional, default true) final Report phase: organize the run dir into
 //                  ref/ src/ reports/, plot benchmark graphs, and write a README + report.md.
 // args.make_graphs (optional, default true) plot PNG graphs from the benchmarks (needs
@@ -70,6 +73,7 @@ const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 const WORKER_AGENT = ARGS?.worker_agent ?? 'pto-stage-worker'
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
+const FUSE = ARGS?.fuse === true                     // OPT-IN; default OFF -- fusion runs only if requested
 const REPORT = ARGS?.report !== false                // default ON; organize run dir + write report
 const MAKE_GRAPHS = ARGS?.make_graphs !== false      // default ON; plot benchmark graphs (needs matplotlib)
 const PLAN_PATH = `${OUT}/stage_plan.json`
@@ -413,14 +417,19 @@ markers_closed: [..], benchmarks_json: path}. Final message IS the result.`
 }
 
 // ---------------------------------------------------------------------------
-// Phase: Fuse (Phase 7) -- gated on all-pass + benchmark, runs once
+// Phase: Fuse (Phase 7) -- OPT-IN (args.fuse). Even when requested, ships a fused
+// kernel ONLY if it is compute-fused AND beats the chain; else keeps the chain.
 // ---------------------------------------------------------------------------
 phase('Fuse')
 
 let fusion = null
-if (allPass && benchmark) {
-  const fusePrompt = `You are running Phase 7 (Kernel Stitching / Fusion) of the PTO stage pipeline. The
-gate is met: every stage PASSed on real NPU and Phase 6 benchmarks exist.
+if (!FUSE) {
+  log('Skipping fusion (not requested; pass fuse:true to enable). Chain is canonical.')
+} else if (!(allPass && benchmark)) {
+  log('Skipping fusion (gate not met or no benchmark baseline).')
+} else {
+  const fusePrompt = `You are running Phase 7 (Kernel Stitching / Fusion) of the PTO stage pipeline. Fusion
+was REQUESTED, every stage PASSed on real NPU, and Phase 6 benchmarks exist.
 
 - stages: ${stages.join(', ')}
 - output_dir: ${OUT}
@@ -428,30 +437,29 @@ gate is met: every stage PASSed on real NPU and Phase 6 benchmarks exist.
 - pto_python: ${PY}
 - devices: ${DEVICES.join(', ')} (benchmark the fused kernel on ONE device, serially)
 
-Compose the (now optimized) per-stage kernels into ONE GENERATED deliverable. DEFAULT to
-LEAN-THEN-COMPOSE (cookbook §8.6P #21), NOT a from-scratch in-kernel merge-then-tune monolith:
-the lean per-stage kernels are already the production slope (#12/#18), so share ONE layout across
-them and chain each stage's launch_* on a single stream in one host call_kernel (stream ordering is
-the free seam; fused slope = sum of lean slopes, ~0 fusion penalty). Reserve a tightly-coupled
-in-kernel merge (intermediates resident, recurrence loop in-kernel, launch->1) ONLY for the one
-stage where it is the sole remaining lever AND its cost is hideable -- a from-scratch 6-stage
-in-kernel-FFTS monolith reliably blows the repair budget and runs SLOWER (the documented failure
-mode). Write a residency + launch budget up front (Step 1). Generate via
-pto-stage-kernel-generator-v2 (all rules). Compile -> validate end-to-end vs the composed
-full-algorithm CPU-fp64 reference (up to 8 repairs). Benchmark fused-vs-chain on the production sweep.
-Classify the deliverable: compute-fused (PASS) vs packaging-fused (INCOMPLETE Phase 7) -- a packaging-only
-result that keeps ~all the chain's launches/GM round-trips is NOT a clean pass; record per-corner reasons.
-PROVENANCE: the fused kernel must be GENERATED, never copied from any pre-existing kernel.
+Fusion is CONDITIONAL on a MEASURED win, not automatic. First confirm a concrete win exists (else
+record "fusion":"skipped (no overlap/streaming win available; chain is canonical)" and stop): a
+same-core sub-chain that goes L1/UB-resident (COOK-§8.6P #2), a GM-heavy Cube op with a GM-light Vec
+partner to overlap (#9, proven by a #10 noop-floor probe), or a large intermediate that must be
+STREAMED to scale. a2a3 reality: a Cube<->Vec intermediate MUST transit GM (on-chip CV FIFO is
+A5-only), so a GM round-trip on that edge is EXPECTED -- residency applies only WITHIN a same-core
+sub-chain. Pure launch-collapse is NOT a win. NEVER put SYNCALL<Mix> on a per-tile Cube<->Vec hand-off
+(#5). DEFAULT to lean-then-compose (#21) unless a tighter in-kernel merge is the sole remaining lever
+AND its cost is hideable. Write the win + residency/launch budget up front. Generate via
+pto-stage-kernel-generator-v2 (all rules); compile -> validate end-to-end vs the composed
+full-algorithm CPU-fp64 reference (up to 8 repairs); benchmark fused-vs-chain AND vs the Phase-6
+reference/roofline. It is a PASS ONLY if compute-fused AND it BEATS the chain. If the build collapses
+to packaging-only (same launches/GM traffic, no overlap/residency/streaming win), do NOT ship it --
+record "not attempted (packaging-only: <reason>)" and keep the chain. PROVENANCE: the fused kernel
+must be GENERATED, never copied from any pre-existing kernel.
 
-Return the fusion result object: {result, classification, launch_count:{target,actual}, residency, fallbacks_taken, speedup_vs_chain, kernel}. Final message IS the result.`
+Return the fusion result object: {result, classification:"compute-fused", win_captured, launch_count:{target,actual}, residency, speedup_vs_chain, kernel}. Final message IS the result.`
 
   fusion = await agent(fusePrompt, {
     label: 'fuse',
     phase: 'Fuse',
     agentType: 'general-purpose',
   })
-} else {
-  log('Skipping fusion (gate not met or no benchmark baseline).')
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +474,7 @@ const pipelineSummary = {
   summary: { pass: passed.length, fail: failed.length, total: stages.length },
   benchmarking: allPass ? (benchmark ?? 'attempted') : 'skipped (not all stages passed)',
   optimization: optimization ?? (OPTIMIZE ? (allPass && benchmark ? 'attempted' : 'skipped (gate not met)') : 'skipped (disabled)'),
-  fusion: fusion ?? (allPass ? 'skipped (no benchmark baseline)' : 'skipped (not all stages passed)'),
+  fusion: fusion ?? (!FUSE ? 'skipped (not requested; chain is canonical)' : (allPass && benchmark ? 'attempted' : 'skipped (gate not met)')),
 }
 
 // ---------------------------------------------------------------------------

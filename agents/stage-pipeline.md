@@ -275,8 +275,9 @@ After ALL sub-agents return:
   skip Phases 6 and 7, and write the final `pipeline_results.json`.
 
 Phases 3-5 are per-stage. After they finish for **all** stages, run Phase 6
-(benchmarking) **once**, globally -- gated on every stage having passed -- then
-Phase 7 (fusion) **once**, gated on Phase 6 having produced a baseline.
+(benchmarking) **once**, globally -- gated on every stage having passed. Phase 7
+(fusion) is **OPT-IN**: run it **once** only if the user/orchestrator requested
+fusion AND Phase 6 produced a baseline; otherwise skip it.
 
 ### Phase 3: Artifact Generation
 
@@ -498,7 +499,7 @@ When the gate passes, benchmark **each** stage on real NPU (not the simulator):
    `pto-kernel-optimizer` BEFORE Phase 7 -- the gap lives in the per-stage kernels, not in
    the composition.
 
-### Phase 7: Kernel Stitching / Fusion (runs when the gate is met, after Phase 6)
+### Phase 7: Kernel Stitching / Fusion (OPT-IN; runs only when requested, after Phase 6)
 
 Goal: where it MEASURABLY pays, stitch the validated per-stage kernels into a single
 generated kernel that runs the outer/iterative loop in-kernel and captures a real
@@ -544,86 +545,62 @@ than the chain (COOK-§8.6P #5); `SYNCALL` is for stage SEAMS only.
   it. If your fusion plan collapses to this, record `"fusion": "not attempted (would be
   packaging-only: <reason>)"` and keep the chain.
 
-**Expectation (measure, do NOT assume).** Whether `compute-fused` is FASTER is
-algorithm-dependent and must be MEASURED: removing inter-stage GM round-trips and
-launch overhead helps, while a serial loop-carried dependency (a producer stage that
-reads the consumer's prior-iteration output) limits the parallel OVERLAP a fused
-kernel could add on top. Note the two are different wins -- eliminating launches +
-DRAM round-trips is real even when overlap is impossible; do NOT use "the recurrence
-is serial so overlap doesn't help" to justify skipping residency/in-kernel-looping,
-which do not depend on overlap at all. A roughly-neutral fused-vs-chain result is
-EXPECTED ONLY when on-chip residency is genuinely infeasible (recorded reason);
-otherwise a neutral result with launch count ≈ the chain's is a SIGNAL that you built
-`packaging-fused`, not `compute-fused` (see Step 4 tripwire). The per-stage chain
-stays the canonical validated + benchmarked result; the fused kernel is an
-additional deliverable.
+**Expectation (measure, do NOT assume).** Whether a `compute-fused` kernel BEATS the
+chain is algorithm-dependent and MUST be measured -- against the Phase-6 chain AND the
+tuned reference/roofline. A serial loop-carried dependency (a producer reading the
+consumer's prior-iteration output) cannot be overlapped, so on that shape the win must
+come from residency/streaming, not overlap. Pure launch-collapse is NOT a win -- a
+stream-ordered chain already overlaps its sub-launches. The per-stage chain is ALWAYS
+the canonical validated + benchmarked result; a fused kernel ships ONLY as an additional
+deliverable, and ONLY when it measurably beats the chain.
 
-- **Gate:** run when (a) every stage PASSed on real NPU AND (b) Phase 6 benchmarks
-  exist. If either is missing, skip and record `"fusion": "skipped (<reason>)"`.
-- **Provenance (hard rule):** the fused kernel must be GENERATED, never copied from
-  any pre-existing kernel (Provenance boundary above) -- from the stage plan + the
-  per-stage kernels you produced + ISA docs + cookbook only.
+- **Opt-in gate (Phase 7 does NOT run by default).** Fusion runs ONLY when the user or
+  orchestrator explicitly requested it (a `fuse` flag/arg). If it was not requested, skip
+  and record `"fusion": "skipped (not requested; chain is canonical)"`.
+- **Feasibility gate (when requested):** also require (a) every stage PASSed on real NPU,
+  (b) Phase 6 benchmarks exist, AND (c) a concrete measured win exists per "When to attempt
+  fusion at all" above. Missing (a)/(b) -> `"fusion": "skipped (<reason>)"`; missing (c) ->
+  `"fusion": "skipped (no overlap/streaming win available; chain is canonical)"`.
+- **Provenance (hard rule):** the fused kernel must be GENERATED, never copied from any
+  pre-existing kernel (Provenance boundary above) -- from the stage plan + the per-stage
+  kernels you produced + ISA docs + cookbook only.
 
 Steps:
-1. **Plan the fusion boundary AND write a residency + launch budget up front.**
-   Compose the validated per-stage math into one dataflow: keep inter-stage
-   intermediates resident on-chip; run any outer loop inside the kernel. Identify
-   which contractions stay Cube (dense GEMMs) vs Vec, and where Cube<->Vec hand-offs
-   occur. Before writing the kernel, WRITE DOWN (record in the run): the TARGET launch
-   count (ideal ~1, or 1-per-irreducible-Cube-stage), and for each inter-stage
-   intermediate (`[C,C]` L / its inverse, `u`/`w`, the `[K,V]` recurrent state, etc.)
-   whether it FITS on-chip (UB/L1/L0 budget at the contract dims) or must stay in GM
-   with a reason. If your plan keeps ~all of the chain's launches and ~all GM
-   round-trips, STOP and state "this is packaging-only, here is why I cannot do
-   better" -- do NOT silently proceed and call it a pass.
-2. **Generate `kernel_fused_<algo>.cpp`** via `pto-stage-kernel-generator-v2`,
-   applying ALL its rules. For any in-kernel Cube<->Vec hand-off use the VALIDATED
-   looped handshake (COOK-§8.6 / C6): BOTH AIV sub-blocks run every
-   `ffts_cross_core_sync`/`wait_flag_dev` (do NOT `if (vid != 0) return;` -- the
-   mode-2 Vec->Cube reduce needs both vids or it deadlocks), gate only DATA work to
-   `vid==0`, signal READY from the committing store pipe (`PIPE_FIX` after a Cube
-   store, `PIPE_MTE3` after a Vec store) after a `pipe_barrier(PIPE_ALL)`, and
-   bootstrap the back-edge flag on its producer side. Do NOT attempt deep-FIFO /
-   double-buffered OVERLAP across a serial loop-carried dependency -- where a
-   producer stage reads the consumer's prior-iteration output there is no
-   independent producer to run ahead, so overlap does not help (COOK-§8.14).
-
-   **Three INDEPENDENT fallbacks -- do not let one excuse another.** These are
-   separate corners with separate justifications; record a per-corner reason for any
-   you take, and the repair log MUST show you ATTEMPTED the strong version (even a
-   failed compile/validate counts) before any fallback is accepted -- "I went
-   straight to the easy split-launch transform" is NOT a valid path to a Phase 7 pass:
-   - **On-chip residency of inter-stage intermediates -- REQUIRED.** Fall back to a
-     GM round-trip only PER-INTERMEDIATE, each with a recorded reason (e.g. "exceeds
-     UB/L1 budget at C=128"). Does NOT depend on the in-kernel handshake.
-   - **In-kernel outer/recurrence loop -- REQUIRED.** Fall back to a host-issued
-     per-iteration launch only with a recorded reason. Does NOT depend on the
-     in-kernel handshake.
-   - **In-kernel Cube<->Vec FFTS handshake -- the ONLY corner the "too risky / flaky"
-     fallback covers.** If an in-kernel handshake cannot be made correct within
-     budget, fall back to stream-serialized split launches for that hand-off rather
-     than shipping a flaky one. Avoiding the handshake does NOT license reverting to
-     GM round-trips for non-handshake data, nor moving the outer loop back to the
-     host -- those are orthogonal and remain required.
-3. **Compile -> validate -> repair** as in Phase 5, but validate the fused kernel
-   end-to-end against the composed full-algorithm reference (with the conditioned
-   inputs the stage specs require), not per-stage. Up to 8 repair attempts.
-4. **Benchmark** the fused kernel on real NPU across the Phase-6 dimension sweep;
-   report fused-vs-chain. **Result tripwire:** if the speedup is roughly neutral
-   (within ~1.5x of the chain) AND the actual launch count ≈ the chain's, do NOT
-   record a pass yet -- flag "this looks like packaging-only fusion" and VERIFY that
-   on-chip residency and the in-kernel loop were actually attempted (Step 1 budget +
-   Step 2 repair log). A neutral result is acceptable only when the Step 1 budget
-   recorded residency as genuinely infeasible; otherwise it means the fusion is
-   incomplete and you must either do the strong version or classify it as a fallback.
-5. **Non-regression / record.** The per-stage chain stays the canonical result.
-   Write `"fusion"` with: the `classification` (`compute-fused` | `packaging-fused`),
-   the target-vs-actual `launch_count`, the per-intermediate residency outcomes, the
-   fused result, and the fused-vs-chain numbers. A `packaging-fused` deliverable is
-   recorded as an INCOMPLETE Phase 7 (with per-corner reasons), not a clean pass. If
-   the fused kernel does not validate within the cap OR clearly regresses, KEEP the
-   chain and record the outcome -- do NOT discard the passing per-stage kernels and
-   do NOT fail the pipeline.
+1. **Plan the win + a residency/overlap/launch budget up front.** Name which of the three
+   achievable A2/A3 wins you are capturing -- same-core L1/UB residency; overlap/double-buffer
+   of the unavoidable Cube<->Vec GM round-trip; or streaming a large intermediate -- and WRITE
+   IT DOWN. A Cube<->Vec intermediate MUST transit GM (the on-chip CV FIFO is A5-only), so a GM
+   round-trip on that edge is EXPECTED, not a failure; residency applies only WITHIN a same-core
+   (Cube-only or Vec-only) sub-chain. Record per inter-stage intermediate: resident-in-L1/UB
+   (same-core), GM-transited-and-overlapped, or streamed. If the only thing your plan changes is
+   launch count (same GM traffic, no overlap/residency/streaming win), STOP -- that is
+   packaging-only: record `"fusion": "not attempted (would be packaging-only: <reason>)"`, keep
+   the chain, and do NOT build it.
+2. **Generate `kernel_fused_<algo>.cpp`** via `pto-stage-kernel-generator-v2`, applying ALL its
+   rules. Keep same-core sub-chains resident (Cube-only in L1 via TMOV Acc->Mat, COOK-§8.6P #2;
+   Vec-only in UB). NEVER put a grid barrier (`SYNCALL<Mix>`) on a per-tile Cube<->Vec hand-off
+   (COOK-§8.6P #5); where the dataflow allows, overlap/double-buffer the GM round-trip against
+   independent work (the #9 pairing rule, proven by a #10 noop-floor probe). A serial
+   loop-carried dependency cannot be overlapped (COOK-§8.14) -- there the win is residency or
+   streaming, not overlap. For a validated in-kernel looped Cube<->Vec handshake use the
+   COOK-§8.6 / C6 protocol (both AIV sub-blocks run every mode-2 sync; gate only DATA work to
+   `vid==0`; signal READY from the committing store pipe after `pipe_barrier(PIPE_ALL)`;
+   bootstrap the back-edge flag). A stream-serialized split launch is the safe fallback for a
+   hand-off that cannot be made correct in budget.
+3. **Compile -> validate -> repair** as in Phase 5, but validate the fused kernel end-to-end
+   against the composed full-algorithm CPU-fp64 reference (with the conditioned inputs the stage
+   specs require), not per-stage. Up to 8 repair attempts.
+4. **Benchmark** the fused kernel on real NPU across the Phase-6 sweep; report fused-vs-chain
+   and fused-vs-reference/roofline. It is a Phase-7 PASS only if it is `compute-fused` AND it
+   BEATS the chain. **Tripwire:** a roughly-neutral result (within ~1.5x) with launch count ~=
+   the chain's is packaging-only -- do NOT record it as a pass; discard the fused kernel and keep
+   the chain (record `"fusion": "not attempted (packaging-only on measurement: <reason>)"`).
+5. **Non-regression / record.** The per-stage chain is ALWAYS the canonical result. Record
+   `"fusion"` as one of: `PASS (compute-fused)` with the fused-vs-chain speedup and the captured
+   win; `skipped/not attempted (<reason>)`; or `FAIL (kept chain)`. There is NO "packaging-fused
+   deliverable" -- if the build collapses to packaging-only it is not shipped. If the fused
+   kernel does not validate within the cap OR regresses, KEEP the chain and record it -- never
+   discard the passing per-stage kernels, never fail the pipeline.
 
 ### Phase 8: Report & Packaging (always runs last)
 
@@ -677,13 +654,13 @@ otherwise `benchmarking` is recorded as skipped:
   "summary": {"pass": 0, "fail": 0, "total": 0},
   "benchmarking": "completed | skipped (not all stages passed)",
   "fusion": {
-    "result": "PASS (compute-fused) | INCOMPLETE (packaging-fused) | FAIL | skipped (<reason>)",
-    "classification": "compute-fused | packaging-fused",
+    "result": "PASS (compute-fused) | FAIL (kept chain) | skipped (<reason>) | not attempted (packaging-only: <reason>)",
+    "classification": "compute-fused",
+    "win_captured": "same-core-residency | overlap | streaming",
     "repair_attempts": 0,
     "kernel": "kernel_fused_<algo>.so",
     "launch_count": {"target": 1, "actual": 0},
-    "residency": {"<intermediate>": "on-chip | GM (<reason>)"},
-    "fallbacks_taken": [{"corner": "handshake | residency | in-kernel-loop", "reason": "..."}],
+    "residency": {"<intermediate>": "L1/UB (same-core) | GM-transited-overlapped | streamed"},
     "speedup_vs_chain": {"<sweep-point>": 0.0}
   }
 }
