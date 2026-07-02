@@ -46,6 +46,21 @@ advantage is almost always a leaner slope.
   across sessions is drift, not a real speedup — re-confirm every win paired.
 - Reproduce the **baseline + a known anchor** on the same device/run before trusting any
   number. Flush caches; use a device-side timer; serialize timed runs.
+- **Get a TUNED baseline at the MATCHED shape before drawing ANY bottleneck conclusion.**
+  Generated-vs-generated comparisons only rank your own kernels — they cannot locate the
+  hardware ceiling, and a generated kernel is routinely 3-15x off it. A vendor / hand-tuned
+  reference (e.g. `torch_npu.npu_fused_infer_attention_score`, a vendor GEMM) run at YOUR
+  exact shape — not the reference's most favorable config — is the only honest ceiling. If
+  the reference is only available at a denser shape (e.g. it wants head_dim=128 but yours is
+  32), run it AT your shape too and split the gap: `intrinsic` shape penalty (un-fixable
+  in-kernel; e.g. a narrow K=32 contraction underfills the cube fractal ~4x) vs `fixable`
+  codegen gap. Optimize only the fixable part, toward the matched-shape ceiling. When no
+  single vendor op exists, COMPOSE a reference from vendor primitives (GEMM + native
+  elementwise/softmax) — still an achievable ceiling. Fall back to the analytic roofline
+  (`max(FLOPs/peak, essential_bytes/peak_BW)`) ONLY for a genuinely novel primitive, and
+  then treat it as a THEORETICAL peak: it proves "far -> inefficient" but NOT "near ->
+  optimal", so keep any "at the limit" call tentative and lean on the noop-floor /
+  per-stage-sum diagnostics (§5) instead.
 
 ## 3. The campaign loop
 1. **Decompose the slope.** Measure each stage/section standalone at 2 sizes -> per-part
@@ -97,6 +112,17 @@ Classify the dominant part, then apply the matching lever:
 - **Paired A/B** — the only trustworthy measurement on a drift-prone device.
 
 ## 6. Stop-criteria (stop honestly)
+- **Do NOT declare a "bandwidth-bound / hardware / not-achievable" floor without PROVING it
+  against a tuned reference.** This is the most common false stop. Two hard gates before you
+  write "bandwidth-bound" or "hardware limit": (a) compute achieved GB/s vs HBM peak AND
+  achieved TFLOP/s vs compute peak — if you are far from BOTH (e.g. ~24% of HBM and ~21% of
+  compute), you are neither bound, you are just inefficient (bulk-synchronous barriers,
+  single-buffering, low occupancy); (b) if a vendor/reference does the SAME workload on the
+  SAME silicon faster, the wall is your kernel, not the chip. In practice "impossible on this
+  arch" (e.g. "a correct single-MIX Cube->Vec hand-off is A5-only", "attention is
+  bandwidth-bound on a2a3") was disproven repeatedly by a working reference — each was a
+  missing technique (a FIFO-pipelined hand-off, deeper run-ahead), not silicon. Distrust your
+  own hardware-wall conclusion until a reference confirms the wall.
 - The sum of irreducible per-part floors already exceeds the target -> the gap is
   intrinsic per-part work; closing it means re-deriving the baseline's algorithms (a
   clone). Stop, document the path.

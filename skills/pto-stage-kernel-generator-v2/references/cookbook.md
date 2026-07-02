@@ -954,6 +954,20 @@ but every rule below is algorithm-agnostic. Collapsing launch count 28->1 alone 
 NOTHING -- a stream-serialized chain already overlaps its sub-launches; the fused win has
 to come from the items below.
 
+**#0. FUSE ONLY WHEN A MEASURED WIN EXISTS -- otherwise ship the chain.** Fusion is not a
+default. Launch-collapse buys nothing (above); and on A2/A3 a Cube<->Vec intermediate
+CANNOT stay on-chip (GM-backed; the on-chip CV FIFO is A5-only), so the classic "keep
+intermediates resident" win does NOT apply across that boundary here. Before fusing,
+confirm ONE concrete lever: a same-core sub-chain that goes L1/UB-resident (#2); a
+GM-heavy Cube op with a GM-light Vec partner to overlap (#9 pairing rule, proven by a #10
+noop-floor probe); or a large intermediate that must be STREAMED to scale (materializing
+a full [.,S,S]-type buffer overflows int32 offsets ~23k and OOMs -- only tiled/streaming
+survives long context). And make each stage LEAN FIRST (#12): the gap to a hand-tuned
+reference is usually a weak STAGE, not the composition -- fusing weak kernels just
+serializes slow parts. Never put a grid barrier (`SYNCALL<Mix>`) on a per-tile Cube<->Vec
+hand-off (#5); measure any fused build against a tuned/vendor reference, never only
+against our own chain.
+
 **1. The bottleneck is the RENDEZVOUS COUNT, not Cube compute -- diagnose it first.**
 Each cross-core rendezvous costs ~2 `pipe_barrier(PIPE_ALL)` drains + an FFTS round-trip,
 and they are SERIAL. Count rendezvous per loop iteration. Before optimizing, run a

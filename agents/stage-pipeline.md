@@ -468,25 +468,81 @@ When the gate passes, benchmark **each** stage on real NPU (not the simulator):
 4. **Record** the per-stage benchmark numbers in the output (see below). Also
    write a combined `benchmarks.json` in the output directory.
 
+5. **Establish a tuned reference + roofline (the honesty gate -- do NOT skip).**
+   Benchmarking our own stages against each other only RANKS our kernels; it cannot
+   locate the hardware ceiling, and a generated kernel is routinely 3-15x off it. Build
+   the tightest available ceiling from this LADDER -- the gate is NEVER skipped, only the
+   ceiling's tightness degrades down the rungs -- run it at the MATCHED contract shape with
+   THIS harness (same timer/flush/warmup), and record its latency + TFLOP/s next to ours;
+   also compute our achieved GB/s vs HBM peak AND TFLOP/s vs compute peak:
+   - **(a) Single fused vendor op** for the whole algorithm or a dominant stage (e.g.
+     `torch_npu.npu_fused_infer_attention_score` for attention, a `torch_npu`/`F.linear`
+     GEMM for a projection). Tightest, achievable ceiling -- use it.
+   - **(b) Composed vendor reference** when no single op exists -- the COMMON case for
+     novel algorithms. Build the reference from vendor PRIMITIVES: `F.linear`/`torch.matmul`
+     (vendor GEMM) + native `silu`/`softmax`/elementwise. E.g. a SwiGLU MLP = two vendor
+     GEMMs + native `silu*mul`; a block = vendor attention + vendor GEMMs. Still an
+     ACHIEVABLE ceiling; prefer this over (c). "No fused op" does NOT mean "no reference".
+   - **(c) Analytic roofline + internal diagnostics** only when a primitive is GENUINELY
+     novel (a triangular inverse, a custom scan). Compute `max(FLOPs/peak_TFLOPs,
+     essential_bytes/peak_HBM_GBps)` -- always computable with NO vendor code -- and lean on
+     the noop-floor (COOK-§8.6P #10), per-stage-sum (#12), and any peer reference (a megagdn
+     hand-tuned stage).
+   A kernel far from BOTH roofs is inefficient (fixable), NOT "bandwidth-bound" or "at the
+   hardware limit" -- never record those verdicts without a ceiling (see
+   `pto-kernel-optimizer` SKILL.md §2/§6). **Rung-(c) caveat:** the analytic roofline is a
+   THEORETICAL peak (achievable is ~55-70%), so it proves "far from peak -> inefficient" but
+   NOT "near peak -> optimal" -- when only rung (c) is available, keep any "at the limit"
+   verdict TENTATIVE and grounded in the diagnostics, not the roofline alone. The dominant
+   stage(s) with a large fixable gap should be driven toward this ceiling via
+   `pto-kernel-optimizer` BEFORE Phase 7 -- the gap lives in the per-stage kernels, not in
+   the composition.
+
 ### Phase 7: Kernel Stitching / Fusion (runs when the gate is met, after Phase 6)
 
-Goal: stitch the validated per-stage kernels into a SINGLE generated kernel (one
-`call_kernel`, one `.so`) so the whole algorithm ships as ONE launch (integration
-parity with a production fused op), keeping data that flows between adjacent stages
-RESIDENT in on-chip memory instead of round-tripping through GM, and running any
-outer/iterative loop inside the kernel. This is the highest-effort phase.
+Goal: where it MEASURABLY pays, stitch the validated per-stage kernels into a single
+generated kernel that runs the outer/iterative loop in-kernel and captures a real
+overlap / residency / streaming win. Fusion is CONDITIONAL, not automatic, and it is
+NOT the highest-value work -- the gap to a tuned reference lives in the per-stage
+KERNELS (occupancy, double-buffering, pipelining), not in how they are composed
+(COOK-§8.6P #12). Before this phase the dominant stage(s) should already have been
+driven toward the Phase-6 roofline via `pto-kernel-optimizer`; fusing weak kernels just
+serializes slow parts.
 
-**Two kinds of fusion -- classify the deliverable, do NOT conflate them.** Before
-benchmarking you MUST classify what you actually built and record it (see Output):
-- `compute-fused` -- inter-stage intermediates stay RESIDENT on-chip (UB/L1/L0), the
-  outer/iterative loop runs INSIDE the kernel carrying recurrent state on-chip, and
-  the launch count collapses to ~1 (or 1-per-irreducible-Cube-stage). This is the
-  primary objective of Phase 7.
-- `packaging-fused` -- one `.cpp`/`.so`/`call_kernel`, BUT internally it issues
-  roughly the same launches the per-stage chain issues and intermediates still
-  round-trip through GM. This is the FALLBACK, NOT a pass: it is an INCOMPLETE Phase
-  7 and must be labeled as such with a per-corner reason (see Step 2 / Step 5).
-  "Ships as one binary and passes accuracy" does NOT by itself satisfy Phase 7.
+**a2a3 reality -- do NOT chase on-chip residency across a Cube<->Vec boundary.** On
+A2/A3 a Cube-produced intermediate consumed by a Vec stage (or vice-versa) CANNOT stay
+on-chip -- the cores share only GM; the on-chip CV FIFO is A5-only (PLAT-§Illegal). So
+"keep every inter-stage intermediate resident" is physically unreachable here for any
+Cube<->Vec dataflow, and a GM round-trip on that edge is NOT a Phase-7 failure. The
+achievable A2/A3 fusion wins are exactly three: (a) L1/UB residency WITHIN a same-core
+sub-chain (a Cube-only run of GEMMs stays in L1 -- COOK-§8.6P #2; a Vec-only run stays in
+UB), (b) overlap/double-buffering that HIDES the unavoidable Cube<->Vec GM round-trip
+under other work, and (c) streaming/tiling that avoids MATERIALIZING a large intermediate
+at all -- not optional at scale (a full [.,S,S]-type buffer overflows int32 offsets ~23k
+and OOMs; only a tiled/streaming kernel survives long context).
+
+**When to attempt fusion at all (gate BEFORE building).** Attempt this phase only when a
+specific, measured win exists -- else record `"fusion": "skipped (no overlap/streaming
+win available; chain is canonical)"` and stop. A real win means ONE of: (a) the algorithm
+has a same-core sub-chain that can go L1/UB-resident (COOK-§8.6P #2); (b) a noop-floor
+probe (COOK-§8.6P #10) shows a GM-heavy Cube op with a GM-light Vec partner to overlap it
+against (the #9 pairing rule); or (c) a large intermediate must be STREAMED to run/scale
+at all (long context). Pure launch-collapse is NOT a win -- a stream-ordered chain
+already overlaps its sub-launches, so "one launch" by itself buys nothing. And NEVER emit
+a single-launch kernel that puts an all-core `SYNCALL<Mix>` (or any grid barrier) on the
+PER-TILE Cube<->Vec hand-off -- that serializes the two engines and is strictly worse
+than the chain (COOK-§8.6P #5); `SYNCALL` is for stage SEAMS only.
+
+**Classify what you built (record it).**
+- `compute-fused` -- captures a real win above: same-core intermediates stay resident
+  (L1/UB), the outer loop runs in-kernel, and Cube<->Vec hand-offs (which MUST transit GM
+  on A2/A3) are OVERLAPPED/double-buffered so their latency is hidden. This is the only
+  classification that counts as a Phase-7 pass, and ONLY if it BEATS the chain in the
+  Phase-6 benchmark.
+- `packaging-fused` -- one binary issuing ~the chain's launches with the same GM traffic
+  and no overlap win. This is NOT a deliverable: do NOT build it, benchmark it, or ship
+  it. If your fusion plan collapses to this, record `"fusion": "not attempted (would be
+  packaging-only: <reason>)"` and keep the chain.
 
 **Expectation (measure, do NOT assume).** Whether `compute-fused` is FASTER is
 algorithm-dependent and must be MEASURED: removing inter-stage GM round-trips and
