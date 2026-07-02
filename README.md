@@ -154,6 +154,7 @@ npu-skillyard/
     marketplace.json     # single-entry marketplace (source ".")
   skills/                # the four PTO skills
   agents/                # stage-pipeline, pto-stage-worker
+  examples/              # tiered test programs + prompts (see examples/README.md)
   include/               # bundled kernel_common.h (the only build header kernels include)
   .mcp.json              # bundled npu-coding-mcp (needs launch config)
   .claude/
