@@ -473,8 +473,12 @@ intermediate and share ONE layout (intermediates transit GM; on-chip CV FIFO is 
   entry and thread ffts_addr through each; SYNCALL<Mix> at EACH seam; all inter-stage intermediates AND
   per-core workspaces are explicit GM buffers in the composed call_kernel ABI. CRITICAL: the seam barrier
   must use reserved FFTS flags (11-14) DISTINCT from any flags the per-stage kernels use INTERNALLY (~6-9) --
-  a flag-ID collision is the run-to-run COHERENCY RACE (not a logic bug). Optional STOP_AFTER_<stage> compile
-  flag aids staged bring-up.
+  a flag-ID collision is the run-to-run COHERENCY RACE (not a logic bug). Also drain a stage's outstanding
+  internal cross-core flags (wait_flag_dev) before its seam, and suppress each pulled-in stage's own
+  call_kernel/launch so only the mega one remains. REPAIR-LOOP AID: emit a STOP_AFTER_<stage> compile guard
+  (#ifdef ... pipe_barrier(PIPE_ALL); return;) at EVERY seam; on a misvalidation/race, bisect by recompiling
+  with successive -DMEGA_STOP_AFTER_<STAGE> to localize the first breaking stage instead of debugging the
+  whole chain.
 - "host-stream": one call_kernel issuing each stage's launch_* in dataflow order on ONE stream
   (COOK-§8.6P #21 lean-then-compose). Correct by construction, ~0 penalty when launches pre-enqueue.
 

@@ -522,8 +522,14 @@ and auto-falls back to `host-stream`:
   `call_kernel` ABI. **Critical (the flaky-ffts failure mode):** the seam barrier must use reserved
   FFTS flags (11-14) DISTINCT from any sync flags the per-stage kernels use INTERNALLY (typically
   6-9) -- a flag-ID collision between a stage's internal sync and the seam barrier is the run-to-run
-  COHERENCY race, not a logic bug. (Optional: a `STOP_AFTER_<stage>` compile flag that returns after
-  a seam is a good staged-bringup aid for the repair loop.)
+  COHERENCY race, not a logic bug. Also DRAIN a stage's outstanding internal cross-core flags
+  (`wait_flag_dev(...)`) before its seam barrier, and when you pull each stage body in, SUPPRESS its
+  own `call_kernel`/`launch_*` entry so only the mega `call_kernel`/launch remains.
+  - **Repair-loop aid (USE IT):** emit a `STOP_AFTER_<stage>` compile guard at EVERY seam
+    (`#ifdef MEGA_STOP_AFTER_<STAGE>` `pipe_barrier(PIPE_ALL); return;` `#endif`). When the composed
+    kernel misvalidates or races, BISECT: recompile with successive `-DMEGA_STOP_AFTER_<STAGE>` defines
+    to find the first stage/seam that breaks, instead of debugging the whole chain at once. This turns
+    an opaque end-to-end failure into a localized one and is the fastest path through the repair budget.
 - **`host-stream` (fallback / opt-out) -- host stream ordering.** One `call_kernel` issuing each
   stage's `launch_*` in dataflow order on ONE stream (COOK-§8.6P #21, lean-then-compose). Correct
   by construction, ~0 penalty when the launches pre-enqueue and overlap on-device.
