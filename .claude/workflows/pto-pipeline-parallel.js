@@ -39,9 +39,14 @@ export const meta = {
 //                  stages) after Benchmark; default true. Set false to ship the correct
 //                  baseline chain without the device-in-the-loop optimization campaign.
 // args.optimize_top_n (optional) how many dominant stages to optimize (default 2)
-// args.fuse       (optional, default FALSE) OPT-IN Phase 7 fusion. Only runs when set true;
-//                  even then it ships a fused kernel ONLY if it is compute-fused AND beats the
-//                  chain (packaging-only fusion is not built/shipped). Default keeps the chain.
+// args.compose_mode (optional, default "ffts") how Part A stitches the integrated chain:
+//                  "ffts" -- one launch, stages ordered ON-DEVICE at seams via SYNCALL<Mix>
+//                  (removes the per-launch host-dispatch floor; DEFAULT; auto-falls back to
+//                  host-stream if it cannot validate deterministically), or "host-stream" --
+//                  stream-ordered launch_* calls. Part A always runs; this only picks the sync.
+// args.fuse       (optional, default FALSE) OPT-IN Phase 7 Part B compute-fusion ("mix"). Only
+//                  runs when set true; even then it ships ONLY if it is compute-fused AND beats
+//                  the composed chain (packaging-only fusion is not built/shipped).
 // args.report     (optional, default true) final Report phase: organize the run dir into
 //                  ref/ src/ reports/, plot benchmark graphs, and write a README + report.md.
 // args.make_graphs (optional, default true) plot PNG graphs from the benchmarks (needs
@@ -74,6 +79,7 @@ const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 const WORKER_AGENT = ARGS?.worker_agent ?? 'pto-stage-worker'
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
+const COMPOSE_MODE = (ARGS?.compose_mode === 'host-stream') ? 'host-stream' : 'ffts'  // default ffts (auto-falls back to host-stream)
 const FUSE = ARGS?.fuse === true                     // OPT-IN; default OFF -- fusion runs only if requested
 const REPORT = ARGS?.report !== false                // default ON; organize run dir + write report
 const MAKE_GRAPHS = ARGS?.make_graphs !== false      // default ON; plot benchmark graphs (needs matplotlib)
@@ -160,6 +166,8 @@ const CHAIN_SCHEMA = {
   required: ['result'],
   properties: {
     result: { type: 'string' },   // "PASS" | "FAIL (kept per-stage kernels)" | "skipped (<reason>)"
+    mode: { type: ['string', 'null'] },        // "ffts" | "host-stream" (the sync actually shipped)
+    fell_back: { type: ['boolean', 'null'] },  // true if ffts was requested but host-stream shipped
     kernel: { type: ['string', 'null'] },
     validated_end_to_end: { type: ['boolean', 'null'] },
     repair_attempts: { type: ['integer', 'null'] },
@@ -444,27 +452,36 @@ if (!(allPass && benchmark)) {
   log('Skipping compose (gate not met or no benchmark baseline); per-stage kernels remain the output.')
 } else {
   const composePrompt = `You are running Phase 7 Part A (Compose the chain) of the PTO stage pipeline. Every
-stage PASSed on real NPU and Phase 6 benchmarks exist. Produce the ONE integrated deliverable the run
-ships by default -- do NOT attempt in-kernel compute-fusion here (that is the separate opt-in Part B).
+stage PASSed on real NPU and Phase 6 benchmarks exist. Produce the ONE integrated deliverable
+kernel_chain_<algo>.cpp/.so the run ships by default. Do NOT attempt in-kernel compute-fusion / residency
+/ overlap merges here -- that is the separate opt-in Part B.
 
 - stages (dataflow order): ${stages.join(', ')}
 - output_dir: ${OUT}
 - plan_path: ${PLAN_PATH}
 - pto_python: ${PY}
 - devices: ${DEVICES.join(', ')} (benchmark on ONE device, serially)
+- compose_mode (requested): ${COMPOSE_MODE}
 
-Emit kernel_chain_<algo>.cpp/.so: a SINGLE call_kernel that allocates one GM buffer per inter-stage
-intermediate, shares ONE layout, and issues each validated stage's launch_* in dataflow order on ONE
-stream (COOK-§8.6P #21 lean-then-compose). Intermediates transit GM; this is stream-ordered and correct
-by construction, with ~0 penalty (composed slope ~= sum of per-stage slopes -- the chain already overlaps
-its sub-launches). Do NOT add cross-core handshakes, in-kernel loops, or SYNCALL on per-tile edges -- that
-is Part B. Generate via pto-stage-kernel-generator-v2 (all rules); compile; validate END-TO-END vs the
-composed full-algorithm CPU-fp64 reference (up to 5 repairs); benchmark on the Phase-6 sweep. If it will
-not validate in budget, KEEP the per-stage kernels and return result "FAIL (kept per-stage kernels)".
-PROVENANCE: GENERATED from the stage plan + your per-stage kernels + ISA docs + cookbook only.
+Two sync modes for stitching the validated per-stage kernels; both allocate one GM buffer per inter-stage
+intermediate and share ONE layout (intermediates transit GM; on-chip CV FIFO is A5-only):
+- "ffts" (DEFAULT): a SINGLE-launch kernel where stages hand off through GM but ORDERING is enforced
+  ON-DEVICE at stage SEAMS with SYNCALL<Mix> (COOK-§8.6 / C6 -- SYNCALL is for stage seams / a single-launch
+  multi-stage kernel, NEVER a per-tile Cube<->Vec edge). Removes the per-launch host-dispatch floor (the win
+  when launch-overhead-bound). Its failure mode is a run-to-run COHERENCY RACE, not a logic bug.
+- "host-stream": one call_kernel issuing each stage's launch_* in dataflow order on ONE stream
+  (COOK-§8.6P #21 lean-then-compose). Correct by construction, ~0 penalty when launches pre-enqueue.
 
-Return: {result:"PASS"|"FAIL (kept per-stage kernels)"|"skipped (<reason>)", kernel, validated_end_to_end,
-repair_attempts, benchmark, note}. Final message IS the result.`
+If compose_mode is "host-stream", build that directly. Otherwise build "ffts" and validate it END-TO-END
+vs the composed full-algorithm CPU-fp64 reference AND run a DETERMINISM check (repeat runs must match) --
+up to 5 repairs. AUTO-FALLBACK: if the ffts chain cannot be made to validate DETERMINISTICALLY within
+budget (a race surgical edits do not fix in ~2 attempts), STOP repairing it and build the "host-stream"
+chain instead (correct by construction) -- NEVER ship a flaky ffts kernel. Benchmark whichever chain you
+ship on the Phase-6 sweep. PROVENANCE: GENERATED from the stage plan + your per-stage kernels + ISA docs +
+cookbook only -- do NOT read any pre-existing kernel's source.
+
+Return: {result:"PASS"|"FAIL (kept per-stage kernels)"|"skipped (<reason>)", mode:"ffts"|"host-stream",
+fell_back:<bool>, kernel, validated_end_to_end, repair_attempts, benchmark, note}. Final message IS the result.`
 
   chain = await agent(composePrompt, {
     label: 'compose',
@@ -472,7 +489,7 @@ repair_attempts, benchmark, note}. Final message IS the result.`
     schema: CHAIN_SCHEMA,
     agentType: 'general-purpose',
   })
-  if (chain) log(`Compose: ${chain.result}${chain.kernel ? ` -- ${chain.kernel}` : ''}`)
+  if (chain) log(`Compose: ${chain.result}${chain.mode ? ` (${chain.mode}${chain.fell_back ? ', fell back from ffts' : ''})` : ''}${chain.kernel ? ` -- ${chain.kernel}` : ''}`)
 }
 
 // ---------------------------------------------------------------------------

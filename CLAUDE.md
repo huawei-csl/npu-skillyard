@@ -56,12 +56,14 @@ agents and the workflow — learn it once:
   at the contract's production sweep.
 - **Phase 6.5 — Optimize** (workflow only). Drive dominant stages toward their strong form.
 - **Phase 7 — Composition.** *Part A — Compose (default):* always stitches the validated
-  per-stage kernels into ONE integrated deliverable `kernel_chain_<algo>` — a single
-  `call_kernel` chaining each stage's `launch_*` on one stream (intermediates via GM,
-  lean-then-compose, ~0 penalty). This is the canonical end deliverable. *Part B — Fuse
-  (opt-in, `fuse`):* the tightly-coupled in-kernel "mix"; ships *only* if it is
-  `compute-fused` and measurably beats the composed chain (packaging-only fusion is neither
-  built nor shipped).
+  per-stage kernels into ONE integrated deliverable `kernel_chain_<algo>`. Two sync modes
+  (`compose_mode`): **`ffts`** (default) — a single-launch kernel synchronized ON-DEVICE at
+  stage seams via `SYNCALL<Mix>` (removes the per-launch host-dispatch floor), which
+  **auto-falls back** to **`host-stream`** (stream-ordered `launch_*` calls, correct by
+  construction) if the FFTS chain can't validate deterministically. Intermediates transit GM
+  either way. This is the canonical end deliverable. *Part B — Fuse (opt-in, `fuse`):* the
+  tightly-coupled in-kernel "mix"; ships *only* if it is `compute-fused` and measurably beats
+  the composed chain (packaging-only fusion is neither built nor shipped).
 - **Phase 8 — Report & Packaging.** Always runs last: organize the run dir into
   `ref/` (inputs) + `src/` (generated kernels/harnesses) + `reports/` (graphs + `report.md`),
   plot benchmark graphs (matplotlib), and write a top-level `README.md` narrating what was
@@ -77,7 +79,7 @@ agents and the workflow — learn it once:
    decompose once, fan out one **`pto-stage-worker`** agent per stage in parallel, then
    benchmark *serially* (device timing must not contend), optimize, and (opt-in) fuse. Invoke with
    `args: {source, output_dir, platform?, contract?, pto_python?, pto_isa_root?,
-   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?, fuse?, report?}`.
+   include_dir?, pto_isa_repo?, bootstrap_venv?, devices?, optimize?, compose_mode?, fuse?, report?}`.
 
 Both drivers begin with a **Preflight** step that resolves every path in priority order
 (**explicit arg → env var → autodetect → documented default**) and validates it before any

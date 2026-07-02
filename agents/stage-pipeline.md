@@ -506,21 +506,33 @@ The pipeline ALWAYS ships ONE integrated deliverable, not just loose per-stage k
 There are two levels; do NOT conflate them.
 
 **Part A -- Compose the chain (DEFAULT; always runs when the gate is met).** Emit ONE
-integrated kernel `kernel_chain_<algo>.cpp/.so`: a single `call_kernel` that allocates the
-inter-stage GM buffers, shares ONE layout, and issues each validated stage's `launch_*` in
-dataflow order on ONE stream (COOK-§8.6P #21, lean-then-compose). Intermediates transit GM;
-it is stream-ordered, correct by construction, and carries ~0 penalty (composed slope ~= the
-sum of the per-stage slopes -- the chain already overlaps its sub-launches). THIS is the
-canonical end deliverable.
+integrated kernel `kernel_chain_<algo>.cpp/.so` from the validated per-stage kernels. Both
+sync modes allocate one GM buffer per inter-stage intermediate and share ONE layout
+(intermediates transit GM; the on-chip CV FIFO is A5-only). The pipeline defaults to `ffts`
+and auto-falls back to `host-stream`:
+- **`ffts` (DEFAULT) -- device-side seam synchronization.** A SINGLE-launch kernel where stages
+  hand off through GM but ORDERING is enforced ON-DEVICE at stage SEAMS with `SYNCALL<Mix>`
+  (COOK-§8.6 / C6 -- `SYNCALL` is for stage seams / a single-launch multi-stage kernel, NEVER a
+  per-tile Cube<->Vec edge). Removes the per-launch host-dispatch floor -- the win when the chain
+  is launch-overhead-bound (many stages / small dims). Its failure mode is a run-to-run COHERENCY
+  race, not a logic bug. Do NOT add residency/overlap merges -- that is Part B.
+- **`host-stream` (fallback / opt-out) -- host stream ordering.** One `call_kernel` issuing each
+  stage's `launch_*` in dataflow order on ONE stream (COOK-§8.6P #21, lean-then-compose). Correct
+  by construction, ~0 penalty when the launches pre-enqueue and overlap on-device.
+- **Auto-fallback:** validate the `ffts` chain END-TO-END vs the composed CPU-fp64 reference AND
+  run the DETERMINISM check (repeat runs must match). If it cannot be made deterministic within
+  budget (a race surgical edits do not fix in ~2 attempts), STOP and fall back to `host-stream`.
+  NEVER ship a flaky `ffts` kernel. (If `compose_mode: host-stream` was requested, build that
+  directly and skip `ffts`.)
 - **Gate:** every stage PASSed on real NPU AND Phase 6 benchmarks exist; else skip and record
   `"chain": "skipped (<reason>)"` (the per-stage kernels remain the output).
 - **Provenance:** GENERATED from the stage plan + your per-stage kernels + ISA docs + cookbook.
 - **Steps:** (1) allocate one GM buffer per inter-stage intermediate + share one layout;
-  (2) generate `kernel_chain_<algo>.cpp` (one `call_kernel`, stream-ordered `launch_*`) via
-  `pto-stage-kernel-generator-v2`; (3) compile; (4) validate END-TO-END vs the composed
-  full-algorithm CPU-fp64 reference (up to 5 repairs); (5) benchmark on the Phase-6 sweep and
-  record as the integrated result. If it will not validate in budget, KEEP the per-stage
-  kernels and record `"chain": "FAIL (kept per-stage kernels)"`.
+  (2) generate `kernel_chain_<algo>.cpp` in the selected mode via `pto-stage-kernel-generator-v2`;
+  (3) compile; (4) validate END-TO-END + determinism vs the composed CPU-fp64 reference (up to 5
+  repairs; fall back per above); (5) benchmark on the Phase-6 sweep. Record which `mode` shipped
+  and whether it `fell_back`. If neither validates in budget, KEEP the per-stage kernels and
+  record `"chain": "FAIL (kept per-stage kernels)"`.
 
 **Part B -- Compute-fusion / the "mix" (OPT-IN; only when fusion was requested).** A tightly
 coupled in-kernel merge that captures a real on-chip residency / overlap / streaming win, and
@@ -680,6 +692,8 @@ otherwise `benchmarking` is recorded as skipped:
   "benchmarking": "completed | skipped (not all stages passed)",
   "chain": {
     "result": "PASS | FAIL (kept per-stage kernels) | skipped (<reason>)",
+    "mode": "ffts | host-stream",
+    "fell_back": false,
     "kernel": "kernel_chain_<algo>.so",
     "validated_end_to_end": true,
     "benchmark": {"mean_ns": 0, "min_ns": 0, "max_ns": 0, "median_ns": 0, "p95_ns": 0, "stddev_ns": 0}
