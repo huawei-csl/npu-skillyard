@@ -39,8 +39,10 @@ Use the stage-pipeline agent to run the full PTO pipeline on
 Preflight resolves paths as **arg > env var > autodetect > default**, so if you run from a
 host project laid out that way you can omit `pto_python` / `pto_isa_root`. Set `optimize: true`
 (and drop `optimize: false`) once a stage passes and you want the optimization campaign.
-Fusion (Phase 7) is **opt-in** and off by default — add `fuse: true` to attempt it; even then a
-fused kernel ships only if it measurably beats the per-stage chain.
+The run always delivers ONE integrated kernel `kernel_chain_<algo>` (Phase 7 Part A — the
+validated per-stage kernels stitched into a single stream-ordered `call_kernel`). The
+tightly-coupled compute-fused "mix" (Part B) is **opt-in** — add `fuse: true` to attempt it,
+and even then it ships only if it measurably beats the composed chain.
 
 **Via the workflow instead:** `cd` into a clone of this repo and ask Claude to run the
 `pto-pipeline-parallel` workflow with the same fields as JSON args (add `contract`). If the

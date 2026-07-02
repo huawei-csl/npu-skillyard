@@ -275,9 +275,10 @@ After ALL sub-agents return:
   skip Phases 6 and 7, and write the final `pipeline_results.json`.
 
 Phases 3-5 are per-stage. After they finish for **all** stages, run Phase 6
-(benchmarking) **once**, globally -- gated on every stage having passed. Phase 7
-(fusion) is **OPT-IN**: run it **once** only if the user/orchestrator requested
-fusion AND Phase 6 produced a baseline; otherwise skip it.
+(benchmarking) **once**, globally -- gated on every stage having passed. Then Phase 7
+Part A (**Compose the chain**) runs by DEFAULT -- the integrated `kernel_chain_<algo>`
+deliverable -- and Part B (**compute-fusion / mix**) runs **once** only if fusion was
+requested AND Phase 6 produced a baseline.
 
 ### Phase 3: Artifact Generation
 
@@ -499,7 +500,31 @@ When the gate passes, benchmark **each** stage on real NPU (not the simulator):
    `pto-kernel-optimizer` BEFORE Phase 7 -- the gap lives in the per-stage kernels, not in
    the composition.
 
-### Phase 7: Kernel Stitching / Fusion (OPT-IN; runs only when requested, after Phase 6)
+### Phase 7: Composition (after Phase 6) -- Compose the chain (default) + optional compute-fusion
+
+The pipeline ALWAYS ships ONE integrated deliverable, not just loose per-stage kernels.
+There are two levels; do NOT conflate them.
+
+**Part A -- Compose the chain (DEFAULT; always runs when the gate is met).** Emit ONE
+integrated kernel `kernel_chain_<algo>.cpp/.so`: a single `call_kernel` that allocates the
+inter-stage GM buffers, shares ONE layout, and issues each validated stage's `launch_*` in
+dataflow order on ONE stream (COOK-§8.6P #21, lean-then-compose). Intermediates transit GM;
+it is stream-ordered, correct by construction, and carries ~0 penalty (composed slope ~= the
+sum of the per-stage slopes -- the chain already overlaps its sub-launches). THIS is the
+canonical end deliverable.
+- **Gate:** every stage PASSed on real NPU AND Phase 6 benchmarks exist; else skip and record
+  `"chain": "skipped (<reason>)"` (the per-stage kernels remain the output).
+- **Provenance:** GENERATED from the stage plan + your per-stage kernels + ISA docs + cookbook.
+- **Steps:** (1) allocate one GM buffer per inter-stage intermediate + share one layout;
+  (2) generate `kernel_chain_<algo>.cpp` (one `call_kernel`, stream-ordered `launch_*`) via
+  `pto-stage-kernel-generator-v2`; (3) compile; (4) validate END-TO-END vs the composed
+  full-algorithm CPU-fp64 reference (up to 5 repairs); (5) benchmark on the Phase-6 sweep and
+  record as the integrated result. If it will not validate in budget, KEEP the per-stage
+  kernels and record `"chain": "FAIL (kept per-stage kernels)"`.
+
+**Part B -- Compute-fusion / the "mix" (OPT-IN; only when fusion was requested).** A tightly
+coupled in-kernel merge that captures a real on-chip residency / overlap / streaming win, and
+ships ONLY if it measurably BEATS the Part A composed chain. Everything below is Part B.
 
 Goal: where it MEASURABLY pays, stitch the validated per-stage kernels into a single
 generated kernel that runs the outer/iterative loop in-kernel and captures a real
@@ -653,6 +678,12 @@ otherwise `benchmarking` is recorded as skipped:
   ],
   "summary": {"pass": 0, "fail": 0, "total": 0},
   "benchmarking": "completed | skipped (not all stages passed)",
+  "chain": {
+    "result": "PASS | FAIL (kept per-stage kernels) | skipped (<reason>)",
+    "kernel": "kernel_chain_<algo>.so",
+    "validated_end_to_end": true,
+    "benchmark": {"mean_ns": 0, "min_ns": 0, "max_ns": 0, "median_ns": 0, "p95_ns": 0, "stddev_ns": 0}
+  },
   "fusion": {
     "result": "PASS (compute-fused) | FAIL (kept chain) | skipped (<reason>) | not attempted (packaging-only: <reason>)",
     "classification": "compute-fused",

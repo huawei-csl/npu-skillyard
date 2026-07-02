@@ -3,7 +3,7 @@
 A Claude Code **plugin** for turning **PyTorch algorithms into validated, benchmarked
 Ascend PTO-ISA kernels**. It bundles the skills, agents, and an MCP server that drive a
 full pipeline: decompose -> generate artifacts -> generate kernels -> validate on real NPU
--> benchmark -> optimize -> fuse.
+-> benchmark -> optimize -> compose (chain) -> (opt-in) fuse.
 
 This repository is **both a plugin and a single-entry marketplace**, so it can be installed
 directly.
@@ -69,7 +69,7 @@ After install, the skills are namespaced under the plugin, e.g.
 
 ### Workflow (`.claude/workflows/`)
 - **pto-pipeline-parallel.js** -- the parallel variant of the pipeline (decompose once, fan
-  out per-stage workers, then benchmark serially, optimize, fuse).
+  out per-stage workers, then benchmark serially, optimize, compose the chain, and (opt-in) fuse).
 
   > Workflows are **not** an installable plugin component. Two ways to use it (this repo
   > ships both):
@@ -133,7 +133,8 @@ and what was tried:
   README.md            # narrative: what was achieved, blockers + tries, how to reproduce
   pipeline_results.json
   ref/                 # inputs: the source algorithm, stage_plan.json, spec_*.json
-  src/                 # generated: kernel_*.cpp/.so, kernel_fused_*, validation_*/benchmark_*.py
+  src/                 # generated: per-stage kernel_*.cpp/.so, the integrated kernel_chain_*,
+                       #            kernel_fused_* (if fused), validation_*/benchmark_*.py
   reports/
     report.md          # per-stage accuracy + benchmark tables, embedded graphs
     benchmarks.json    # raw aggregated benchmark data

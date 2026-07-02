@@ -8,6 +8,7 @@ export const meta = {
     { title: 'Stages' },
     { title: 'Benchmark' },
     { title: 'Optimize' },
+    { title: 'Compose' },
     { title: 'Fuse' },
     { title: 'Report' },
   ],
@@ -149,6 +150,20 @@ const REPORT_SCHEMA = {
     graphs: { type: 'array', items: { type: 'string' } },
     readme: { type: ['string', 'null'] },
     report: { type: ['string', 'null'] },
+    note: { type: ['string', 'null'] },
+  },
+}
+
+const CHAIN_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['result'],
+  properties: {
+    result: { type: 'string' },   // "PASS" | "FAIL (kept per-stage kernels)" | "skipped (<reason>)"
+    kernel: { type: ['string', 'null'] },
+    validated_end_to_end: { type: ['boolean', 'null'] },
+    repair_attempts: { type: ['integer', 'null'] },
+    benchmark: { type: ['object', 'null'] },
     note: { type: ['string', 'null'] },
   },
 }
@@ -417,8 +432,52 @@ markers_closed: [..], benchmarks_json: path}. Final message IS the result.`
 }
 
 // ---------------------------------------------------------------------------
-// Phase: Fuse (Phase 7) -- OPT-IN (args.fuse). Even when requested, ships a fused
-// kernel ONLY if it is compute-fused AND beats the chain; else keeps the chain.
+// Phase: Compose (Phase 7 Part A) -- DEFAULT. Stitch the validated per-stage
+// kernels into ONE integrated deliverable: a single call_kernel that chains each
+// stage's launch on one stream (intermediates via GM, lean-then-compose, ~0
+// penalty). This is the canonical end deliverable; the fused "mix" is opt-in below.
+// ---------------------------------------------------------------------------
+phase('Compose')
+
+let chain = null
+if (!(allPass && benchmark)) {
+  log('Skipping compose (gate not met or no benchmark baseline); per-stage kernels remain the output.')
+} else {
+  const composePrompt = `You are running Phase 7 Part A (Compose the chain) of the PTO stage pipeline. Every
+stage PASSed on real NPU and Phase 6 benchmarks exist. Produce the ONE integrated deliverable the run
+ships by default -- do NOT attempt in-kernel compute-fusion here (that is the separate opt-in Part B).
+
+- stages (dataflow order): ${stages.join(', ')}
+- output_dir: ${OUT}
+- plan_path: ${PLAN_PATH}
+- pto_python: ${PY}
+- devices: ${DEVICES.join(', ')} (benchmark on ONE device, serially)
+
+Emit kernel_chain_<algo>.cpp/.so: a SINGLE call_kernel that allocates one GM buffer per inter-stage
+intermediate, shares ONE layout, and issues each validated stage's launch_* in dataflow order on ONE
+stream (COOK-§8.6P #21 lean-then-compose). Intermediates transit GM; this is stream-ordered and correct
+by construction, with ~0 penalty (composed slope ~= sum of per-stage slopes -- the chain already overlaps
+its sub-launches). Do NOT add cross-core handshakes, in-kernel loops, or SYNCALL on per-tile edges -- that
+is Part B. Generate via pto-stage-kernel-generator-v2 (all rules); compile; validate END-TO-END vs the
+composed full-algorithm CPU-fp64 reference (up to 5 repairs); benchmark on the Phase-6 sweep. If it will
+not validate in budget, KEEP the per-stage kernels and return result "FAIL (kept per-stage kernels)".
+PROVENANCE: GENERATED from the stage plan + your per-stage kernels + ISA docs + cookbook only.
+
+Return: {result:"PASS"|"FAIL (kept per-stage kernels)"|"skipped (<reason>)", kernel, validated_end_to_end,
+repair_attempts, benchmark, note}. Final message IS the result.`
+
+  chain = await agent(composePrompt, {
+    label: 'compose',
+    phase: 'Compose',
+    schema: CHAIN_SCHEMA,
+    agentType: 'general-purpose',
+  })
+  if (chain) log(`Compose: ${chain.result}${chain.kernel ? ` -- ${chain.kernel}` : ''}`)
+}
+
+// ---------------------------------------------------------------------------
+// Phase: Fuse (Phase 7 Part B) -- OPT-IN (args.fuse). Even when requested, ships a
+// fused kernel ONLY if it is compute-fused AND beats the composed chain; else keeps it.
 // ---------------------------------------------------------------------------
 phase('Fuse')
 
@@ -428,8 +487,10 @@ if (!FUSE) {
 } else if (!(allPass && benchmark)) {
   log('Skipping fusion (gate not met or no benchmark baseline).')
 } else {
-  const fusePrompt = `You are running Phase 7 (Kernel Stitching / Fusion) of the PTO stage pipeline. Fusion
-was REQUESTED, every stage PASSed on real NPU, and Phase 6 benchmarks exist.
+  const fusePrompt = `You are running Phase 7 Part B (compute-fusion / the "mix") of the PTO stage pipeline.
+Fusion was REQUESTED, every stage PASSed on real NPU, and Phase 6 benchmarks exist. Part A already
+produced the composed chain (kernel_chain_<algo>) -- your job is the tightly-coupled in-kernel merge,
+and it ships ONLY if it measurably BEATS that composed chain.
 
 - stages: ${stages.join(', ')}
 - output_dir: ${OUT}
@@ -444,14 +505,15 @@ partner to overlap (#9, proven by a #10 noop-floor probe), or a large intermedia
 STREAMED to scale. a2a3 reality: a Cube<->Vec intermediate MUST transit GM (on-chip CV FIFO is
 A5-only), so a GM round-trip on that edge is EXPECTED -- residency applies only WITHIN a same-core
 sub-chain. Pure launch-collapse is NOT a win. NEVER put SYNCALL<Mix> on a per-tile Cube<->Vec hand-off
-(#5). DEFAULT to lean-then-compose (#21) unless a tighter in-kernel merge is the sole remaining lever
-AND its cost is hideable. Write the win + residency/launch budget up front. Generate via
-pto-stage-kernel-generator-v2 (all rules); compile -> validate end-to-end vs the composed
-full-algorithm CPU-fp64 reference (up to 8 repairs); benchmark fused-vs-chain AND vs the Phase-6
-reference/roofline. It is a PASS ONLY if compute-fused AND it BEATS the chain. If the build collapses
-to packaging-only (same launches/GM traffic, no overlap/residency/streaming win), do NOT ship it --
-record "not attempted (packaging-only: <reason>)" and keep the chain. PROVENANCE: the fused kernel
-must be GENERATED, never copied from any pre-existing kernel.
+(#5). Pursue an in-kernel merge ONLY when it is the sole remaining lever AND its cost is hideable
+(the plain composed chain already exists from Part A -- do not just rebuild it). Write the win +
+residency/launch budget up front. Generate via pto-stage-kernel-generator-v2 (all rules); compile ->
+validate end-to-end vs the composed full-algorithm CPU-fp64 reference (up to 8 repairs); benchmark
+fused vs the Part A composed chain (kernel_chain) AND vs the Phase-6 reference/roofline. It is a PASS
+ONLY if compute-fused AND it BEATS the composed chain. If the build collapses to packaging-only (same
+launches/GM traffic, no overlap/residency/streaming win), do NOT ship it -- record "not attempted
+(packaging-only: <reason>)" and keep the composed chain. PROVENANCE: the fused kernel must be
+GENERATED, never copied from any pre-existing kernel.
 
 Return the fusion result object: {result, classification:"compute-fused", win_captured, launch_count:{target,actual}, residency, speedup_vs_chain, kernel}. Final message IS the result.`
 
@@ -474,6 +536,7 @@ const pipelineSummary = {
   summary: { pass: passed.length, fail: failed.length, total: stages.length },
   benchmarking: allPass ? (benchmark ?? 'attempted') : 'skipped (not all stages passed)',
   optimization: optimization ?? (OPTIMIZE ? (allPass && benchmark ? 'attempted' : 'skipped (gate not met)') : 'skipped (disabled)'),
+  chain: chain ?? (allPass && benchmark ? 'attempted' : 'skipped (gate not met)'),
   fusion: fusion ?? (!FUSE ? 'skipped (not requested; chain is canonical)' : (allPass && benchmark ? 'attempted' : 'skipped (gate not met)')),
 }
 
