@@ -468,7 +468,13 @@ intermediate and share ONE layout (intermediates transit GM; on-chip CV FIFO is 
 - "ffts" (DEFAULT): a SINGLE-launch kernel where stages hand off through GM but ORDERING is enforced
   ON-DEVICE at stage SEAMS with SYNCALL<Mix> (COOK-§8.6 / C6 -- SYNCALL is for stage seams / a single-launch
   multi-stage kernel, NEVER a per-tile Cube<->Vec edge). Removes the per-launch host-dispatch floor (the win
-  when launch-overhead-bound). Its failure mode is a run-to-run COHERENCY RACE, not a logic bug.
+  when launch-overhead-bound). Structure: refactor each validated per-stage kernel's device body into a
+  device function and invoke them in dataflow order inside ONE launch_*; set_ffts_base_addr(ffts_addr) at
+  entry and thread ffts_addr through each; SYNCALL<Mix> at EACH seam; all inter-stage intermediates AND
+  per-core workspaces are explicit GM buffers in the composed call_kernel ABI. CRITICAL: the seam barrier
+  must use reserved FFTS flags (11-14) DISTINCT from any flags the per-stage kernels use INTERNALLY (~6-9) --
+  a flag-ID collision is the run-to-run COHERENCY RACE (not a logic bug). Optional STOP_AFTER_<stage> compile
+  flag aids staged bring-up.
 - "host-stream": one call_kernel issuing each stage's launch_* in dataflow order on ONE stream
   (COOK-§8.6P #21 lean-then-compose). Correct by construction, ~0 penalty when launches pre-enqueue.
 

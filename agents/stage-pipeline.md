@@ -514,8 +514,16 @@ and auto-falls back to `host-stream`:
   hand off through GM but ORDERING is enforced ON-DEVICE at stage SEAMS with `SYNCALL<Mix>`
   (COOK-§8.6 / C6 -- `SYNCALL` is for stage seams / a single-launch multi-stage kernel, NEVER a
   per-tile Cube<->Vec edge). Removes the per-launch host-dispatch floor -- the win when the chain
-  is launch-overhead-bound (many stages / small dims). Its failure mode is a run-to-run COHERENCY
-  race, not a logic bug. Do NOT add residency/overlap merges -- that is Part B.
+  is launch-overhead-bound (many stages / small dims). Do NOT add residency/overlap merges -- that
+  is Part B. **Structure:** refactor each validated per-stage kernel's device body into a device
+  function and invoke them in dataflow order inside ONE `launch_*`; call `set_ffts_base_addr(ffts_addr)`
+  at entry and thread `ffts_addr` through each; place a `SYNCALL<Mix>` all-core barrier at EACH seam.
+  All inter-stage intermediates AND per-core workspaces are explicit GM buffers in the composed
+  `call_kernel` ABI. **Critical (the flaky-ffts failure mode):** the seam barrier must use reserved
+  FFTS flags (11-14) DISTINCT from any sync flags the per-stage kernels use INTERNALLY (typically
+  6-9) -- a flag-ID collision between a stage's internal sync and the seam barrier is the run-to-run
+  COHERENCY race, not a logic bug. (Optional: a `STOP_AFTER_<stage>` compile flag that returns after
+  a seam is a good staged-bringup aid for the repair loop.)
 - **`host-stream` (fallback / opt-out) -- host stream ordering.** One `call_kernel` issuing each
   stage's `launch_*` in dataflow order on ONE stream (COOK-§8.6P #21, lean-then-compose). Correct
   by construction, ~0 penalty when the launches pre-enqueue and overlap on-device.
