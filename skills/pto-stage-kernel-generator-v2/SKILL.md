@@ -625,6 +625,12 @@ error. For any feature width above 64 this is a silent-wrong reduction. Reduce
 either row-by-row (`1 x width -> 1 x 8` per row) or tile the reduction into
 64-lane blocks and sum the partials. (Observed: a multi-row reduction over a
 128-wide tile truncated to its first 64 lanes; the per-row form was correct.)
+For the correct wide matvec/GEMV pattern -- reduce the wide axis with `TROWSUM`
+(per-row output, NOT `TCOLSUM` whose per-column output truncates at 64), and since
+`TROWSUM` ALSO reduces only the first 64 lanes of a >64-wide row on this build
+(dav-c220/CANN 9.1.0; verified on-NPU), split the reduced axis into <=64-lane blocks
+and `TADD` the partials, plus the paired rank-1 update in one orientation -- see
+COOK-§10.5.
 
 Always verify reduction instruction signatures in the PTO ISA reference. → PLAT-§Reductions
 
@@ -1256,6 +1262,11 @@ For recurrent/scan stages:
   reduce with TROWSUM: that forces every free-axis quantity into column 0,
   disagrees with the outer-product orientation, and yields a per-step error that
   COMPOUNDS over the scan (exact at step 0, growing every step). See C28(a)/(b).
+  EXCEPTION (wide free axis): when the free/output axis exceeds 64 lanes (e.g.
+  dv=128), `TCOLSUM` silently truncates its output to the first 64 columns. In that
+  case use the reduce-over-columns `TROWSUM` orientation (state `[dv, dk]`, reduce
+  over dk cols) from COOK-§10.5, which handles widths >64 and keeps the matvec and
+  rank-1 update in one consistent orientation.
 - Build the rank-1 update from broadcasts, not TROWEXPANDMUL: a row-indexed
   column scalar via TROWEXPAND (reads col 0) times a `[1, free_axis]` row via
   TCOLEXPAND, then TMUL. To place a vector in column 0 without a rejected

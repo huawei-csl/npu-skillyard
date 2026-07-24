@@ -1728,6 +1728,72 @@ TMUL(coeff_ub, coeff_ub, msk_ub);
 
 ---
 
+## COOK-§10.5: Wide-Axis Reduction and Vec Matvec (reduced axis > 64 lanes)
+
+For a tile Vec matvec `y[i] = sum_j S[i,j] * k[j]` (a GEMV / one matvec step of a
+recurrent scan) where the **reduced axis is wider than the 64-fp32 Vec lane block**
+(e.g. dk = 128), TWO things decide correctness: the reduction DIRECTION and the 64-lane
+SPLIT. Both are **verified on real NPU (dav-c220, CANN 9.1.0)** -- the ISA source alone
+is misleading here (see the "why not one TROWSUM" note).
+
+**(A) Direction -- reduce the wide axis with `TROWSUM` (per-row output), not `TCOLSUM`.**
+- `TROWSUM(dst, src, tmp)` reduces each row over its COLUMNS -> one **per-row scalar**
+  (narrow output). This is the right shape for a matvec: output `y[i]` is one value per
+  output row.
+- `TCOLSUM(dst, src)` reduces each column over its ROWS -> a `[1, W]` per-column row. It
+  masks `set_vector_mask(0, W)` and issues a single `vadd` (`rptTimes = 0`), so its
+  OUTPUT width truncates to the first **64 fp32 lanes**: for `W > 64` the tail is
+  silently wrong. This is the trap behind "only the first 64 outputs are correct."
+
+**(B) Split -- even `TROWSUM` reduces only the first 64 lanes of a >64-wide row on this
+build.** The `TRowReduceInstr` repeat-tiling path in the ISA source is NOT what runs for
+a RowMajor dst on dav-c220/CANN 9.1.0 (confirmed by isolation test: a single `TROWSUM`
+over a 128-wide row summed only lanes 0..63). So **split the reduced axis into <=64-lane
+blocks and `TADD` the partials** (this is the C15 pattern, and it is REQUIRED, not
+optional):
+
+```cpp
+// S : [dv, dk]  (output dim = rows, reduced dim = cols) -- keep this orientation
+// k : [1, dk] (the vector).  dk = 128 -> two 64-lane halves.
+UbND<float, DV, 64> S_lo, S_hi;       // the two dk-halves of S (or views into S[:, :64] / S[:,64:])
+UbND<float, 1, 64>  k_lo, k_hi;
+UbND<float, DV, 64> kexp, prod;
+UbND<float, DV, 8>  y_lo, y_hi, y, tmp;
+
+TCOLEXPAND(kexp, k_lo); TMUL(prod, S_lo, kexp); TROWSUM(y_lo, prod, tmp);  // lanes 0..63
+TCOLEXPAND(kexp, k_hi); TMUL(prod, S_hi, kexp); TROWSUM(y_hi, prod, tmp);  // lanes 64..127
+TADD(y, y_lo, y_hi);                  // full-width per-row scalar in col 0
+// y[i] = GetValue on row i, col 0
+```
+
+For the exact fp32 shapes `[64,128]`, `[32,256]`, `[16,512]`, `[8,1024]` with a ColMajor
+`[R,1]` dst, `TROWSUM` auto-dispatches a correct shape-specialized fast path (no manual
+split needed) -- but do NOT rely on this for other shapes/dst-layouts; verify on the gate.
+
+**(C) Rank-1 update** `S += outer(y_delta, k)` stays in the SAME `[dv, dk]` orientation
+(no transpose), so reduce direction and update direction agree end-to-end:
+
+```cpp
+UbND<float, DV, DK> y_exp, k_exp, outer;
+TROWEXPAND(y_exp, reinterpret_cast<UbDN<float, DV, 1>&>(y_delta)); // per-row scalar across cols
+TCOLEXPAND(k_exp, k_row);                                          // k down rows
+TMUL(outer, y_exp, k_exp); TADD(S, S, outer);                     // S += outer
+```
+
+**(D) Placing a GM-contiguous vector into col 0** (needed to feed a per-row scalar, e.g.
+`v` in a delta-rule step): a `[64,64]` `TTRANS` reliably delivers an output ROW but NOT
+an output column (it keeps only the diagonal 16x16 fractal), and a `DIM_4=1` strided GM
+load PACKS contiguously rather than scattering to col 0. The reliable per-row column
+producer is **broadcast (`TCOLEXPAND`) x identity-mask (`TTRI`) then `TROWSUM`**.
+
+Cross-refs: this **amends S9** (SKILL.md) for the wide-free-axis case (its `TCOLSUM`
+orientation truncates when the free/output axis > 64) and **reinforces C15** (the 64-lane
+limit applies to `TROWSUM` too on this build, so the block-split is mandatory). See also
+COOK-§10 (broadcast ops). ALWAYS verify on the real-NPU gate across the FULL width
+(not a sub-64 sim shape) and explicitly check the tail rows -- the truncation is silent.
+
+---
+
 ## COOK-§11: Dynamic Tail Handling
 
 Keep the fast path static and isolate only the tail logic.
