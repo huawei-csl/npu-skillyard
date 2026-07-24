@@ -1,7 +1,7 @@
 {
   "name": "npu-skillyard",
   "description": "PyTorch algorithm -> Ascend PTO-ISA kernel generation: decompose into stages, generate validation/benchmark artifacts and kernels, validate on real NPU, benchmark, optimize, and fuse.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "keywords": ["pytorch", "pto", "pto-isa", "ascend", "npu", "kernel-generation", "ml-compiler"],
   "author": {
     "name": "Endri Bezati",
