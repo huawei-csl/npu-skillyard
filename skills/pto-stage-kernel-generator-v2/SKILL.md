@@ -922,6 +922,15 @@ This applies to ALL Vec ops that read from the pipeline: `TEXP`, `TADD`, `TSUB`,
 `TMUL`, `TSEL`, `TROWSUM`, `TCOLSUM`. If an operand came from `TLOAD`, push it
 with `TMULS(x, x, 1.0f)` first. → PLAT-§Pipeline
 
+**C27-escape: `TAXPY` reads BOTH operands from the BUFFER.** `TAXPY(dst, src, a)`
+computes `dst += a * src` reading `dst` and `src` from the tile buffer, so it does
+NOT need the push. A broadcast-add prologue built from `TLOAD`ed operands can
+therefore be written as `TAXPY(acc, addend, 1.0f)` with no `TMULS(x,x,1.0f)`
+pushes and no intervening `pipe_barrier(PIPE_V)` per operand. Measured on a
+masked-softmax kernel: a 5-op push-and-add prologue collapsed to 2 ops, worth
+~4% end-to-end. Prefer `TAXPY` whenever the operation is `dst += a*src` and the
+operands come from `TLOAD`. → COOK-§6.5
+
 **C28. Vec-contraction tile-shape traps (matvec / outer-product / recurrent state).**
 Three layout traps surface whenever a stage does matvecs and rank-1 outer
 products on the Vec core (the GEMV / outer-product path of the decision tree and

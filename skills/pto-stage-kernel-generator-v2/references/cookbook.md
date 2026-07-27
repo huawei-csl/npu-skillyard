@@ -636,6 +636,55 @@ Use when:
 
 ---
 
+## COOK-§6.5: Deep Software Pipelines -- the event-id budget (>=3-deep prefetch)
+
+A 2-slot prefetch (load chunk k+1 while computing chunk k) is the usual win, but
+going **3-deep** (prefetch 2 ahead) is where naive event allocation deadlocks. The
+hardware exposes a small set of usable event ids; reusing one id across three or
+more pipe pairs deadlocks, and `EVENT_ID4` has been observed unusable at runtime.
+
+**Budget that works (verified on dav-c220):** give each of `EVENT_ID0`,
+`EVENT_ID1`, `EVENT_ID2` exactly **two** pipe pairs -- `MTE2->V` (load ready) and
+`MTE3->MTE2` (buffer free, the WAR guard) -- one id per pipeline slot; then
+collapse `V->MTE3` (compute done, store may start) onto a single `EVENT_ID3`,
+because its `set_flag`/`wait_flag` are back-to-back and therefore a strict 1:1
+FIFO that cannot interleave. No id is shared by three pipe pairs, and `EVENT_ID4`
+is never needed.
+
+```cpp
+// slot s in {0,1,2} -> event id s ; V->MTE3 always on ID3
+for (int i = 0; i < n_chunks + 2; ++i) {
+  const int s_load = i % 3, s_comp = (i - 2) % 3;
+  if (i < n_chunks) {                       // issue load for slot s_load
+    if (i >= 3) wait_flag(PIPE_MTE3, PIPE_MTE2, (event_t)s_load); // buffer free
+    TLOAD(buf[s_load], ...);
+    set_flag(PIPE_MTE2, PIPE_V, (event_t)s_load);
+  }
+  if (i >= 2) {                             // compute slot s_comp
+    wait_flag(PIPE_MTE2, PIPE_V, (event_t)s_comp);
+    /* ... Vec body on buf[s_comp] ... */
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+    TSTORE(..., buf[s_comp]);
+    set_flag(PIPE_MTE3, PIPE_MTE2, (event_t)s_comp);  // buffer free
+  }
+}
+```
+
+**Two failure modes this avoids**, both observed before the budget was found: an
+id reused across >=3 pipe pairs deadlocks the core (the run hangs and a killed
+mid-flight kernel can leave the device wedged for the next launch); and the only
+other deadlock-free allocation had a genuine buffer-reuse data hazard that passed
+at 2 iterations and failed at >=4, so **validate a deep pipeline at a high
+iteration count, not the minimum**. Determinism must be re-checked with fresh GM
+allocations, not just repeated launches on the same buffers.
+
+Measured effect: on a masked-softmax kernel, 2-slot prefetch took the ratio to
+vendor from 1.02x to 0.92x and the 3-deep form to 0.75x. Combine with `TAXPY`
+(C27-escape) to keep the Vec body short enough that the loads dominate.
+
+---
+
 ## COOK-§7: L0 Ping-Pong For Cube GEMM Slices
 
 When a `K` dimension is split into repeated 64-wide pieces.
