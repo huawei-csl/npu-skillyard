@@ -696,9 +696,11 @@ Independent of sync: **validate a deep pipeline at a high iteration count, not t
 genuine buffer-reuse hazard can pass at 2 iterations and fail at >=4 -- and re-check determinism
 with fresh GM allocations, not just repeated launches on the same buffers.
 
-**If your seam is Cube<->Vec rather than intra-core, do not hand-roll it at all -- use the
-`TPipe`/`TPUSH`/`TPOP` FIFO (COOK-6.6), which handles space-wait, store and data-ready
-sync for you.** This entry applies only to intra-core pipe pairs.
+**If your seam is Cube<->Vec rather than intra-core, reach for the
+`TPipe`/`TPUSH`/`TPOP` FIFO (COOK-6.6) before hand-rolling it -- it handles
+space-wait, store and data-ready sync for you. Bring it up at your production
+shape first: COOK-6.6 records shape/depth combinations that fault on hardware.**
+This entry applies only to intra-core pipe pairs.
 
 Scope: these findings are from Vec-only probes and say nothing about `SYNCALL<Mix>` cross-core
 seams; they settle the intra-core pipe-pair question only.
@@ -733,10 +735,13 @@ struct TPipe;
 2. stores the producer tile into the current slot;
 3. records data-ready synchronization for the consumer.
 
-That is the whole producer-side protocol -- no event ids to allocate, no set/wait
-balance to reason about, no WAR guard to hand-write. There is also a GM-slot
-workflow: `TALLOC` a slot view, write it with ordinary memory instructions, then
-`TPUSH(Pipe&, GlobalData&)` to commit.
+That is the whole **cross-core** protocol: no FFTS flag ids to allocate, no
+cross-core credit balance to reason about, no WAR guard to hand-write. It does
+**not** cover the intra-core ordering around the call -- you still write the
+ordinary `set_flag`/`wait_flag` pairs (`PIPE_M -> PIPE_FIX` before the push,
+`PIPE_MTE3 -> PIPE_MTE2` around the pop), exactly as in a kernel with no FIFO.
+There is also a GM-slot workflow: `TALLOC` a slot view, write it with ordinary
+memory instructions, then `TPUSH(Pipe&, GlobalData&)` to commit.
 
 **Vendor reference pattern.** pto-isa ships a Flash Attention pipeline recipe using
 exactly this (`.claude/skills/pto-isa-flash-atten-a3-pipeline/` upstream): a
@@ -761,12 +766,55 @@ only `platform_model_a5.md` covered them -- and none of 76 generated kernels use
 one. A generated flash-attention kernel consequently staged its Cube<->Vec seam by
 hand and saturated at 48 TFLOP/s against a vendor operator reaching 128.
 
-**Status: DOCUMENTED HERE, NOT YET PROBED ON HARDWARE BY US.** Everything above is
-from the official `docs/isa/TPUSH.md`, `docs/isa/TPOP.md`, the headers, and the
-vendor recipe -- not from our own measurement. Verify the pipe declaration, slot
-sizing and drain against a small kernel before trusting it in a deliverable, and
-record what you find here. Do not let this entry become the thing a later run cites
-as evidence; it is a pointer to the vendor's mechanism, not a measured result.
+**Status: PROBED ON REAL HARDWARE (910B2, CANN 9.1.0, pto-isa `109c9f72`).** It
+works, it is exact, and it is fragile in ways we could not pin down. Read all
+three parts before using it.
+
+*(1) It works and it is bit-accurate.* A C2V pipe (`TPipe<0, DIR_C2V, SlotBytes,
+1>`, `TPUSH` of a `TileAcc` on Cube, `TPOP` of a `Tile<Vec>` on both AIV
+sub-blocks, `TILE_UP_DOWN`) computing `A@B + bias` matched a CPU-float64
+reference to **max relative error 1e-07** over 1..64 tiles at 128x128x128. Two
+API facts worth having: `TPOP` **assigns the consumer tile itself** out of
+`C2V_CONSUMER_BUF` with `LocalSlotNum`-way rotation, so do not `TASSIGN` the
+popped tile; and the FIFO handles only the *cross-core* handshake -- you still
+write the ordinary intra-core `set_flag`/`wait_flag` around `TPUSH`/`TPOP`
+(`PIPE_M -> PIPE_FIX` before the push, `PIPE_MTE3 -> PIPE_MTE2` around the pop).
+The earlier claim in this entry that there is "no set/wait balance to reason
+about" was wrong and is corrected here.
+
+*(2) Some (shape, depth) combinations fault, deterministically.* Each row below
+was repeated on independent, freshly health-checked devices:
+
+| tile M x K x N | slot | depth 1 | depth 2 |
+|---|---|---|---|
+| 128 x 128 x 128 | 64 KB | PASS 8/8 | FAULT 8/8 |
+| 128 x 128 x 64  | 32 KB | PASS | PASS |
+| 128 x 128 x 32  | 16 KB | FAULT 6/6 | PASS |
+| 16 x 32 x 32    | 2 KB  | PASS 5/5 | PASS 5/5 |
+
+The fault is an AIV aicore exception (`507015`, *"fftsplus aivector error"*,
+decoded as *"VEC instruction to read/write UB is out of bounds"*) -- not a hang,
+not a wrong answer. Ruled out as causes: our UB layout (80 KB of extra clearance
+changes nothing), our compile flags (pto-isa's exact CCE option set changes
+nothing), and the torch_npu/ctypes loader (a pure-ACL host reproduces it). **Not**
+ruled out: a defect in our probe -- pto-isa's own `tpushpop_cv` conformance
+kernel, run unmodified through the same loaders, passed 50/50.
+
+*(3) Therefore: usable, but validate the exact production configuration.* Do not
+assume a pipe that passes at one tile shape or FIFO depth passes at another --
+that assumption is falsified above. Bring the FIFO up at the real shape first, on
+real hardware, before building a stage around it. And note **no performance
+number exists**: the comparison against a hand-staged seam needs the 64 KB-slot,
+depth>=2 configuration, which is the one that faults, so there is no
+TPUSH-vs-hand-rolled ratio to cite. Full probe, controls and raw counts:
+`skillyard-runs/isa_probes/README.md`.
+
+Two smaller findings from the same probe. `docs/isa/TPUSH.md` in the pinned tree
+says `SyncPeriod = (SlotNum <= 2) ? SlotNum : SlotNum/2`; both the A2/A3 and A5
+headers define `SyncPeriod = SlotNum`, so trust the header. And the npu-coding-mcp
+serves a **newer** TPUSH page than the pinned checkout (extra overloads, and the
+wrong `SyncPeriod` line already removed) -- when the two disagree on this
+instruction, the MCP is ahead.
 
 ---
 

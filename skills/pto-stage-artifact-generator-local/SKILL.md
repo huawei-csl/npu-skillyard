@@ -222,6 +222,7 @@ Before returning the JSON output, verify:
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
 - [ ] BenchmarkScript supports `--baseline-so` for a within-process paired A/B and reports the paired delta (rule 28)
 - [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full: flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
+- [ ] Any launch that can raise an aicore exception is followed by a device health check before a FAIL is recorded, with retry on a second device; a fault that cannot be reproduced on a healthy device is reported as `device-poisoned`, not as a stage failure (rule 30)
 - [ ] No hard-coded dimension values (HV, H, K, V) — all derived from StageSpec.problem
 - [ ] No double-escaped `\n` in Python source — plain parseable text after JSON decode
 
@@ -383,6 +384,32 @@ Before returning the JSON output, verify:
 
     If any of a-g cannot be satisfied, label the number ADVISORY in the JSON and in the
     report. Never present an unverified vendor ratio as a result.
+
+30. **An aicore exception POISONS the NPU device. Treat "device faulted" as STOP-AND-MOVE,
+    never as "this stage FAILs".**
+    Measured on 910B2 / CANN 9.1.0: after one kernel raised an aicore exception
+    (`507015`), the *same binary that had just run 30/30 clean on that device* then failed
+    on iteration 0, fifty times in a row, while two other devices ran it 50/50 clean at
+    the same wall-clock moment. The device recovered on its own roughly half an hour
+    later. Detail: `skillyard-runs/isa_probes/README.md`, section 4.
+
+    The failure mode this creates is not a lost run, it is a **fabricated one**: the first
+    genuine fault converts every later launch on that device into a fault, and a harness
+    that records verdicts blindly reports a whole sweep of stages as broken when only one
+    was. This has already invalidated two of our own probe sweeps.
+
+    So a harness that launches kernels which can fault MUST:
+    a. **Health-check before trusting a FAIL.** After any launch that returns
+       `507015`/`aicore exception`, re-run a known-good launch on that device. If the
+       known-good launch also fails, the device is poisoned: the FAIL is unattributable.
+       Report it as `device-poisoned`, not as a stage failure.
+    b. **Retry on a different device** (`ASCEND_RT_VISIBLE_DEVICES`) before recording any
+       verdict, and record which device produced it.
+    c. **Never run one process per configuration on one device and read the result column
+       as a failure rate.** That column measures the poisoning, not the kernel. If you
+       need a rate, rotate devices and health-check between repetitions.
+    d. **Say so in the report.** "3 configurations faulted, all after the first fault on
+       device 0" is a completely different statement from "3 configurations faulted".
 
 ### Dimension Rules
 
