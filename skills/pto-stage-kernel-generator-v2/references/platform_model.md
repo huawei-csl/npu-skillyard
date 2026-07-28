@@ -351,6 +351,7 @@ UB is shared by both Vec sub-blocks (`vid=0` and `vid=1`).
 | Vec dtype | `TCVT` | UB ↔ UB (Vec) | AIV |
 | Vec fill | `TEXPANDS` (scalar fill), `TFILLPAD` (zero pad) | UB (Vec) | AIV |
 | Vec reduction | `TROWSUM`, `TCOLSUM`, `TROWMAX`, `TCOLMAX`, `TROWMIN`, `TCOLMIN`, `TROWPROD` | UB ↔ UB (Vec) | AIV |
+| Cube↔Vec FIFO | `TPUSH`, `TPOP`, `TALLOC` (via `TPipe`, dir `DIR_C2V`/`DIR_V2C`/`DIR_BOTH`) | slot ring, GM- or UB-staged | AIC↔AIV — see COOK-6.6 |
 | Vec complex | `TGATHER`, `TSCATTER`, `TSORT32`, `TMRGSORT`, `TPARTADD`, `TQUANT` | UB (Vec) | AIV |
 | Cube extract | `TEXTRACT` | L1 → L0A/L0B (MTE1) | AIC |
 | Cube reshape | `TRESHAPE` | L1 → L1 (view reinterpretation) | AIC |

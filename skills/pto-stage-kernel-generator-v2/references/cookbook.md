@@ -696,12 +696,77 @@ Independent of sync: **validate a deep pipeline at a high iteration count, not t
 genuine buffer-reuse hazard can pass at 2 iterations and fail at >=4 -- and re-check determinism
 with fresh GM allocations, not just repeated launches on the same buffers.
 
+**If your seam is Cube<->Vec rather than intra-core, do not hand-roll it at all -- use the
+`TPipe`/`TPUSH`/`TPOP` FIFO (COOK-6.6), which handles space-wait, store and data-ready
+sync for you.** This entry applies only to intra-core pipe pairs.
+
 Scope: these findings are from Vec-only probes and say nothing about `SYNCALL<Mix>` cross-core
 seams; they settle the intra-core pipe-pair question only.
 
 Measured effect: on a masked-softmax kernel, 2-slot prefetch took the ratio to vendor from 1.02x to
 0.92x and the 3-deep form to 0.75x. Combine with `TAXPY` (C27-escape) to keep the Vec body short
 enough that the loads dominate.
+
+---
+
+## COOK-§6.6: `TPUSH`/`TPOP` -- the supported Cube<->Vec staging FIFO
+
+**Read the scope line first: this is for CROSS-CORE Cube<->Vec pipelines. It is NOT a
+replacement for intra-core UB double buffering.** `TPipe`'s direction enum is
+`DIR_C2V` (1), `DIR_V2C` (2), `DIR_BOTH` (3), plus `_CTRL`/`_GM` variants
+(`include/pto/common/fifo.hpp`). There is no Vec->Vec direction. If what you want is
+MTE2 run-ahead over Vec inside one core, this entry does not apply -- see COOK-6.5.
+
+When a kernel alternates Cube and Vec stages (attention, GEMM+activation chains),
+the intended mechanism is **not** hand-rolled `set_flag`/`wait_flag` but a FIFO
+declared as a `TPipe`, written with `TPUSH` and read with `TPOP`:
+
+```cpp
+// include/pto/npu/a2a3/TPush.hpp
+template <uint8_t FlagID, uint8_t DirType, uint32_t SlotSize, uint32_t SlotNum,
+          uint32_t LocalSlotNum = 2, bool IsNoSplit = false, bool EN_UNIT_FLAG = false>
+struct TPipe;
+```
+
+`TPUSH(pipe, tile)` does three things for you (`docs/isa/TPUSH.md`):
+1. waits for FIFO space when `Pipe::shouldWaitFree(pipe.prod.tileIndex)`;
+2. stores the producer tile into the current slot;
+3. records data-ready synchronization for the consumer.
+
+That is the whole producer-side protocol -- no event ids to allocate, no set/wait
+balance to reason about, no WAR guard to hand-write. There is also a GM-slot
+workflow: `TALLOC` a slot view, write it with ordinary memory instructions, then
+`TPUSH(Pipe&, GlobalData&)` to commit.
+
+**Vendor reference pattern.** pto-isa ships a Flash Attention pipeline recipe using
+exactly this (`.claude/skills/pto-isa-flash-atten-a3-pipeline/` upstream): a
+GM-staged FIFO with an 8-deep slot ring, three logical pipes (QK cube->vec,
+PV cube->vec, P vec->cube), and a `QK_PRELOAD` depth knob so the producer runs
+several slots ahead. Its shape:
+
+```text
+cube QK:  [QK0] [QK1] [QK2] [QK3] ...
+vec  P :        [P0]  [P1]  [P2]  ...   (lags by QK_PRELOAD-1)
+cube PV:              [PV0] [PV1] ...
+vec  GU:                    [GU0] ...
+```
+with a distinct prologue (prime the FIFO), steady loop, and epilogue (drain) --
+collapsing the prologue into the steady loop breaks the lag invariant.
+
+**Why this entry exists.** `TPUSH`/`TPOP` have been present in the pinned tree the
+whole time (`TPush.hpp`, `TPop.hpp`, `GridTPush.hpp`, `GridTPop.hpp`,
+`grid_pipe_runtime.hpp`, with `docs/isa/TPUSH.md` and `docs/isa/TPOP.md`), yet this
+cookbook mentioned them zero times, `platform_model.md` (A2/A3) zero times --
+only `platform_model_a5.md` covered them -- and none of 76 generated kernels used
+one. A generated flash-attention kernel consequently staged its Cube<->Vec seam by
+hand and saturated at 48 TFLOP/s against a vendor operator reaching 128.
+
+**Status: DOCUMENTED HERE, NOT YET PROBED ON HARDWARE BY US.** Everything above is
+from the official `docs/isa/TPUSH.md`, `docs/isa/TPOP.md`, the headers, and the
+vendor recipe -- not from our own measurement. Verify the pipe declaration, slot
+sizing and drain against a small kernel before trusting it in a deliverable, and
+record what you find here. Do not let this entry become the thing a later run cites
+as evidence; it is a pointer to the vendor's mechanism, not a measured result.
 
 ---
 
