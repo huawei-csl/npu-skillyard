@@ -221,6 +221,7 @@ Before returning the JSON output, verify:
 - [ ] BenchmarkScript benchmarks at the contract production sweep and supports `--l-seg-list`
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
 - [ ] BenchmarkScript supports `--baseline-so` for a within-process paired A/B and reports the paired delta (rule 28)
+- [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full: flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
 - [ ] No hard-coded dimension values (HV, H, K, V) — all derived from StageSpec.problem
 - [ ] No double-escaped `\n` in Python source — plain parseable text after JSON decode
 
@@ -343,6 +344,46 @@ Before returning the JSON output, verify:
     only when paired; a "speedup" that appears only across separate processes/sessions is
     drift, not a real win. Never claim a comparison from two unpaired runs.
 
+29. **Comparing against a VENDOR framework operator (e.g. `torch_npu.npu_*`) needs a
+    stricter protocol than `.so` vs `.so`, and getting it wrong has repeatedly produced
+    ratios that were wrong by 2-3x IN OUR FAVOUR.** Our kernel is launched by a bare
+    ctypes call (~6 us of host dispatch); a framework operator goes through
+    python -> aten -> allocator -> launch (~31-52 us). Any protocol that lets host
+    dispatch fall inside one side's event window and not the other's measures dispatch,
+    not the kernel. Required, all of them:
+
+    a. **Flush ENQUEUED, never drained.** `.zero_()` the 256 MiB L2 scratch and do NOT
+       call `torch.npu.synchronize()` between the flush and the start event, on either
+       side. The flush is a ~200 us device-side spacer that hides host dispatch equally.
+       A drain leaves the device idle at the start event, so dispatch lands inside the
+       window -- measured effect: vendor 76 us -> 162 us, our side barely moving.
+    b. **Symmetry is the invariant.** Whatever is inside the timed region for one side
+       must be inside it for the other. The worst observed bug was asymmetric: our side
+       timed undrained while the vendor was effectively drained, reporting 0.83x for a
+       kernel that is really 1.80x. That is worse than a symmetric drain, which at least
+       inflates both sides.
+    c. **Allocate outputs the way the vendor does.** A framework op allocates its outputs
+       per call and does NOT zero them. If your harness allocates with `torch.zeros`
+       inside the timed callable it pays a fill the vendor never pays -- measured 1.330
+       with `torch.zeros` vs 1.179 with `torch.empty` on the same kernel. Use
+       `torch.empty` per call. Do NOT preallocate once outside the window either: that
+       skips an allocation the vendor pays for and biases the other way.
+    d. **Randomize the issue order per repetition.** A fixed "ours then vendor" order
+       carries a ~0.9% slot bias -- large enough to have flipped an optimizer decision.
+    e. **Run a NULL CONTROL.** Time one callable against ITSELF through the identical
+       harness. If its confidence interval excludes 1.0, the harness is broken and every
+       ratio from it is void. Report the null control alongside the ratio, always.
+    f. **>=200 repetitions, median ratios, and a bootstrap CI.** 20 repetitions is not
+       enough: at small sizes it produced 68% relative standard deviation and a ratio
+       that was wrong by 35%.
+    g. **State the arity/semantics match.** If the vendor writes extra outputs, or is
+       in-place while you are out-of-place, say so and say which way it biases. An
+       in-place vendor op compared against an out-of-place kernel moved one case from
+       1.34x to 0.96x once matched.
+
+    If any of a-g cannot be satisfied, label the number ADVISORY in the JSON and in the
+    report. Never present an unverified vendor ratio as a result.
+
 ### Dimension Rules
 
 23. All dimension constants MUST come from StageSpec.problem dict, never invented or hard-coded.
@@ -354,7 +395,7 @@ Before returning the JSON output, verify:
 
 - `references/npu_launch_patterns.md` — NPU launch patterns, ctypes boilerplate, stream handling, dimension derivation
 - `references/validation_patterns.md` — ValidationScript template, DEFAULT_CASES generation, two-tier accuracy, CLI template
-- `references/benchmark_patterns.md` — BenchmarkScript template, torch.npu.Event timing + L2 flush, statistics, JSON output, production sweep support, per-work-unit slope fit, within-process paired A/B (`--baseline-so`)
+- `references/benchmark_patterns.md` — BenchmarkScript template, torch.npu.Event timing + L2 flush, statistics, JSON output, production sweep support, per-work-unit slope fit, within-process paired A/B (`--baseline-so`), vendor-baseline comparison protocol with null control (rule 29)
 
 ## Failure Policy
 

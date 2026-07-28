@@ -378,3 +378,104 @@ flush, iteration count, dtype, and shape.
    `--sim-mode` minimums.
 6. **Integer keys in results dict**: use `results[str(BT)]`, not `results[BT]`.
 7. **Non-contiguous launch tensors**: force `.contiguous()` before `.data_ptr()`.
+
+---
+
+## Vendor-baseline comparison (rule 29) -- copy this, do not re-derive it
+
+Comparing against a `torch_npu.npu_*` operator is NOT the same as comparing two
+`.so` files, because the two sides have wildly different host-dispatch costs
+(~6 us for a bare ctypes launch, ~31-52 us through the framework). Every bias
+below was measured on real kernels in this project, and each produced a wrong
+ratio in a direction that flattered us.
+
+```python
+import numpy as np, torch, torch_npu
+
+FLUSH_MIB, WARMUP, REPS, N_BOOT, SEED = 256, 20, 200, 10_000, 20260728
+
+class Timer:
+    """Flush is ENQUEUED as a device-side spacer and never drained (rule 29a).
+
+    Draining leaves the device idle when the start event is timestamped, so host
+    dispatch falls INSIDE the window -- which costs the vendor ~50 us and us ~6,
+    i.e. it fabricates a win. Measured: vendor 76.4 -> 161.5 us under a drain.
+    """
+    def __init__(self, flush): self.flush = flush
+    def once(self, fn):
+        self.flush.zero_()                     # enqueued; NO synchronize here
+        s = torch.npu.Event(enable_timing=True)
+        e = torch.npu.Event(enable_timing=True)
+        s.record(); fn(); e.record()
+        torch.npu.synchronize()                # always OUTSIDE the timed window
+        return s.elapsed_time(e)
+
+def paired(fa, fb, timer, reps, rng):
+    """Interleaved with the issue order randomized per repetition (rule 29d)."""
+    for _ in range(WARMUP): fa(); fb()
+    torch.npu.synchronize()
+    a, b = [], []
+    for _ in range(reps):
+        if rng.integers(0, 2):  a.append(timer.once(fa)); b.append(timer.once(fb))
+        else:                   b.append(timer.once(fb)); a.append(timer.once(fa))
+    return np.asarray(a), np.asarray(b)
+
+def boot_ci(a, b, n=N_BOOT, seed=SEED):
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, a.shape[0], size=(n, a.shape[0]))
+    r = np.median(a[idx], axis=1) / np.median(b[idx], axis=1)
+    return tuple(np.percentile(r, [2.5, 97.5]))
+
+# --- OUR callable: allocate outputs per call with torch.empty (rule 29c) -------
+# The vendor allocates its outputs per call and does NOT zero them. `torch.zeros`
+# pays a fill the vendor never pays (measured 1.330 vs 1.179 on one kernel);
+# preallocating once outside the window skips an allocation the vendor DOES pay.
+def ours():
+    y = torch.empty(T, H, dtype=torch.int8, device="npu")   # NOT torch.zeros
+    lib.call_kernel(..., ctypes.c_void_p(y.data_ptr()), ...)
+
+def vendor():
+    return torch_npu.npu_some_op(x, ...)
+
+flush = torch.empty(FLUSH_MIB * 2**20, dtype=torch.uint8, device="npu")
+timer = Timer(flush)
+a, b = paired(ours, vendor, timer, REPS, np.random.default_rng(SEED))
+ratio, ci = float(np.median(a) / np.median(b)), boot_ci(a, b)
+
+# --- NULL CONTROL (rule 29e): the vendor timed against ITSELF -----------------
+# If this interval excludes 1.0 the harness is broken and the ratio above is VOID.
+na, nb = paired(vendor, vendor, timer, 60, np.random.default_rng(SEED + 1))
+null_ratio, null_ci = float(np.median(na) / np.median(nb)), boot_ci(na, nb)
+null_ok = null_ci[0] <= 1.0 <= null_ci[1]
+
+out = {"ratio_ours_over_vendor": ratio, "ratio_ci95": list(ci),
+       "null_control": {"ratio": null_ratio, "ci95": list(null_ci),
+                        "includes_unity": null_ok},
+       "semantics_note": "state arity match and which way any mismatch biases",
+       "advisory": not null_ok}
+```
+
+### The four biases this protocol corrects
+
+| # | bias | measured effect |
+|---|---|---|
+| a | flush drained instead of enqueued | vendor 76.4 -> 161.5 us; ratio 1.76 -> 1.48 |
+| b | **asymmetric** timing (ours undrained, vendor drained) | reported 0.83x for a kernel that is 1.80x |
+| c | outputs allocated with `torch.zeros` inside the window | 1.330 vs 1.179 with `torch.empty` |
+| d | fixed issue order | ~0.9% slot bias; flipped one optimizer decision |
+
+Bias (b) is the dangerous one: it is not a mistake either side of the comparison
+makes symmetrically, so it does not partially cancel. It reversed the sign of the
+result on two separate cases.
+
+### Semantics traps to check before quoting any ratio
+
+- **In-place vs out-of-place.** If the vendor mutates its inputs and returns the
+  same storage (check `data_ptr()` identity), time your kernel in-place too.
+  Read-modify-write reaches ~1000 GB/s on this part where out-of-place streaming
+  tops out near 800 -- one case moved 1.34x -> 0.96x once matched.
+- **Extra outputs.** If the vendor writes a residual/mean/rstd you do not, say so
+  and state that the ratio is conservative in your favour.
+- **Fixed-overhead floors.** If both sides are pinned at an overhead floor the
+  ratio compares launch costs, not the algorithm. A tell: the vendor is SLOWER at
+  a smaller size than at a larger one. Do not quote such a point as a result.
