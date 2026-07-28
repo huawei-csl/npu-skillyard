@@ -636,31 +636,23 @@ Use when:
 
 ---
 
-## COOK-§6.5: Deep Software Pipelines -- the event-id budget (>=3-deep prefetch)
+## COOK-§6.5: Deep Software Pipelines -- balance, not an id budget
 
-A 2-slot prefetch (load chunk k+1 while computing chunk k) is the usual win, but
-going **3-deep** (prefetch 2 ahead) is where naive event allocation deadlocks. The
-hardware exposes a small set of usable event ids; reusing one id across three or
-more pipe pairs deadlocks, and `EVENT_ID4` has been observed unusable at runtime.
-
-**Budget that works (verified on dav-c220):** give each of `EVENT_ID0`,
-`EVENT_ID1`, `EVENT_ID2` exactly **two** pipe pairs -- `MTE2->V` (load ready) and
-`MTE3->MTE2` (buffer free, the WAR guard) -- one id per pipeline slot; then
-collapse `V->MTE3` (compute done, store may start) onto a single `EVENT_ID3`,
-because its `set_flag`/`wait_flag` are back-to-back and therefore a strict 1:1
-FIFO that cannot interleave. No id is shared by three pipe pairs, and `EVENT_ID4`
-is never needed.
+A >=3-deep prefetch needs a WAR guard so a load cannot overwrite a slot still being read. The
+working form gives each slot `s` an `MTE2->V` flag (load ready) and an `MTE3->MTE2` flag (buffer
+free, set after the store that last read the slot), and collapses `V->MTE3` onto a single id because
+its set/wait are back-to-back.
 
 ```cpp
 // slot s in {0,1,2} -> event id s ; V->MTE3 always on ID3
 for (int i = 0; i < n_chunks + 2; ++i) {
   const int s_load = i % 3, s_comp = (i - 2) % 3;
-  if (i < n_chunks) {                       // issue load for slot s_load
+  if (i < n_chunks) {
     if (i >= 3) wait_flag(PIPE_MTE3, PIPE_MTE2, (event_t)s_load); // buffer free
     TLOAD(buf[s_load], ...);
     set_flag(PIPE_MTE2, PIPE_V, (event_t)s_load);
   }
-  if (i >= 2) {                             // compute slot s_comp
+  if (i >= 2) {
     wait_flag(PIPE_MTE2, PIPE_V, (event_t)s_comp);
     /* ... Vec body on buf[s_comp] ... */
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
@@ -671,17 +663,45 @@ for (int i = 0; i < n_chunks + 2; ++i) {
 }
 ```
 
-**Two failure modes this avoids**, both observed before the budget was found: an
-id reused across >=3 pipe pairs deadlocks the core (the run hangs and a killed
-mid-flight kernel can leave the device wedged for the next launch); and the only
-other deadlock-free allocation had a genuine buffer-reuse data hazard that passed
-at 2 iterations and failed at >=4, so **validate a deep pipeline at a high
-iteration count, not the minimum**. Determinism must be re-checked with fresh GM
-allocations, not just repeated launches on the same buffers.
+**A separated `wait_flag(PIPE_MTE3, PIPE_MTE2, id)` -- set in one iteration, waited in a later one
+-- is fully supported and reliable on dav-c220.** So is `wait_flag(PIPE_V, PIPE_MTE2, id)` (use it
+when the guarded buffer is only read by Vec; it frees the slot one pipe stage earlier). Verified by
+standalone probe at depths 2/3/4, 2-4096 iterations, block_dim 1-48, one and two AIV sub-blocks,
+1-16 KB tiles, and 600 launches across 30 processes per form: zero hangs, bit-identical output. The
+vendor's own `pto-isa/demos/torch_jit/add/add_custom.cpp` ships the same separated form.
 
-Measured effect: on a masked-softmax kernel, 2-slot prefetch took the ratio to
-vendor from 1.02x to 0.92x and the 3-deep form to 0.75x. Combine with `TAXPY`
-(C27-escape) to keep the Vec body short enough that the loads dominate.
+**The single failure mode is an unbalanced set/wait count on a `(srcPipe, dstPipe, event_id)`
+triple.** Every `wait_flag` that executes must have a `set_flag` that executed before it -- from the
+bootstrap, a prior iteration, or the same iteration. Deadlock is what an unbalanced count looks
+like, and it is *deterministic*: 100% hang, first launch, every time. If a pipeline hangs, do not
+hunt for a bad pipe pair or a bad event id -- count the sets and waits on each triple along every
+path, including the prologue, the `if`-guarded issue slots, the tail iterations, and the drain. The
+two classic bugs are (a) no bootstrap `set_flag` for the initial "buffer free" tokens, and (b) a
+`set_flag` inside a conditional whose matching `wait_flag` is not under the same condition.
+
+Two things that do **not** cause deadlock, contrary to a claim that appeared in an earlier version
+of this entry: sharing one event id across several pipe pairs (ids are scoped per
+`(srcPipe, dstPipe)`; four pairs on one id ran clean), and using `EVENT_ID4`-`EVENT_ID7` (guard ids
+4,5,6,7 ran clean). Flags are counting semaphores at least 16 deep per triple, not one-bit flags, so
+extra outstanding tokens leak rather than deadlock.
+
+One real id hazard, distinct from the above: several PTO ops emit an internal `set_flag`/`wait_flag`
+pair on a **hardcoded `EVENT_ID0`** (`pto::PtoSetWaitFlag`). Most use `PIPE_S` pairs and are
+harmless, but `MScatter` uses `(MTE3, MTE2)`, `MGather` uses `(MTE2, V)` and `(MTE2, MTE3)`, and
+`TTrans` uses `(MTE3, V)` and `(V, MTE3)`. If your kernel calls one of those, keep your pipeline
+flags for that pair off `EVENT_ID0`. (Probed directly: the collision did not deadlock or corrupt in
+a simple pipeline, so treat this as hygiene, not a known bug.)
+
+Independent of sync: **validate a deep pipeline at a high iteration count, not the minimum** -- a
+genuine buffer-reuse hazard can pass at 2 iterations and fail at >=4 -- and re-check determinism
+with fresh GM allocations, not just repeated launches on the same buffers.
+
+Scope: these findings are from Vec-only probes and say nothing about `SYNCALL<Mix>` cross-core
+seams; they settle the intra-core pipe-pair question only.
+
+Measured effect: on a masked-softmax kernel, 2-slot prefetch took the ratio to vendor from 1.02x to
+0.92x and the 3-deep form to 0.75x. Combine with `TAXPY` (C27-escape) to keep the Vec body short
+enough that the loads dominate.
 
 ---
 
