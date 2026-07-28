@@ -1,7 +1,7 @@
 ---
 name: pto-stage-worker
 description: Single-stage PTO kernel worker -- given ONE stage from an existing stage_plan.json, generate its artifacts + kernel, then compile/validate/repair on real NPU. Returns a structured per-stage result. Built to be fanned out in parallel (one worker per stage) by the pto-pipeline-parallel workflow; does NOT decompose, benchmark globally, or fuse.
-tools: Read, Edit, Bash, Glob, Grep, Skill
+tools: Read, Edit, Bash, Glob, Grep, Skill, mcp__npu-coding-mcp__get_cpp_intrinsic, mcp__npu-coding-mcp__get_constraints, mcp__npu-coding-mcp__get_instruction, mcp__npu-coding-mcp__search_instructions, mcp__npu-coding-mcp__list_instructions, mcp__npu-coding-mcp__list_categories, mcp__npu-coding-mcp__get_family_doc, mcp__npu-coding-mcp__get_examples, mcp__npu-coding-mcp__get_assembly_format, mcp__npu-coding-mcp__get_cce_intrinsics, mcp__npu-coding-mcp__get_scalar_ops, mcp__npu-coding-mcp__get_auxiliary_ops, mcp__npu-coding-mcp__get_control_flow_ops, mcp__npu-coding-mcp__get_grammar
 ---
 
 # PTO Stage Worker

@@ -1,7 +1,7 @@
 ---
 name: stage-pipeline
 description: Full PTO kernel pipeline -- decompose algorithm into stages, generate artifacts per stage, generate kernels, validate with msprof simulator, fix and retry.
-tools: Read, Edit, Bash, Glob, Grep, Skill, Task
+tools: Read, Edit, Bash, Glob, Grep, Skill, Task, mcp__npu-coding-mcp__get_cpp_intrinsic, mcp__npu-coding-mcp__get_constraints, mcp__npu-coding-mcp__get_instruction, mcp__npu-coding-mcp__search_instructions, mcp__npu-coding-mcp__list_instructions, mcp__npu-coding-mcp__list_categories, mcp__npu-coding-mcp__get_family_doc, mcp__npu-coding-mcp__get_examples, mcp__npu-coding-mcp__get_assembly_format, mcp__npu-coding-mcp__get_cce_intrinsics, mcp__npu-coding-mcp__get_scalar_ops, mcp__npu-coding-mcp__get_auxiliary_ops, mcp__npu-coding-mcp__get_control_flow_ops, mcp__npu-coding-mcp__get_grammar
 ---
 
 # Stage Pipeline Agent
