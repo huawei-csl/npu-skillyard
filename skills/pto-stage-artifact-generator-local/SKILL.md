@@ -222,6 +222,7 @@ Before returning the JSON output, verify:
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
 - [ ] BenchmarkScript supports `--baseline-so` for a within-process paired A/B and reports the paired delta (rule 28)
 - [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full: flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
+- [ ] The validation sweep reports items-per-lane per case and includes at least one case with items_per_lane >= 3 at the production block_dim, so the kernel's pipelined/steady-state path is actually exercised; a sweep where every lane owns <= 1 item is a coverage gap (rule 31)
 - [ ] Any launch that can raise an aicore exception is followed by a device health check before a FAIL is recorded, with retry on a second device; a fault that cannot be reproduced on a healthy device is reported as `device-poisoned`, not as a stage failure (rule 30)
 - [ ] No hard-coded dimension values (HV, H, K, V) — all derived from StageSpec.problem
 - [ ] No double-escaped `\n` in Python source — plain parseable text after JSON decode
@@ -410,6 +411,32 @@ Before returning the JSON output, verify:
        need a rate, rotate devices and health-check between repetitions.
     d. **Say so in the report.** "3 configurations faulted, all after the first fault on
        device 0" is a completely different statement from "3 configurations faulted".
+
+31. **The validation sweep MUST include a size where each lane owns SEVERAL work items.
+    A kernel can pass every generated test without its own pipelined path ever running.**
+    This is not hypothetical: a double-buffered kernel here validated **100% exact at
+    T=8 and T=64 and was corrupt from T=512 up**. At `block_dim=20` (40 lanes) and 2 rows
+    per item, T=8 is 4 items and T=64 is 32 items -- fewer items than lanes, so every lane
+    owned at most ONE item and the prefetch branch was dead code. Half the sweep tested a
+    kernel that, at production size, silently produced wrong data.
+
+    a. **Compute items-per-lane, do not eyeball it.** `items = ceil(rows / rows_per_item)`,
+       `lanes = block_dim * 2` (both AIV sub-blocks are workers -- verified), so
+       `items_per_lane = items / lanes`. Put it in the validation output next to each case
+       so a reader can see which cases exercised the loop.
+    b. **Require at least one case with `items_per_lane >= 3`** at the production
+       `block_dim`. Three, not two: a 2-slot ring must WRAP and re-enter steady state, not
+       just run prologue-then-epilogue. If the contract's largest size cannot reach 3,
+       say so explicitly in the report rather than passing quietly.
+    c. **Also test at least one case with `items_per_lane < 1`** (more lanes than items),
+       since the prologue/drain path with an empty or single-item lane is where
+       off-by-one token accounting shows up.
+    d. **Report the number of distinct lanes actually used.** A sweep that only ever runs
+       one item per lane is a coverage gap of the same kind as testing one dtype.
+
+    The failure mode this prevents is the worst kind: not a crash, not a hang, but a
+    kernel that passes its gate and returns wrong numbers only at the size anyone
+    would actually run.
 
 ### Dimension Rules
 

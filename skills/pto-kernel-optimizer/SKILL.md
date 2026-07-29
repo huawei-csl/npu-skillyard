@@ -62,6 +62,23 @@ advantage is almost always a leaner slope.
   optimal", so keep any "at the limit" call tentative and lean on the noop-floor /
   per-stage-sum diagnostics (§5) instead.
 
+- **If a change touches a STRUCTURAL parameter as well as the optimization, build the
+  variant that changes ONLY the structural parameter, and time it too.** Otherwise the
+  attribution is guesswork, and it is routinely guesswork in the wrong direction.
+  Worked instance: adding an MTE2 prefetch needed a second UB input slot, which only
+  fitted after halving rows-per-item. Measured, canonical protocol, null control valid:
+
+  | variant | ratio to vendor |
+  |---|---|
+  | A rows=4, no prefetch (starting point) | 1.120 |
+  | B rows=2, no prefetch (**the control**) | 1.327 |
+  | C rows=2 + prefetch | 1.084 |
+
+  Reported as A -> C alone, the prefetch "bought 3%". Against its own control it is
+  worth **1.224x**, and the tiling change is a 1.19x regression that had to be paid
+  for. Those lead to opposite decisions about whether to keep hunting for UB room.
+  A control is cheap: same source file, one compile-time switch.
+
 ## 3. The campaign loop
 1. **Decompose the slope.** Measure each stage/section standalone at 2 sizes -> per-part
    slope. The whole slope ~= sum of part slopes. This says WHERE the time is.

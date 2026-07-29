@@ -679,6 +679,9 @@ Use when:
 > `if (vid != 0) return;` never hits it, which is why toy probes passed while the
 > real kernels failed.
 
+**For the complete, validated double-buffered loop -- both WAR guards, the id
+partition, and an exact drain -- copy COOK-6.7 rather than assembling one here.**
+
 A >=3-deep prefetch needs a WAR guard so a load cannot overwrite a slot still being read. The
 working form gives each slot `s` an `MTE2->V` flag (load ready) and an `MTE3->MTE2` flag (buffer
 free, set after the store that last read the slot), and collapses `V->MTE3` onto a single id because
@@ -856,6 +859,120 @@ headers define `SyncPeriod = SlotNum`, so trust the header. And the npu-coding-m
 serves a **newer** TPUSH page than the pinned checkout (extra overloads, and the
 wrong `SyncPeriod` line already removed) -- when the two disagree on this
 instruction, the MCP is ahead.
+
+---
+
+## COOK-§6.7: The complete double-buffered Vec loop (copy this)
+
+The pattern below is the one that took `dequant_swiglu_quant` from **1.120x to
+1.084x** of `npu_dequant_swiglu_quant` (canonical protocol, null control valid,
+disjoint CIs), after two earlier rounds abandoned double buffering as "shape
+dependently unsafe". Nothing about it is subtle *once written down*, and everything
+about it is easy to get wrong from scratch -- so start from this, do not re-derive it.
+
+**Retiring the per-item `pipe_barrier(PIPE_ALL)` retires TWO hazards, not one.**
+That barrier is what a non-pipelined loop uses to cover everything at once. Replace
+it and you owe *both* of these:
+
+| hazard | who races whom | guard |
+|---|---|---|
+| **input WAR** | next item's MTE2 DMA overwrites a slot the current Vec work still reads | `V -> MTE2` token per slot |
+| **output WAR** | next item's Vec writes to the output tiles while the previous item's MTE3 stores are still reading them | `MTE3 -> V` token |
+
+The input one is obvious and everyone writes it. **The output one is not, and omitting
+it produces a kernel that validates EXACTLY at small sizes and corrupts at production
+size** -- because at small sizes each lane owns one item and the pipelined path is
+never taken. That is precisely how it failed here: exact at T=8 and T=64, wrong from
+T=512 up. See COOK-6.5 for why event ids are partitioned by sub-block.
+
+```cpp
+// Event ids are a PER-CORE resource shared by both AIV sub-blocks (COOK-6.5),
+// so each sub-block gets a disjoint range: vid 0 -> 0..3, vid 1 -> 4..7.
+const int32_t eb       = static_cast<int32_t>(get_subblockid()) * 4;
+const int32_t kSlotA   = eb + 0;   // slot 0 free / ready
+const int32_t kSlotB   = eb + 1;   // slot 1 free / ready
+const int32_t kStoreEv = eb + 2;   // V -> MTE3 before the stores
+const int32_t kOutEv   = eb + 3;   // MTE3 -> V : output tiles free again
+
+// How many items THIS lane owns -- needed so prologue and drain are exact for
+// every trip count, including 0 and 1.
+int64_t my_items = 0;
+for (int64_t t = lane; t < num_items; t += lanes) ++my_items;
+
+if (my_items > 0) {
+    set_flag(PIPE_V,    PIPE_MTE2, (event_t)kSlotB);   // slot 1 starts free
+    set_flag(PIPE_MTE3, PIPE_V,    (event_t)kOutEv);   // outputs start free
+    /* TLOAD item(lane) into slot 0 */
+    set_flag(PIPE_MTE2, PIPE_V,    (event_t)kSlotA);
+}
+
+int64_t idx = -1;
+for (int64_t it = lane; it < num_items; it += lanes) {
+    ++idx;
+    const int32_t slot   = (int32_t)(idx & 1);
+    const int32_t cur_ev = slot ? kSlotB : kSlotA;
+    const int32_t nxt_ev = slot ? kSlotA : kSlotB;
+
+    // 1. issue the NEXT DMA first, so it overlaps this item's Vec work
+    if (it + lanes < num_items) {
+        wait_flag(PIPE_V, PIPE_MTE2, (event_t)nxt_ev);   // input WAR
+        /* TLOAD item(it + lanes) into the other slot */
+        set_flag(PIPE_MTE2, PIPE_V, (event_t)nxt_ev);
+    }
+    // 2. this item's data landed earlier; take its ready token
+    wait_flag(PIPE_MTE2, PIPE_V,    (event_t)cur_ev);
+    // 3. and wait for the PREVIOUS item's stores to release the output tiles.
+    //    The DMA above is already in flight, so this does not serialise the load.
+    wait_flag(PIPE_MTE3, PIPE_V,    (event_t)kOutEv);   // output WAR
+
+    /* convert / copy the input OUT of the slot (e.g. TCVT into working tiles) */
+    set_flag(PIPE_V, PIPE_MTE2, (event_t)cur_ev);       // slot refillable NOW
+
+    /* ... the rest of the Vec body, writing the output tiles ... */
+
+    set_flag(PIPE_V, PIPE_MTE3, (event_t)kStoreEv);
+    wait_flag(PIPE_V, PIPE_MTE3, (event_t)kStoreEv);
+    /* TSTORE every output */
+    set_flag(PIPE_MTE3, PIPE_V, (event_t)kOutEv);       // outputs free once retired
+}
+
+// Exactly one free token per slot is outstanding for EVERY trip count, plus one
+// output token. Drain them: do NOT leave tokens outstanding at kernel exit.
+if (my_items > 0) {
+    pipe_barrier(PIPE_ALL);
+    wait_flag(PIPE_V,    PIPE_MTE2, (event_t)kSlotA);
+    wait_flag(PIPE_V,    PIPE_MTE2, (event_t)kSlotB);
+    wait_flag(PIPE_MTE3, PIPE_V,    (event_t)kOutEv);
+}
+```
+
+**Release the input slot as early as it is genuinely dead** -- at step 3 above, right
+after the conversion reads it, not at the end of the iteration. That is what gives the
+next DMA a full Vec body to land in.
+
+### Size the tile for the second slot AT DESIGN TIME, not when optimizing
+
+Double buffering costs **one extra input slot in UB**. Decide that when you pick the
+tile, because retrofitting it is expensive:
+
+* Here the input tile was aliased over two working fp32 tiles, leaving 3.5 KB spare of
+  the 90,624 B per-sub-block footprint. A second slot did not fit at 4 rows/item.
+* Dropping to 2 rows/item made room but **cost 1.120x -> 1.327x on its own**, because
+  the per-item DMA halved from 32 KB to 16 KB on a kernel that is ~95% memory
+  movement. The prefetch then repaid that and more (1.224x over its own control), but
+  the whole detour was avoidable.
+
+So when the stage is memory-bound, budget `2 * input_tile` from the start and pick the
+largest rows-per-item that still fits, rather than the largest that fits without a
+prefetch. And note the row count is not the only lever -- freeing one live working
+tile buys the same room without shrinking the DMA.
+
+**Always measure the control.** If an optimization also changes a structural
+parameter (rows per item, tile width, core count), build the variant that changes only
+that parameter and time it too. Without variant B above, "prefetch made it 1.084x"
+looks like a small win over 1.120x; with it, the prefetch is worth 1.224x and the
+tiling change is a 1.19x regression that had to be paid for. Those are different
+engineering conclusions.
 
 ---
 
