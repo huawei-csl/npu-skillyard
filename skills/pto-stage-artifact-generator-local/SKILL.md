@@ -221,7 +221,7 @@ Before returning the JSON output, verify:
 - [ ] BenchmarkScript benchmarks at the contract production sweep and supports `--l-seg-list`
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
 - [ ] BenchmarkScript supports `--baseline-so` for a within-process paired A/B and reports the paired delta (rule 28)
-- [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full: flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
+- [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full, INCLUDING arity match with byte counts for both sides (h), allocation symmetry on our side (i), and both A/B arms measured in the SAME session (j): flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
 - [ ] The validation sweep reports items-per-lane per case and includes at least one case with items_per_lane >= 3 at the production block_dim, so the kernel's pipelined/steady-state path is actually exercised; a sweep where every lane owns <= 1 item is a coverage gap (rule 31)
 - [ ] Any launch that can raise an aicore exception is followed by a device health check before a FAIL is recorded, with retry on a second device; a fault that cannot be reproduced on a healthy device is reported as `device-poisoned`, not as a stage failure (rule 30)
 - [ ] No hard-coded dimension values (HV, H, K, V) — all derived from StageSpec.problem
@@ -383,7 +383,28 @@ Before returning the JSON output, verify:
        in-place vendor op compared against an out-of-place kernel moved one case from
        1.34x to 0.96x once matched.
 
-    If any of a-g cannot be satisfied, label the number ADVISORY in the JSON and in the
+    h. **Match the ARITY, and say so.** If the vendor writes outputs your kernel does not,
+       it is doing strictly more work and the ratio is biased in your favour. Measured
+       instance: `npu_fusion_attention` writes 20.000 MB at S=2048 (attention output plus
+       `softmax_max` and `softmax_sum`, fp32 `[B,N,S,8]`) where a 1-output kernel writes
+       16.000 MB -- 25% more output traffic on a memory-bound stage. Emitting the two
+       missing outputs moved the honest ratio from 1.110 to 1.149, and it reversed the
+       headline: "beats the vendor below S=2048" became "parity at S=256, ~5% behind at
+       S=512-1024". Report the byte counts of both sides, not just the claim.
+    i. **Allocate on YOUR side whatever the vendor allocates.** Reusing a preallocated
+       output while the vendor allocates per call skips work the vendor pays for. This is
+       the same error as (c) but on the harness side rather than the fill side, and it
+       compounds with (h): the two together accounted for the whole of a false
+       "we beat the vendor" result.
+    j. **Compare only WITHIN a session.** Cross-session drift on a shared machine exceeds
+       the within-session CI. The same unmodified binary measured 1.094, 1.120, 1.131 and
+       1.110 at the same shape across four sessions, with NON-OVERLAPPING confidence
+       intervals -- so the spread is not sampling noise. A before/after taken in two
+       different sessions can manufacture or hide a 2-3% effect. Take both arms of every
+       A/B in one process, paired and interleaved, and say which session a number came
+       from.
+
+    If any of a-j cannot be satisfied, label the number ADVISORY in the JSON and in the
     report. Never present an unverified vendor ratio as a result.
 
 30. **An aicore exception POISONS the NPU device. Treat "device faulted" as STOP-AND-MOVE,
