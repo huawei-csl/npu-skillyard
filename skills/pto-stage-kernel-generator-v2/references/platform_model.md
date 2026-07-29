@@ -48,10 +48,10 @@ One AI Core cluster (A2/A3):
   ├────────────────────────────────────────────┤
   │  AIV-0 (Vec sub-block 0, vid=0)            │
   │    - TMOV, TADD, TMUL, TEXP, TCVT, TLOAD   │
-  │    - UB 192KB shared with AIV-1             │
+  │    - UB 192KB PRIVATE to this sub-block     │
   ├────────────────────────────────────────────┤
   │  AIV-1 (Vec sub-block 1, vid=1)            │
-  │    - Same capabilities, same UB space       │
+  │    - Same capabilities, its OWN 192KB UB    │
   └────────────────────────────────────────────┘
 ```
 
@@ -147,8 +147,45 @@ pipe_barrier(PIPE_ALL);                       // Full barrier before buffer reus
 
 ## PLAT-§UB: UB Budget Math
 
+> **The 192 KB is PER AIV SUB-BLOCK, not per core. Do NOT partition UB between the two
+> sub-blocks -- that halves your budget for nothing.**
+>
+> This was an open contradiction in this project for a long time, and several kernels
+> resolved it the expensive way: `ub = vid * UB_VID_STRIDE` with
+> `static_assert(2 * UB_VID_STRIDE <= 184*1024)`, i.e. ~92 KB each. Those kernels are
+> CORRECT -- partitioning is merely wasteful, not wrong -- but they were built on half
+> the buffer that exists. In one case it forced rows-per-item down from 4 to 2 to make
+> room for a prefetch slot, costing 1.120x -> 1.327x before the prefetch repaid it.
+>
+> **Probed directly** (`skillyard-runs/isa_probes/probe_ubpriv.cpp`): both sub-blocks
+> `TASSIGN` a tile at the SAME UB address and hammer it concurrently for up to 20,000
+> iterations, then each stores what it sees. If the buffer were shared, both would read
+> the last writer's value.
+>
+> | UB address | result |
+> |---|---|
+> | 0x0 | sub0 reads 1.0, sub1 reads 2.0 -- **PRIVATE** |
+> | 0x10000 (64 KB) | **PRIVATE** |
+> | 0x20000 (128 KB) | **PRIVATE** |
+> | 0x2c000 (176 KB) | **PRIVATE** |
+>
+> Deterministic across repeats. 176 KB matters: it is far above the ~92 KB half-budget
+> the partitioning scheme assumes, so a single sub-block demonstrably addresses the
+> whole buffer.
+>
+> **Positive control, so "always private" cannot mean "the probe is blind":** the same
+> hammer-then-read logic pointed at one GM slot -- unambiguously shared -- reports
+> SHARED on every run (both sub-blocks read 2.0). The probe detects sharing when
+> sharing exists.
+>
+> Practical consequence: budget the FULL 184 KB usable (192 KB minus the 8 KB PTO
+> reserves at `TMP_UB_OFFSET`) for each sub-block independently. The one thing the two
+> sub-blocks DO share is that `TMP_UB_OFFSET` library scratch -- which is why
+> `SaturationMode::ON` must be passed explicitly on the fp16->int8 `TCVT`, since the
+> default path routes through that shared region and can race.
+
 ```
-UB capacity: 192 KB = 196,608 bytes
+UB capacity: 192 KB = 196,608 bytes PER AIV SUB-BLOCK (184 KB usable below TMP_UB_OFFSET)
 Alignment: 32 bytes
 
 Double-buffered fp16 tile: max ELEMENTS_PER_TILE <= 196608 / (4 * 2) = 24,576
