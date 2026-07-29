@@ -844,6 +844,25 @@ nothing), and the torch_npu/ctypes loader (a pure-ACL host reproduces it). **Not
 ruled out: a defect in our probe -- pto-isa's own `tpushpop_cv` conformance
 kernel, run unmodified through the same loaders, passed 50/50.
 
+*(2b) Second independent probe, at an attention production shape -- the failure tracks
+RING ITERATION, not just depth.* A later run probed `TPipe<0, DIR_C2V, 65536, depth>`
+with `TileAcc<float,128,128>` and `TILE_NO_SPLIT` before building a stage around it,
+health-checking the device after every fault so nothing was attributed to poisoning:
+
+| tiles pushed | depth 1 | depth 2 |
+|---|---|---|
+| 1 | PASS (rel err 5.4e-08) | PASS (5.4e-08) |
+| 4 | aicore exception 507015 | aicore exception 507015 |
+
+So a single push/pop is exact at both depths, and it faults as soon as the ring is
+actually *iterated* -- i.e. once `tileIndex > 0` brings the `shouldWaitFree` /
+free-notify path into play. Combined with the table above, treat "it worked at one
+tile" as no evidence at all: **probe at your real trip count, not just your real
+shape.** That run fell back to a hand-rolled point-to-point FFTS handshake, and its
+ablation then showed the seam sync was only 69 us of 1904 us -- so on that kernel
+TPUSH could not have been the win anyway. Measure where the time actually is before
+spending effort on the seam.
+
 *(3) Therefore: usable, but validate the exact production configuration.* Do not
 assume a pipe that passes at one tile shape or FIFO depth passes at another --
 that assumption is falsified above. Bring the FIFO up at the real shape first, on
