@@ -1,0 +1,14 @@
+# NPU crash debris. A 96 MB exception dump was once swept into a cookbook commit by
+# `git add -A` and shipped to every marketplace clone; this repo is a DISTRIBUTABLE
+# plugin, so keep run artifacts out of it entirely.
+extra-info/
+**/data-dump/
+*.o
+core.*
+kernel_meta/
+*.so
+
+# build / editor noise
+__pycache__/
+*.pyc
+.venv/
