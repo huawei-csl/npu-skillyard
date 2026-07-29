@@ -636,7 +636,48 @@ Use when:
 
 ---
 
-## COOK-§6.5: Deep Software Pipelines -- balance, not an id budget
+## COOK-§6.5: Deep Software Pipelines -- balance, AND a per-sub-block id partition
+
+> **READ THIS FIRST -- it is the single most common reason a double-buffered kernel
+> "mysteriously" hangs or corrupts, and it cost this project two abandoned optimizer
+> rounds.**
+>
+> **`set_flag`/`wait_flag` event ids are a per-CORE resource, SHARED BY BOTH AIV
+> SUB-BLOCKS.** If both sub-blocks run the same flag protocol with the same event
+> ids, they consume each other's tokens. A `wait_flag` is then satisfied by the
+> *other* sub-block's token instead of blocking, the load races ahead of the store,
+> and you get a hang or silent corruption.
+>
+> Measured on 910B2, one memory-bound streaming kernel, same device, same session,
+> with an independent control kernel passing before and after:
+>
+> | both sub-blocks active | correct runs |
+> |---|---|
+> | same event ids on both | **2 / 14** |
+> | ids partitioned by sub-block (sub0: 0-3, sub1: 4-7) | **10 / 10** |
+>
+> The fix is one line -- offset every event id by the sub-block:
+>
+> ```cpp
+> // sub-block 0 gets ids 0..3, sub-block 1 gets ids 4..7, on EVERY pipe pair
+> AICORE inline int eid(int slot) { return slot + (get_subblockid() ? 4 : 0); }
+> ...
+> wait_flag(PIPE_MTE3, PIPE_MTE2, (event_t)eid(s));
+> ```
+>
+> This budgets 4 ids per sub-block, so a pipeline of up to 4 slots fits. Deeper than
+> that, or serialize the sub-blocks (`if (get_subblockid() != 0) return;`) and accept
+> half the memory parallelism.
+>
+> **Why this looked like something else.** It is a race, so it is probabilistic, and
+> sampling one run per shape makes it look shape-selective -- which is exactly how
+> `dequant_swiglu_quant`'s parity round came to report a "shape-dependent deadlock"
+> and conclude the tokens are single-bit rather than counting. The tokens ARE
+> counting (COOK-6.5's original claim, independently re-verified 16 deep on three
+> pipe pairs). The missing rule was never about depth or about pipe pairs; it was
+> about the two sub-blocks sharing one id space. A kernel that does
+> `if (vid != 0) return;` never hits it, which is why toy probes passed while the
+> real kernels failed.
 
 A >=3-deep prefetch needs a WAR guard so a load cannot overwrite a slot still being read. The
 working form gives each slot `s` an `MTE2->V` flag (load ready) and an `MTE3->MTE2` flag (buffer
