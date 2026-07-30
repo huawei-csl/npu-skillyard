@@ -221,7 +221,7 @@ Before returning the JSON output, verify:
 - [ ] BenchmarkScript benchmarks at the contract production sweep and supports `--l-seg-list`
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
 - [ ] BenchmarkScript supports `--baseline-so` for a within-process paired A/B and reports the paired delta (rule 28)
-- [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full, INCLUDING arity match with byte counts for both sides (h), allocation symmetry on our side (i), and both A/B arms measured in the SAME session (j): flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
+- [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full, INCLUDING arity match with byte counts for both sides (h), allocation symmetry on our side (i), both A/B arms measured in the SAME PROCESS (j), and a rep count justified by convergence rather than habit (k): flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
 - [ ] The validation sweep reports items-per-lane per case and includes at least one case with items_per_lane >= 3 at the production block_dim, so the kernel's pipelined/steady-state path is actually exercised; a sweep where every lane owns <= 1 item is a coverage gap (rule 31)
 - [ ] Any launch that can raise an aicore exception is followed by a device health check before a FAIL is recorded, with retry on a second device; a fault that cannot be reproduced on a healthy device is reported as `device-poisoned`, not as a stage failure (rule 30)
 - [ ] No hard-coded dimension values (HV, H, K, V) — all derived from StageSpec.problem
@@ -396,15 +396,26 @@ Before returning the JSON output, verify:
        the same error as (c) but on the harness side rather than the fill side, and it
        compounds with (h): the two together accounted for the whole of a false
        "we beat the vendor" result.
-    j. **Compare only WITHIN a session.** Cross-session drift on a shared machine exceeds
-       the within-session CI. The same unmodified binary measured 1.094, 1.120, 1.131 and
-       1.110 at the same shape across four sessions, with NON-OVERLAPPING confidence
-       intervals -- so the spread is not sampling noise. A before/after taken in two
-       different sessions can manufacture or hide a 2-3% effect. Take both arms of every
-       A/B in one process, paired and interleaved, and say which session a number came
-       from.
+    j. **Compare only WITHIN ONE PROCESS -- the boundary is the process, not the session.**
+       Measured directly (`skillyard-runs/drift_study.py`). Inside a single process there
+       is NO drift: six blocks of 300 paired reps agreed to **0.15%** against a 0.29% CI,
+       first-half vs second-half differed by <=0.11%, and the running estimate settled
+       inside +/-1% by **n=10** and +/-0.5% by **n=20**. Between processes, the SAME binary
+       at the SAME shape minutes apart gave 1.151 / 1.169 / 1.165 -- a **1.5% offset with
+       non-overlapping CIs**, and across sessions 1.094 / 1.110 / 1.120 / 1.131. That is a
+       per-process calibration offset, not sampling noise, and **no rep count reduces it**.
+       So: both arms of every A/B in the same process, paired and interleaved; never
+       compare a number from one process against another.
 
-    If any of a-j cannot be satisfied, label the number ADVISORY in the JSON and in the
+    k. **Pick the rep count from convergence, not habit.** Since the estimate is converged
+       by n~20, **~50 paired reps is enough and 200 is generous**; beyond that you buy
+       nothing but wall-clock. This matters at large shapes -- at 361 ms per call, 200 reps
+       costs two minutes to shrink an already-converged number. Scale reps down as the
+       per-call cost rises (e.g. 200 up to a few ms, 60 for tens of ms, 30 beyond) and say
+       what you used. Report the CI either way: a converged estimate with a stated interval
+       beats an arbitrary rep count every time.
+
+    If any of a-k cannot be satisfied, label the number ADVISORY in the JSON and in the
     report. Never present an unverified vendor ratio as a result.
 
 30. **An aicore exception POISONS the NPU device. Treat "device faulted" as STOP-AND-MOVE,
