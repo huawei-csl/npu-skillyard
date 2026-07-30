@@ -2050,6 +2050,115 @@ single-buffered cost -- measure before committing.
 (128 KB) with concurrent accumulators; tail-chunk flag imbalance (deadlock);
 routing S through the ping-pong flags (re-serializes every chunk).
 
+## COOK-§8.15: Attention / online-softmax kernels -- the recipe
+
+Everything here is measured on one generated flash-attention kernel taken from 2.72x the
+vendor to ~1.15x at S=2048. It is written as a recipe because almost none of it is
+specific to attention *as an algorithm* -- it applies to any stage that alternates Cube
+and Vec over a swept axis with a running reduction. Read COOK-6.5 and COOK-6.7 first;
+this entry assumes them.
+
+### The one that costs the most: do NOT materialize the score row in GM
+
+An online-softmax kernel exists precisely so the `[BQ, S]` score matrix never has to. If
+your GM workspace formula contains the sweep axis, you have written the algorithm's
+arithmetic without its memory behaviour, and it will fall off a cache cliff outside the
+shape you tuned at. The kernel above had
+
+```
+per_core = 2 slots x ( BQ*S*2  +  BQ*S*2  +  BQ*D*4 )
+                       ^scores    ^probs     ^accumulator
+                       O(S)       O(S)       O(1)
+```
+
+and its footprint went 51 MB at S=2048 to 771 MB at S=32768. Ratio to vendor by S:
+1.165 / 1.107 / (void) / **1.888** / **2.537** at 2048/4096/8192/16384/32768. The vendor
+scaled as S^2 predicts; this scaled ~7x per doubling past 8192. **Write the workspace
+formula down and check which terms carry the sweep axis, before you write the loop.**
+Stream K/V blocks and keep an O(1) `[BQ, Bk]` tile. See PLAT-§L2 for the capacity budget.
+
+### Diagnose before optimizing -- three probes, in this order
+
+1. **Engine-nulled ablation.** Build variants that null out one engine and time them. If
+   `cube_only + vec_only - sync ~= full`, there is ZERO overlap and overlap is your
+   biggest single lever. Measured: 731 + 1252 - 69 = 1914 against a full 1904 us.
+2. **Marginal-cost probe.** Duplicate ONE op on ONE pipe, keeping all sync intact, and see
+   what it costs. This kills plausible-but-wrong diagnoses in one measurement. Measured on
+   a kernel sitting at "27% of the fp16 cube roofline": duplicating **every matmul** cost
+   **4.8%**, while duplicating Vec loads cost 32.2% and Vec stores 24.9%. It was never
+   MAC-underfilled -- both engines were stalled on memory movement, and every L0-tile /
+   K-blocking / fractal-underfill hypothesis was dead. **A roofline percentage is not a
+   diagnosis.**
+3. **block_dim sweep.** If REDUCING `block_dim` makes it faster, you are footprint-bound,
+   not compute-bound (see the optimizer skill's diagnostic, and PLAT-§L2).
+
+### The ladder that worked, with what each step bought
+
+Applied in this order to the kernel above; every number is a paired same-process A/B.
+
+| step | gain |
+|---|---|
+| COOK-6.7 double-buffered Vec loop, event ids partitioned per sub-block | 1.28x |
+| hoist per-chunk reductions: accumulate elementwise max/sum TILES, do ONE `TROWMAX`/`TROWSUM` at the end | 1.11x |
+| 2-slot software pipeline inside each Cube phase (GM->L1 prefetch, L0B and L0C double buffered) | 1.18x |
+| 2-slot GM workspace so Cube runs item i+1 while Vec runs item i | 1.24x |
+| remove a redundant Vec->Cube "workspace free" back-edge | 1.090x |
+| tile-block the score/prob workspace | 1.076x |
+| write P over the scores in place (halves the workspace) | 1.010x |
+| make both Vec passes read contiguous chunks | 1.119x, 1.168x |
+
+**Rejected, each with the measurement -- these are as valuable as the wins:**
+* 3-slot GM workspace: **1.49x REGRESSION**. Working set 53 -> 80 MB, loses L2.
+* fp16 score workspace (halves the largest traffic leg): **no gain**, 1903.7 -> 1891.3 us.
+  Falsified the bandwidth hypothesis outright.
+* removing a V->V `pipe_barrier`: 1.3% faster and the OUTPUT CHANGED -> a latent ordering
+  dependency, not a win.
+* pinning K/V or the score chunk to a hot address: both SLOWER, which proved K/V traffic
+  was already free -- and that is why a two-q-block merge worth a paper 13.6% traffic
+  saving was correctly never built.
+* `TPUSH`/`TPOP` for the Cube<->Vec seam: faults once the FIFO ring iterates (COOK-6.6).
+  The ablation vindicated the fallback anyway -- the seam was 69 us of 1904.
+
+### Two bugs this class of kernel produces, both from overlap
+
+Both were introduced by the overlap steps above and both validated clean at small sizes:
+
+* **A missing WAR guard on the score tile** made the result wrong by exactly `scale^2` --
+  a pass-2 `TLOAD` landed before pass 1's `TMULS` on the same tile, applying the scale
+  twice. Localize by dumping each intermediate against the fp64 reference; the phase that
+  is still exact bounds the search.
+* **The running softmax statistics are PER-WORK-ITEM state.** Once Cube runs item i+1
+  while Vec runs item i, `m` and `l` are read one item behind. Give them **one slot per
+  workspace slot**. This failed at every size, which is the lucky case -- a subtler
+  version fails only at production.
+
+And the coverage rule that catches them: rule 31 in the artifact generator. A kernel can
+pass every generated test without its pipelined path ever running -- at `block_dim=20`
+with 2 rows/item, T=8 and T=64 have fewer items than lanes, so the prefetch branch was
+dead code. Require `items_per_lane >= 3` somewhere in the sweep.
+
+### Benchmarking an attention kernel against a vendor operator
+
+`npu_fusion_attention` returns **seven** values and writes **three** tensors: the
+attention output plus `softmax_max` and `softmax_sum`, fp32 `[B, N, S, 8]` with the value
+replicated across all 8 lanes. At S=2048 it writes 20.000 MB where a 1-output kernel
+writes 16.000 -- **25% more output traffic on a memory-bound stage.** Emitting the two
+missing statistics moved the honest ratio 1.110 -> 1.149 and turned "beats the vendor
+below S=2048" into "parity at S=256, ~5% behind at S=512-1024". They are also what a
+backward pass consumes, and an online-softmax kernel already has both, so emitting them
+is a broadcast and a store, not new math. See rule 29(h) in the artifact generator; also
+(i) allocation symmetry and (j) same-process comparison.
+
+### Status of one open item
+
+Holding the score slab in the (private, 184 KB per sub-block -- see PLAT-§UB) UB so the
+second Vec pass never re-reads it from GM is measured worth up to **1.184x** by a probe
+that skips the pass entirely -- an upper bound, not a promise. It is also the structural
+fix for the O(S) workspace above. NOT YET LANDED at time of writing; do not cite it as
+achieved.
+
+---
+
 ## COOK-§9: L1 Prefetching For Next-State Tiles
 
 Use a second L1 tile only when there is a clear next-state tile.
@@ -2216,6 +2325,11 @@ Never emit these as the main solution:
 
 ---
 
+> If the stage alternates Cube and Vec over a swept axis with a running reduction
+> (attention, online softmax, chunked scan), go to **COOK-8.15** first -- it is the
+> whole recipe, including the three diagnostic probes to run BEFORE optimizing and the
+> workspace rule that decides whether the kernel survives outside its tuned shape.
+
 ## COOK-§14: Pattern Selection Heuristic
 
 **Primary signal: StageSpec.instruction_families. stage_family is semantic guidance only.**
@@ -2240,6 +2354,8 @@ ELSE (pure Vec ops only: TLOAD, TADD, TMULS, TMOV, TSTORE, TEXP, without
 ```
 
 ---
+
+> Attention / online-softmax stages: **COOK-8.15**.
 
 ## COOK-§15: Stage Archetypes
 
