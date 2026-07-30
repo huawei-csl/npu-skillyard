@@ -79,6 +79,38 @@ advantage is almost always a leaner slope.
   for. Those lead to opposite decisions about whether to keep hunting for UB room.
   A control is cheap: same source file, one compile-time switch.
 
+- **If reducing `block_dim` makes the kernel FASTER, you are footprint-bound, not
+  compute-bound.** This is a one-command diagnostic and it is decisive, because using
+  fewer cores should always cost time unless the cores were never the constraint. Sweep
+  `block_dim` down and watch both the wall time and the per-core-normalized cost
+  (`ms * bd / bd_max`). Measured instance, a flash-attention kernel whose GM workspace
+  was `block_dim x O(S)`:
+
+  | S | bd=24 | bd=16 | bd=12 | bd=8 |
+  |---|---|---|---|---|
+  | 8192 | **7.70 ms** | 10.70 (1.39x) | 14.13 (1.83x) | 19.98 (2.59x) |
+  | 16384 | 59.03 ms | **44.62 (0.76x)** | 55.40 | 77.83 |
+
+  At 8192 the reduction costs what you expect. At 16384 it *gains* 1.4x, and the
+  per-core cost falls 59.0 -> 25.9. Confirm with the implied bandwidth: if it exceeds
+  the part's measured streaming ceiling at small sizes and drops below it at large ones,
+  a cache was absorbing the traffic and has stopped. (Here: 1673 GB/s at S=8192 against
+  an 811 GB/s HBM ceiling, then 695 GB/s at S=32768.)
+
+- **A GM workspace that scales with a SWEPT dimension is a cliff waiting to happen.**
+  Write the workspace formula down and check which terms carry the sweep axis. In the
+  case above, `per_core = 2*(BQ*S*2 + BQ*S*2 + BQ*D*4)` had two of three terms O(S), so
+  the footprint went 51 MB -> 771 MB across the sweep and fell out of L2 partway. The fix
+  is structural (stream the axis, keep an O(1) tile) -- tuning `block_dim` only buys back
+  part of it.
+
+- **State the RANGE over which an optimization was validated, and expect it to invert
+  outside that range.** The 2-slot GM workspace in that kernel was measured worth 1.24x
+  at S=2048 and was costing 2.5x at S=32768 -- the same construct, a good decision inside
+  the contract sweep and a bad one outside it. Nothing had asked, because the contract
+  stopped at 2048. If your stage has a sweep axis, probe at least one point BEYOND the
+  contract's top size before calling a structural choice settled.
+
 ## 3. The campaign loop
 1. **Decompose the slope.** Measure each stage/section standalone at 2 sizes -> per-part
    slope. The whole slope ~= sum of part slopes. This says WHERE the time is.

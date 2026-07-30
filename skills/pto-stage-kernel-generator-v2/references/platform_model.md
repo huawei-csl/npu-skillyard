@@ -197,6 +197,22 @@ UB budget check formula:
 
 ---
 
+## PLAT-§L2: L2 capacity, measured
+
+Not in any datasheet we have; bracketed by experiment on 910B2. A kernel whose GM
+working set grew with its sweep axis was L2-served up to **195 MB** of footprint and
+HBM-bound by **387 MB**, so L2 capacity lies between those. The signature: implied
+bandwidth of 1288 / 1527 / 1673 GB/s at the small sizes -- impossible against a measured
+**811 GB/s** HBM streaming ceiling, so a cache was absorbing it -- collapsing to 695 GB/s
+once the footprint no longer fit.
+
+Practical rule: keep `block_dim * per_core_workspace` under ~190 MB. If a stage's
+workspace scales with a swept dimension, that budget is what decides the largest size it
+runs well at, and exceeding it costs far more than the parallelism you gain from more
+cores (measured: 1.4x at one size, 1.23x at another, purely from lowering `block_dim`).
+
+---
+
 ## PLAT-§L0C: L0C Budget Math
 
 ```
