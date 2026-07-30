@@ -2075,7 +2075,19 @@ and its footprint went 51 MB at S=2048 to 771 MB at S=32768. Ratio to vendor by 
 1.165 / 1.107 / (void) / **1.888** / **2.537** at 2048/4096/8192/16384/32768. The vendor
 scaled as S^2 predicts; this scaled ~7x per doubling past 8192. **Write the workspace
 formula down and check which terms carry the sweep axis, before you write the loop.**
-Stream K/V blocks and keep an O(1) `[BQ, Bk]` tile. See PLAT-§L2 for the capacity budget.
+See PLAT-§L2 for the capacity budget.
+
+**Know what does and does not remove the O(S) term -- this was got wrong once already.**
+Holding the score slab in UB so the second Vec pass never re-reads it from GM is worth
+about **1.04x** (ceiling 1.184x), and it is NOT the structural fix: the Cube still writes
+the score block and re-reads it as P, and **a Cube<->Vec operand must transit GM on
+A2/A3**, so `[BQ, S]` stays resident in the workspace either way. Measured live footprint
+after residency is `2 * (BQ*S*2 + BQ*D*4)` per core -- still linear in S.
+
+Only a **true online formulation** is O(1): carry running `m`, `l` and a *rescaled* `O`
+accumulator across K/V tiles and never materialize `[BQ, S]` at all. That is a different
+kernel, not an edit to this one. If you are writing an attention stage from scratch,
+write the online form from the start -- retrofitting it is a rewrite.
 
 ### Diagnose before optimizing -- three probes, in this order
 
@@ -2149,13 +2161,23 @@ backward pass consumes, and an online-softmax kernel already has both, so emitti
 is a broadcast and a store, not new math. See rule 29(h) in the artifact generator; also
 (i) allocation symmetry and (j) same-process comparison.
 
-### Status of one open item
+### Two more traps, both found the hard way
 
-Holding the score slab in the (private, 184 KB per sub-block -- see PLAT-§UB) UB so the
-second Vec pass never re-reads it from GM is measured worth up to **1.184x** by a probe
-that skips the pass entirely -- an upper bound, not a promise. It is also the structural
-fix for the O(S) workspace above. NOT YET LANDED at time of writing; do not cite it as
-achieved.
+**A tile binding selected per outer-loop iteration and consumed in a LATER region does not
+survive.** Only a compile-time-constant address, or a `TASSIGN` immediately followed by its
+use, is reliable. A resident-slab implementation that picked its slab tile per iteration
+and used it further down produced a stale read that looked like an addressing bug for
+several rounds. If you need per-iteration slabs, accumulate into disjoint row ranges of ONE
+statically-addressed tile and reduce once.
+
+**Reusing resident UB slots across an outer-loop boundary needs a WAR guard even when the
+inner loop does not.** Within a slab each chunk owns its own slot, so no guard is needed and
+none gets written; at the slab boundary the slots are reused, and MTE2 refills them for slab
+g+1 while slab g's second Vec pass is still draining on V and MTE3. The symptom is one slab
+reading stale data while every slab is exact *when run alone* -- which is the tell: if
+per-item results are correct in isolation and wrong together, it is interference, not
+addressing. A directed slab-boundary guard costs far less than `pipe_barrier(PIPE_ALL)`
+(measured: the barrier version was 1.293x SLOWER than baseline, the directed guard 0.977x).
 
 ---
 
