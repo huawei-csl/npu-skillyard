@@ -223,8 +223,11 @@ These must appear at the top of the device compute function body, after
 `set_ffts_base_addr`, and before any tile declarations or compute logic.
 
 Why:
-- `vid != 0` return: UB is shared by both Vec sub-blocks. Without explicit
-  address partitioning between vids, return on nonzero vid. → PLAT-§Subblocks
+- `vid != 0` return: **do NOT do this by default.** UB is PRIVATE per sub-block
+  (PLAT-§UB), so there is no sharing hazard to dodge, and returning throws away half
+  the Vec throughput. Keep both vids working. Return early only when the stage
+  genuinely has no work for vid 1 -- and NEVER in a stage with a cross-core FFTS
+  handshake, where both AIVs must signal (C12, COOK-§8.6). → PLAT-§Subblocks
 - `set_mask_norm()`: Reset Vec mask to normal mode (all lanes active).
 - `set_vector_mask(-1, -1)`: Enable all SIMD lanes.
 

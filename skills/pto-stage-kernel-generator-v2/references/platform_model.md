@@ -306,14 +306,22 @@ constexpr int CTC = ((ColTile + 7) / 8) * 8;  // 32-byte alignment for fp32
 
 ---
 
-## PLAT-§Subblocks: Vec Sub-block UB Sharing
+## PLAT-§Subblocks: Vec Sub-block UB (CORRECTED -- it is PRIVATE)
 
-UB is shared by both Vec sub-blocks (`vid=0` and `vid=1`).
+**UB is PRIVATE to each Vec sub-block. Each of `vid=0` and `vid=1` has its own
+192 KB (184 KB usable below `TMP_UB_OFFSET`).** This section previously said the
+opposite; see PLAT-§UB for the hardware probe and its positive control.
 
-- Static `TASSIGN` addresses are **not** private per sub-block
-- Concurrent vids require disjoint address carving or a proven ping-pong protocol
-- Otherwise, return early on nonzero vid before any shared addresses are reused
+- Static `TASSIGN` addresses **are** private per sub-block -- both vids may use the
+  SAME addresses without interfering
+- Do NOT carve disjoint address ranges per vid: that halves your budget for nothing
+- Do NOT `return` on nonzero vid to avoid a sharing hazard that does not exist; you
+  lose half the Vec throughput. (Returning early is still WRONG for a different and
+  real reason in cross-core stages -- both AIVs must reach an FFTS handshake or it
+  deadlocks. See C8 and COOK-§8.6.)
 - `get_subblockid()` returns the current vid
+- The ONE genuinely shared resource is the `TMP_UB_OFFSET` library scratch at the top
+  of UB, which is why `SaturationMode::ON` is load-bearing on the fp16->int8 `TCVT`
 
 **Standard Vec-only preamble:**
 ```cpp

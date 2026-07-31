@@ -338,6 +338,13 @@ constexpr int CTC = ((ColTile + 7) / 8) * 8;  // 32-byte alignment for fp32
 
 UB is shared by both Vec sub-blocks (`vid=0` and `vid=1`).
 
+> **UNVERIFIED ON A5.** On **A2/A3** this statement was probed and found FALSE -- UB is
+> private per sub-block, 192 KB each (see `platform_model.md` PLAT-§UB, with a positive
+> control). That probe ran on 910B2 only, so it says nothing about A5, and this page is
+> left as-is rather than assumed. If you are targeting A5 and the budget matters, run
+> `skillyard-runs/isa_probes/probe_ubpriv.cpp` there before trusting either statement --
+> it is a few minutes and it doubles the tile budget if A5 behaves like A2/A3.
+
 - Static `TASSIGN` addresses are **not** private per sub-block
 - Concurrent vids require disjoint address carving or a proven ping-pong protocol
 - Otherwise, return early on nonzero vid before any shared addresses are reused

@@ -479,11 +479,14 @@ Emit `static_assert(kMaxUbAddr <= 196608)` when using static TASSIGN addresses.
 Derive UB usage from PLAT-§UB before choosing addresses. Never guess
 hard-coded UB layouts without a budget derivation and guard. → PLAT-§UB, COOK-§1.6, §4
 
-**C8. Vec subblock UB sharing.**
-UB is shared by both Vec sub-blocks (vid=0 and vid=1). Static TASSIGN
-addresses are not private per sub-block. If both vids stay active,
-partition UB address ranges explicitly. Otherwise return on nonzero vid
-before any shared TASSIGN addresses are reused.
+**C8. Vec subblock UB is PRIVATE (corrected).**
+Each Vec sub-block has its OWN 192 KB UB (184 KB usable below TMP_UB_OFFSET).
+Static TASSIGN addresses ARE private per vid, so both vids may use the same
+addresses. Do NOT partition UB between vids -- that halves the budget for
+nothing -- and do NOT return on nonzero vid to dodge a hazard that does not
+exist, which throws away half the Vec throughput. Hardware-probed with a
+positive control; see PLAT-§UB. The only shared region is the TMP_UB_OFFSET
+library scratch.
 **Exception -- cross-core stages:** you may NOT early-return vid 1 in a stage that
 does a mode-2 FFTS Cube<->Vec handshake -- the Vec->Cube reduce needs both AIVs to
 signal or it deadlocks (C12, COOK-§8.6). There, keep both vids running the
@@ -511,7 +514,7 @@ The standard Vec-only preamble is:
 #endif
 ```
 **Exception -- cross-core handshakes need BOTH vids.** The `if (vid != 0) return;`
-above is correct for a Vec-ONLY kernel with shared UB (C8). It is WRONG before a
+above is correct for a Vec-ONLY kernel (C8). It is WRONG before a
 mode-2 cross-core Cube<->Vec handshake: a Vec->Cube reduce requires BOTH AIV
 sub-blocks to signal, so an early-returned vid 1 starves it and deadlocks --
 immediately, even at niter=1 (COOK-§8.6). In a cross-core stage, run every
