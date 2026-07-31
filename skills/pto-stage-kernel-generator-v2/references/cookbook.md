@@ -2088,9 +2088,38 @@ A2/A3**, so `[BQ, S]` stays resident in the workspace either way. Measured live 
 after residency is `2 * (BQ*S*2 + BQ*D*4)` per core -- still linear in S.
 
 Only a **true online formulation** is O(1): carry running `m`, `l` and a *rescaled* `O`
-accumulator across K/V tiles and never materialize `[BQ, S]` at all. That is a different
-kernel, not an edit to this one. If you are writing an attention stage from scratch,
-write the online form from the start -- retrofitting it is a rewrite.
+accumulator across K/V tiles and never materialize `[BQ, S]` at all.
+
+**But do NOT assume the online form is the faster choice -- it was built and measured, and
+on this hardware it LOST at every size up to S=32768.** Both kernels exist; canonical,
+arity-matched, null controls valid:
+
+| S | score-materializing + footprint-capped `block_dim` | true online |
+|---|---|---|
+| 2048 | **1.12** | 3.52 |
+| 8192 | **1.07** | 3.28 |
+| 16384 | **1.25** | 2.98 |
+| 32768 | **2.15** | 2.85 |
+
+The online kernel does exactly what it promises structurally: its workspace is **33.0 MB
+at every S from 128 to 32768** (no term contains S), and its ratio *falls* with S -- 3.58
+at 4096 down to 2.85 at 32768 -- where the materializing kernel's *rises*. The curves are
+converging and would cross somewhere past 32768. Inside the measured range, materializing
+and managing the footprint wins, by 3x at S=2048.
+
+**Why: the online form trades memory for SERIALIZATION.** Its rescale recurrence
+(`O_run = O_run*alpha + O_slab`) is a dependency chain across slabs, and a marginal-cost
+probe on it found duplicating a score `TLOAD` cost 2.3%, a whole `TEXP` 2.0%, a `TSTORE`
+0.16% -- nothing on the data path. Its Vec floor was **pure per-chunk sync count**, and
+phase C (P@V) stayed fully exposed because phase D depends on it. A materializing kernel
+has slack to pipeline; the recurrence does not.
+
+**So choose by S range, and measure both if it matters.** Up to ~32K on A2/A3, materialize
+and cap `block_dim` by footprint (PLAT-§L2). Choose the online form when S is large enough
+that the footprint cannot be capped, or when the machine has less cache headroom. The
+online form is also **2x more accurate here** (2.85e-04 vs 5.5e-04 Frobenius, landing
+exactly on the vendor's own fp64 error) because it never round-trips the score block
+through fp16 GM -- which may decide it for you independently of speed.
 
 ### Diagnose before optimizing -- three probes, in this order
 
@@ -2237,6 +2266,15 @@ is misleading here (see the "why not one TROWSUM" note).
   masks `set_vector_mask(0, W)` and issues a single `vadd` (`rptTimes = 0`), so its
   OUTPUT width truncates to the first **64 fp32 lanes**: for `W > 64` the tail is
   silently wrong. This is the trap behind "only the first 64 outputs are correct."
+
+> **PREMISE (B) BELOW IS FALSE -- see C15.** `TROWSUM` does NOT truncate at 64 lanes;
+> it is exact at 128-wide when its scratch is sized to the SOURCE (`tmp = src/2` exact,
+> `src/4` silently wrong). The split described below is therefore unnecessary for
+> correctness. It is retained only because it is a legitimate *performance* pattern in
+> some shapes -- COOK-10.5's own hardware test measured the manual fold FASTER than a
+> DYNAMIC-shaped full-width `TROWSUM`, which takes a generic path issuing a
+> `pipe_barrier(PIPE_V)` per 64-element repeat. Split for SPEED if you measure it;
+> never for correctness. Part (A) on direction is unaffected and still holds.
 
 **(B) Split -- even `TROWSUM` reduces only the first 64 lanes of a >64-wide row on this
 build.** The `TRowReduceInstr` repeat-tiling path in the ISA source is NOT what runs for

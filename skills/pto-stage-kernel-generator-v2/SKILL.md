@@ -597,7 +597,9 @@ PTO reduction instructions have specific input/output shape requirements:
 - `TROWSUM(dst, src, temp)`: Reduces each row of `src` to a single value in `dst`
   - `src`: `UbND<T, R, C>` (R rows, C cols)
   - `dst`: `UbND<T, R, 8>` (R rows, minimum 8 cols for alignment)
-  - `temp`: `UbND<T, R, 8>` (workspace, same shape as dst)
+  - `temp`: **must scale with the SOURCE width, not the destination.** `src/2` is
+    exact; `src/4` is silently WRONG (measured ~0.22 relative error). A `[R,8]`
+    scratch is correct only for a narrow `src` -- see the corrected note below.
   - Result: `dst.GetValue(i)` contains sum of row `i` from `src`
 
 - `TCOLSUM(dst, src)`: Reduces each column of `src` to a single value in `dst`
@@ -621,19 +623,24 @@ TROWSUM(sum_tile, g_row, temp_tile);           // Reduces 1×K → 1×1 (stored 
 float scalar_result = sum_tile.GetValue(0);
 ```
 
-**Vec reduction lane limit (wide tiles).** A single multi-row `TROWSUM`/`TCOLSUM`
-over a tile whose row is wider than the 64-fp32 Vec lane block reduces ONLY the
-first 64 lanes -- the tail is silently dropped, giving a partial sum with no
-error. For any feature width above 64 this is a silent-wrong reduction. Reduce
-either row-by-row (`1 x width -> 1 x 8` per row) or tile the reduction into
-64-lane blocks and sum the partials. (Observed: a multi-row reduction over a
-128-wide tile truncated to its first 64 lanes; the per-row form was correct.)
-For the correct wide matvec/GEMV pattern -- reduce the wide axis with `TROWSUM`
-(per-row output, NOT `TCOLSUM` whose per-column output truncates at 64), and since
-`TROWSUM` ALSO reduces only the first 64 lanes of a >64-wide row on this build
-(dav-c220/CANN 9.1.0; verified on-NPU), split the reduced axis into <=64-lane blocks
-and `TADD` the partials, plus the paired rank-1 update in one orientation -- see
-COOK-§10.5.
+**CORRECTED -- there is NO 64-lane reduction limit. The old rule here was a
+misdiagnosis, and this rule's own scratch sizing was what caused the symptom.**
+
+`TROWSUM` and `TROWMAX` are EXACT at 128-wide rows on dav-c220 / CANN 9.1.0. Three
+independent hardware probes agree: a standalone `TROWMAX` sweep (correct at widths
+64/128/1024, max placed at every column); a run that found `TROWMAX`'s scratch must be
+src-shaped for float/half because it reduces as a binary tree; and a run that measured
+`TROWSUM` exact at 128 wide with `tmp = src/2` and deterministically wrong (~0.22
+relative) with `tmp = src/4`, while `TROWMAX` with that same undersized tmp stayed exact.
+
+So the real rule is: **the scratch is proportional to the SOURCE width, and under-sizing
+it is silently wrong rather than an error.** The `[R, 8]` scratch this rule used to
+prescribe is under-sized for any `src` wider than 16 -- which produces exactly the
+"partial sum with no error" that was then attributed to lane truncation.
+
+Cost of the stale rule, measured: it forced a Vec chunk 2x narrower than necessary in a
+generated attention kernel; removing it was that kernel's single largest speedup
+(**1.617x**). Do not re-derive the 64-lane rule from older run reports.
 
 Always verify reduction instruction signatures in the PTO ISA reference. → PLAT-§Reductions
 
