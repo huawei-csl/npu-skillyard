@@ -1434,11 +1434,25 @@ For recurrent/scan stages:
   reduce with TROWSUM: that forces every free-axis quantity into column 0,
   disagrees with the outer-product orientation, and yields a per-step error that
   COMPOUNDS over the scan (exact at step 0, growing every step). See C28(a)/(b).
-  EXCEPTION (wide free axis): when the free/output axis exceeds 64 lanes (e.g.
-  dv=128), `TCOLSUM` silently truncates its output to the first 64 columns. In that
-  case use the reduce-over-columns `TROWSUM` orientation (state `[dv, dk]`, reduce
-  over dk cols) from COOK-§10.5, which handles widths >64 and keeps the matvec and
-  rank-1 update in one consistent orientation.
+  ~~EXCEPTION (wide free axis): `TCOLSUM` silently truncates past 64 columns.~~
+  **FALSIFIED -- REMOVED.** `isa_probes/probe_colsum.cpp`, R=16 summed to `[1,C]`,
+  with columns >= 64 offset by +100 so truncation could not hide:
+
+  | C | 32 | 64 | 96 | 128 | 256 | 512 |
+  |---|---|---|---|---|---|---|
+  | max abs err | 0 | 0 | 0 | **0** | **0** | **0** |
+
+  Bit-exact at every width. `TCOLSUM` is correct for any free axis; do NOT reorient
+  the state to work around a limit that does not exist. (COOK-§10.5's `TROWSUM`
+  orientation remains a valid *performance* choice, but it is not required for
+  correctness.)
+
+  **This was the THIRD appearance of a false "64 lanes" restriction.** C15 claimed the
+  same for `TROWMAX`/`TROWSUM` -- refuted, and the symptom was C15's own under-sized
+  scratch. If you meet another "> 64 lanes is broken" claim in this cookbook, probe it
+  before designing around it: the real rule is that reduction scratch scales with the
+  SOURCE width (C15), and an under-sized scratch produces exactly the truncation
+  symptom these rules kept mis-attributing to a lane limit.
 - Build the rank-1 update from broadcasts, not TROWEXPANDMUL: a row-indexed
   column scalar via TROWEXPAND (reads col 0) times a `[1, free_axis]` row via
   TCOLEXPAND, then TMUL. To place a vector in column 0 without a rejected

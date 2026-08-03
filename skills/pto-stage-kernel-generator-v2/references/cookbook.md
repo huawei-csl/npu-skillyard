@@ -2630,7 +2630,39 @@ AICORE inline VarlenTileInfo get_tile_info(uint32_t tile_id,
 always returning `{0, tile_size}`. It is a shape placeholder, not a recipe. For an
 actual runtime-determined schedule use COOK-§11.5.
 
-### COOK-§11.5: Schedule resolved ON DEVICE from a runtime boundary tensor
+#### COOK-§10.8: CROSS-WORK-ITEM reduction (a column sum across rows)
+
+A reduction along the axis that work items are SPLIT over cannot be closed inside one
+core's tile loop. This is the shape of every `dgamma`/`dbeta` in a norm backward, of
+per-expert accumulators in MoE, and of any `sum(axis=0)` over a row-parallel stage.
+Nothing else in this cookbook covers it.
+
+Two mechanisms, both real on A2/A3:
+
+**(a) Per-core partial + a second pass.** Each core reduces its own rows into a
+`[1, D]` partial at `workspace + core_id * D`, then a second kernel (or a second phase
+after a barrier) reduces the `block_dim` partials. Deterministic, needs no pre-zeroed
+output, and -- the property that matters -- every lane writes ONE CONTIGUOUS `[1, D]`
+run, so it never touches C1's 32-byte scalar-scatter hazard. Cost is a
+`block_dim * D * 4` workspace and one extra launch: an INTERCEPT, not a slope.
+
+**(b) `TSTORE` with atomic add.** `pto/npu/a2a3/TStore.hpp:126` takes
+`AtomicType currentAtomicType = AtomicType::AtomicNone`, so
+`AtomicType::AtomicAdd` is reachable on A2/A3 -- not an A5-only feature, which is the
+only place the platform model previously mentioned it. One pass, no workspace, but the
+destination must be pre-zeroed and the result is NOT bit-deterministic across runs
+(accumulation order varies), so it fails a determinism gate.
+
+**Choose (a) when the stage must be deterministic or bit-exact**, which is the default
+for a validation gate here. Choose (b) when the workspace or the extra launch is the
+measured bottleneck and non-determinism is acceptable -- and say so in the report.
+
+Do NOT emulate this with interleaved scalar `__gm__` stores. Scalar stores are 32-byte
+cache-line granular: an interleaved cross-lane scatter loses **half the array at
+block_dim=1** (C1, probed). Contiguous per-lane runs are the only safe scalar form,
+and MTE `TSTORE` is better still.
+
+## COOK-§11.5: Schedule resolved ON DEVICE from a runtime boundary tensor
 
 Use when the work partition is **data**, not shape: grouped matmul with a
 `group_list`, varlen attention with `cu_seqlens`, MoE with runtime expert counts.
