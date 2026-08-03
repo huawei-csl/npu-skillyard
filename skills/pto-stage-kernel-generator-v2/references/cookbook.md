@@ -665,7 +665,8 @@ Use when:
 >
 > ```cpp
 > // sub-block 0 gets ids 0..3, sub-block 1 gets ids 4..7, on EVERY pipe pair
-> AICORE inline int eid(int slot) { return slot + (get_subblockid() ? 4 : 0); }
+> // NOTE THE +1: EVENT_ID0 is reserved by the library. See "EVENT_ID0" below.
+> AICORE inline int eid(int slot) { return 1 + slot + (get_subblockid() ? 4 : 0); }
 > ...
 > wait_flag(PIPE_MTE3, PIPE_MTE2, (event_t)eid(s));
 > ```
@@ -738,8 +739,16 @@ One real id hazard, distinct from the above: several PTO ops emit an internal `s
 pair on a **hardcoded `EVENT_ID0`** (`pto::PtoSetWaitFlag`). Most use `PIPE_S` pairs and are
 harmless, but `MScatter` uses `(MTE3, MTE2)`, `MGather` uses `(MTE2, V)` and `(MTE2, MTE3)`, and
 `TTrans` uses `(MTE3, V)` and `(V, MTE3)`. If your kernel calls one of those, keep your pipeline
-flags for that pair off `EVENT_ID0`. (Probed directly: the collision did not deadlock or corrupt in
-a simple pipeline, so treat this as hygiene, not a known bug.)
+flags for that pair off `EVENT_ID0`.
+
+**CORRECTED -- this is a BUG, not hygiene.** An earlier version of this paragraph said the
+collision "did not deadlock or corrupt in a simple pipeline, so treat this as hygiene, not a
+known bug". That conclusion came from a probe too simple to expose it. The pto-isa source
+settles it: `EVENT_ID0` is used internally by **14 core A2A3 instructions** including every
+row reduction and `TEXTRACT`, so a user token held on `EVENT_ID0` across any of them is
+destroyed. It is silent, and it is not restricted to the pipe pairs listed above. See
+*EVENT_ID0 IS RESERVED BY THE LIBRARY* below, and never use `EVENT_ID0` for a token that must
+survive an instruction call.
 
 Independent of sync: **validate a deep pipeline at a high iteration count, not the minimum** -- a
 genuine buffer-reuse hazard can pass at 2 iterations and fail at >=4 -- and re-check determinism
@@ -760,10 +769,88 @@ enough that the loads dominate.
 
 ---
 
+### EVENT_ID0 IS RESERVED BY THE LIBRARY -- never hold a user token on it
+
+Read from the pto-isa source, not inferred: **`EVENT_ID0` appears 250 times across
+the library**, against 26 for `EVENT_ID1`, 5 for `ID2`, 1 for `ID3` and 16 for `ID7`.
+It is the library's default internal scratch id, and it is used *inside instructions
+your kernel calls*:
+
+```
+A2A3 instructions that issue set_flag/wait_flag on EVENT_ID0 internally:
+  TROWSUM  TROWMAX  TROWMIN  TROWEXPAND  TROWREDUCEIDXOPS
+  TEXTRACT  TINSERT  TCONCAT  TTRANS  TDEQUANT  TFILLPAD  TPUSH  TSYNC  SYNCALL
+```
+
+That list contains the row reductions used by **every** softmax / attention /
+normalization kernel and `TEXTRACT`, used by **every** Cube kernel. `TRowExpand`
+does it once per row *inside its loop*:
+
+```cpp
+// pto/npu/a2a3/TRowExpand.hpp
+for (int i = 0; i < validRow; i++) {
+    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    ...
+}
+```
+
+**So any outstanding user token on `EVENT_ID0` is destroyed the moment you call one
+of these.** A slot-free token you set before a `TROWSUM` and wait on after it is
+simply gone -- the `wait_flag` is satisfied by the library's token, the ring
+advances early, and you get corruption or a hang depending on timing.
+
+**This is why the original `eid(slot) = slot + vid*4` was wrong**: it puts slot 0 of
+sub-block 0 exactly on `EVENT_ID0`. A moe_token_permute run reported precisely that
+signature -- "every corrupt row was on slot 0 of sub-block 0" -- and it is explained
+in full by the source above. The formula now starts at 1.
+
+Safe-id summary, from the source:
+
+| id | reserved by | safe for your ring? |
+|---|---|---|
+| `EVENT_ID0` | 14 core A2A3 instructions (above) | **NEVER** |
+| `EVENT_ID1`, `ID2` | `comm/` collectives only (`TGATHER`, `TREDUCE`, `TPUT`, `TSCATTER`, `TBROADCAST`, `TGET`) | yes, unless the stage uses collectives |
+| `EVENT_ID3`-`ID6` | nothing on device (`ID3` only in the CPU stub) | **yes -- prefer these** |
+| `EVENT_ID7` | `TPOW` only | yes, unless the stage uses `TPOW` |
+
+The earlier note that this collision was "hygiene, not a known bug" was wrong and has
+been removed. It is a bug, the mechanism is in the source, and it is silent.
+
 ## COOK-§6.6: `TPUSH`/`TPOP` -- the supported Cube<->Vec staging FIFO
 
 **Read the scope line first: this is for CROSS-CORE Cube<->Vec pipelines. It is NOT a
-replacement for intra-core UB double buffering.** `TPipe`'s direction enum is
+replacement for intra-core UB double buffering.**
+
+> **What the implementation actually does** (read from `pto/npu/a2a3/GridTPush.hpp`
+> and `GridTPop.hpp`, not inferred from behaviour). This matters because COOK-6.6's
+> earlier "exact but faults once the ring iterates" was an observation with no
+> mechanism, and the mechanism is right there in the source:
+>
+> * **It is a cross-RANK neighbour-SRAM ring, not a set_flag/wait_flag FIFO.** The
+>   producer copies the tile into the *neighbour's* SRAM slot
+>   (`copy_sram_to_neighbour_sram`) and then bumps a cross-rank counter with
+>   `mtspr_neighbor_counter(Ready, ...)`. The consumer spins on that counter with
+>   `wfe_neighbor_counter(...)` and, after copying out, bumps the producer's `Free`
+>   counter. **No `EVENT_ID` is involved anywhere in the path.**
+> * **The slot index wraps modulo `SlotCount`** (`idx % Pipe::SlotCount`), so the
+>   ring genuinely reuses slots -- which is why a single tile passes and a
+>   multi-tile run faults.
+> * **`GRID_TPUSH_IMPL` and `GRID_TPOP_IMPL` DISCARD the failure signal.** Both are
+>   one-line wrappers over the `TRY` form with `maxSpins = 0`:
+>   ```cpp
+>   (void)GRID_TRY_TPUSH_IMPL<Dir, Pipe, TileProd>(pipe, tile, 0);
+>   ```
+>   The `TRY` form returns `false` and sets a fault flag when the ready/free counter
+>   does not arrive; the non-`TRY` form throws that away. So the plain `TPUSH`/`TPOP`
+>   have **no backpressure and no error reporting** -- exactly matching the probed
+>   "1 tile PASS, 4 tiles FAULT". If you use this FIFO, use the `TRY` forms and check
+>   the return, or provide your own flow control.
+> * **There is a mandatory publish fence** between the payload store and the ready
+>   flag -- `pipe_barrier(PIPE_ALL); dsb(DSB_DDR);` -- and the source comment states
+>   that without it the scalar-pipe flag write can become visible on the peer before
+>   the MTE3 slot bytes commit, so the consumer's `TLOAD` reads pre-publish zeros.
+>   Any hand-rolled cross-rank publish needs the same fence. `TPipe`'s direction enum is
 `DIR_C2V` (1), `DIR_V2C` (2), `DIR_BOTH` (3), plus `_CTRL`/`_GM` variants
 (`include/pto/common/fifo.hpp`). There is no Vec->Vec direction. If what you want is
 MTE2 run-ahead over Vec inside one core, this entry does not apply -- see COOK-6.5.
