@@ -703,11 +703,14 @@ modify kernels, re-validate, or re-benchmark here.
    fused-vs-chain speedup (from the fusion result, if fusion ran); per-stage accuracy
    (rel-err vs tolerance, from each stage's `accuracy`, NOT benchmarks.json). Label axes +
    units; plot only what the data supports.
-   **Plus, per stage, the OPTIMIZATION TRAJECTORY graph** (from
-   `reports/optimization_<stage>.json`, Phase 6.5): attempt number on x, ratio-vs-vendor on
-   y (lower is better), a horizontal reference line at 1.0 = vendor parity, and kept vs
-   reverted attempts visually distinct (e.g. filled vs hollow markers). This is how a
-   reader sees HOW the kernel was optimized, not just where it landed.
+   **Plus, per stage, the OPTIMIZATION TRAJECTORY graph.** Do NOT hand-roll it -- run the
+   plugin's plotter over the Phase 6.5 JSON:
+   `<py> ${CLAUDE_PLUGIN_ROOT}/scripts/plot_optimization.py <output_dir>/reports/`
+   It emits `optimization_trajectory_<stage>.png` for every `optimization_<stage>.json`,
+   drawing all 10 budget slots (so an early stop shows as shaded unused budget), kept vs
+   reverted attempts distinctly, best-kept-so-far, vendor parity at 1.0, and a red PROCESS
+   FAILURE banner on a `mixed` stage that ran short. This is how a reader sees HOW the
+   kernel was optimized, not just where it landed.
 3. **`reports/report.md`** -- the `shape_contract`, a per-stage table (result | rel-err vs
    tol | headroom% | repair_attempts | last_error), a benchmark table, the embedded graphs,
    fusion classification + speedups, and the **optimization campaign per stage**: the

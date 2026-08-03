@@ -629,13 +629,14 @@ ${JSON.stringify(pipelineSummary)}
    - slope_by_stage.png    : bar of slope_per_unit_ns per stage (the per-work-unit production cost).
    - optimized_before_after.png : for stages with an "optimized" block, grouped before/after
                              slope bars annotated with speedup_x (skip if no stage was optimized).
-   - optimization_trajectory_<stage>.png : one per reports/optimization_<stage>.json (Phase 6.5).
-                             x = attempt number, y = measured ratio vs vendor (LOWER IS BETTER),
-                             a horizontal reference line at y=1.0 labelled "vendor parity",
-                             error bars from each attempt's ci, and KEPT vs REVERTED attempts
-                             visually distinct (filled vs hollow markers) with a legend. This
-                             graph is how a reader sees HOW the kernel was optimized rather than
-                             only where it landed -- do not skip it when the JSON exists.
+   - optimization_trajectory_<stage>.png : do NOT hand-roll this one. Run the plugin's plotter
+                             over the Phase 6.5 JSONs:
+                               \`${PY} \${CLAUDE_PLUGIN_ROOT}/scripts/plot_optimization.py ${OUT}/reports/\`
+                             (falls back to a no-op if no optimization_*.json exists). It draws all
+                             10 budget slots so an early stop is visible as shaded unused budget,
+                             marks kept vs reverted attempts distinctly, traces best-kept-so-far,
+                             draws vendor parity at 1.0, and prints a red PROCESS FAILURE banner on
+                             a 'mixed' stage that ran short.
    - fused_vs_chain.png    : ONLY if the summary's fusion has speedup_vs_chain -- fused vs chain per
                              sweep point (data from the summary above, NOT benchmarks.json).
    - accuracy_vs_tol.png   : per-stage relative error vs tolerance from the summary's

@@ -171,12 +171,39 @@ optimization pass on tile geometry and the other declared it out of scope. Run-t
 variance in optimization effort was larger than every rule change between the two plugin
 versions. An unoptimized kernel is not a result.
 
+**Record every attempt as you go, in `reports/optimization_<stage>.json`:**
+
+```json
+{"stage": "...", "archetype": "mixed|vec_only|cube_only", "baseline_ratio": 2.31,
+ "attempts": [{"n": 1, "hypothesis": "...", "changed": "...", "ratio": 1.94,
+               "ci": [1.93, 1.95], "kept": true, "why": "...",
+               "kernel": "src/variants/kernel_<stage>_a01.cpp"}],
+ "stop_reason": "budget_exhausted|hardware_limit",
+ "gate": "...", "gate_value": "..."}
+```
+
+**Archive EVERY attempt's kernel** under `src/variants/kernel_<stage>_a<NN>.cpp` —
+including the one you keep. Overwriting the main kernel in place with the winner and
+archiving only the losers loses the winning kernel's identity the moment a later attempt
+supersedes it; one run here did exactly that, and its best intermediate is now only
+recoverable because it happened to be the last one.
+
+**Then plot it with the plugin's script — do not hand-roll a chart:**
+
+```bash
+<py> ${CLAUDE_PLUGIN_ROOT}/scripts/plot_optimization.py reports/optimization_<stage>.json
+```
+
+It draws all 10 budget slots regardless of how many were used, so an early stop is
+*visible* as shaded unused budget, marks kept vs reverted attempts distinctly, traces
+best-kept-so-far, and prints a red PROCESS FAILURE banner on a `mixed` stage that ran
+short. That last part is deliberate: a campaign that stopped early should not be able to
+look complete.
+
 **Required in the report (Phase 8):**
-1. **A trajectory table** — one row per attempt: `#`, hypothesis, what changed, measured
+1. **The trajectory table** — one row per attempt: `#`, hypothesis, what changed, measured
    ratio (+95% CI), kept or reverted, and *why*.
-2. **A trajectory graph** — attempt number on x, ratio-vs-vendor on y (lower better),
-   with the vendor at 1.0 drawn as a reference line, kept and reverted points visually
-   distinct. `matplotlib`, saved under `reports/`.
+2. **The trajectory graph** from the script above, embedded.
 3. **The stop reason**, explicitly: budget exhausted, or which hardware-limit gate fired
    with its number.
 4. If fewer than 10 attempts were made on a single-engine stage, the gate evidence.
