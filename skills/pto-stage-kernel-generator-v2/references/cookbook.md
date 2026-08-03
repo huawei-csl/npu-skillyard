@@ -1818,6 +1818,66 @@ for a plain `C = A @ B` and you get `B^T`. Pick the branch that matches your mat
 
 ---
 
+## COOK-§8.7B: L1 MACRO-BLOCKING -- reuse operands across output tiles
+
+**Read this before shipping any dense contraction.** COOK-§8.7 and §8.8 show how to
+compute ONE output tile. Followed literally for a full GEMM -- one output tile per
+work item, operands re-fetched per tile -- they produce a kernel that moves **3.2x
+more GM bytes than necessary**. That is not a hypothetical: it was the measured
+starting point of a `quant_matmul` campaign, and closing it was worth **3.2x**, from
+3.196 to 0.892 against the vendor.
+
+The arithmetic is the whole argument. For an `[M,K] x [K,N]` GEMM tiled `MT x NT`:
+
+```
+one output tile per work item : GM reads = (M/MT)*(N/NT) * (MT*K + K*NT)
+                                         = M*N*K*(1/NT + 1/MT)          <- every A
+                                           tile re-read for every N tile, and v.v.
+macro-block MB x NB tiles     : each A macro-row is read ONCE per macro-column
+                                and each B macro-column ONCE per macro-row, so the
+                                traffic falls by ~MB and ~NB respectively.
+```
+
+So: **make the work item a MACRO-BLOCK of output tiles, not a single tile.** Stage
+the A macro-row and the B macro-column into L1 once, then sweep the `MB x NB` output
+tiles out of L0 without touching GM again.
+
+```cpp
+// work item = one MB x NB block of output tiles
+for (int32_t item = get_block_idx(); item < n_items; item += get_block_num()) {
+  // stage ONCE per macro-block
+  TLOAD(a_l1, a_macro_row);          // MB*MT x K
+  TLOAD(b_l1, b_macro_col);          // K x NB*NT
+  for (int32_t j = 0; j < NB; ++j) {         // N-MAJOR: see below
+    TEXTRACT(l0b, b_l1, 0, j);
+    for (int32_t i = 0; i < MB; ++i) {
+      TEXTRACT(l0a, a_l1, i, 0);
+      TMATMUL(acc, l0a, l0b);
+      TSTORE(gm_tile(i, j), acc);
+    }
+  }
+}
+```
+
+**Iterate N-MAJOR, and do not assume it is a wash.** Measured on a 14-shape on-device
+sweep: N-major (`2x8`) beat M-major (`8x2`) by **1.38x at IDENTICAL byte counts** --
+both move 400 KB per 16 tiles. The difference is burst shape, not traffic, and it is
+not derivable on paper. **Sweep the block geometry; do not reason about it.**
+
+**A single L0C accumulator serializes the Cube.** With one accumulator the MMAD pipe
+must wait for the FIXPIPE writeback of tile `t` before starting `t+1`; double-buffer
+L0C so the two overlap. This was worth crossing vendor parity in the campaign above.
+
+**Sizing.** L1 must hold `MB*MT*K + K*NB*NT` elements, so the macro-block is capped
+by L1 capacity, not by preference -- derive it in your C7 budget. If it does not fit,
+slice K (COOK-§8.8) *inside* the macro-block rather than shrinking the block to one
+tile, which puts you straight back to the 3.2x.
+
+**Emit an `OPTIMIZER-TARGET` marker** if you ship a dense contraction that re-fetches
+an operand once per output tile. The campaign that found this shipped its baseline
+with no marker at all, silently asserting no strong form applied -- an assertion that
+was false and cost 3.2x.
+
 ## COOK-§8.8: K-Sliced GEMM Pattern
 
 When K > 128, split into 128-element blocks with TMATMUL (first block) +
@@ -1909,6 +1969,44 @@ Use when:
 
 **Never**: Read L0C directly from Vec — they are separate physical cores.
 Always stage through GM. → PLAT-§Illegal
+
+### COOK-§8.9B: populating the Bias table for `TMATMUL_BIAS` (the only route)
+
+Folding the bias into the Cube accumulator removes a whole Vec stage, a GM
+workspace and a cross-core handshake. The path to get a bias INTO the bias table is
+documented nowhere upstream, and the two natural guesses are both wrong. All four
+legs below were compile-checked against `bisheng -xcce --cce-aicore-arch=dav-c220`:
+
+| what you might try | result |
+|---|---|
+| `TLOAD(bias_tile, gm)` -- load GM straight to Bias | **FAILS** `static_assert`: a TLOAD destination must be Vec or Mat |
+| `BiasTile<half, ...>` -- keep the bias in fp16 | **FAILS** `static_assert(std::is_same<half,float>)`: the table is fp32, always |
+| GM -> L1 `Mat<half>` -> `TMOV` -> `Bias<float>` | **COMPILES** -- and the `TMOV` performs the fp16->fp32 conversion in hardware |
+| same, with the boxed `L1Mat` (ColMajor/RowMajor) source | **COMPILES** too |
+
+```cpp
+// GM(half) -> L1 Mat -> TMOV -> BiasTable(float). The TMOV converts.
+L1MatND<half, 1, N> b_l1;   TASSIGN(b_l1, B_L1_ADDR);
+TLOAD(b_l1, g_bias);                       // half -> half, no conversion
+BiasT<float, 1, N> bt;      TASSIGN(bt, BT_ADDR);
+TMOV(bt, b_l1);                            // half -> float, IN HARDWARE
+TMATMUL_BIAS(acc, l0a, l0b, bt);
+```
+
+**Why this matters more than it looks.** The hardware conversion is what keeps an
+fp16-bias GEMM `cube_only`. Without it the obvious readings are "the bias must
+already be fp32" -- forcing a Vec pre-pass, an FFTS handshake and a GM workspace --
+or "`TMATMUL_BIAS` is unusable". Two independent `grouped_matmul` runs hit this;
+the one that found the conversion deleted an entire stage with it.
+
+**The bias table is small and it silently caps your output tile.** It holds one
+fp32 row, so `N <= 256` on A2/A3. That is a real constraint on the column extent of
+the output tile, and it is not reported as a capacity error -- derive it in your C7
+budget rather than discovering it.
+
+Note `TMOV` here is the exception to COOK-§8.7's blanket "always `TEXTRACT`, never
+`TMOV` for L1->L0": that rule is about the A/B operand feed. For `Mat -> Bias`,
+`TMOV` is the ONLY path.
 
 ### COOK-§8.9Q: int32 accumulator -> fp16 with a dequant scale, FUSED into the store
 
@@ -2637,6 +2735,13 @@ select the instruction sequence. Verify each instruction with MCP
 | Activation (pointwise) | load → compute → store | TLOAD → TEXP/TRELU/TLRELU → TSTORE |
 | Reduction (axis) | load → reduce → store | TLOAD → TROWSUM/TCOLSUM/TROWMAX → TSTORE |
 | Element-wise binary | load2 → op → store | TLOAD ×2 → TADD/TSUB/TMUL/TDIV/TMAX/TMIN → TSTORE |
+
+**`TDIV` is RowMajor-only.** Compile-checked: a `BLayout::ColMajor` operand fails the
+`static_assert` outright, while the RowMajor form compiles. This collides with
+`TROWEXPANDMUL` Mode 1, which *requires* a ColMajor `[N,1]` operand -- so a
+"compute `127/amax` then broadcast-multiply" chain cannot be written in one layout.
+Compute the reciprocal in the ND/RowMajor domain, then move the single valid column
+into ColMajor for the expand. A run lost a repair attempt to this.
 | Element-wise scalar | load → scalar-op → store | TLOAD → TADDS/TSUBS/TMULS/TDIVS → TSTORE |
 | Broadcast+op | load → fused-broadcast → store | TLOAD → TROWEXPANDADD/SUB/MUL/DIV → TSTORE |
 | Matrix multiply (Cube) | load → extract → matmul → store | TLOAD → TEXTRACT → TMATMUL → TSTORE(L0C) |

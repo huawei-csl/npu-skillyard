@@ -602,18 +602,29 @@ AICORE void stage_kernel(
     wait_flag_dev(ready_flag);
 
     // TLOAD: GM workspace → UB (COOK-§8.12)
-    UbND<float, M_TILE, N_TILE> result_ub;
-    TASSIGN(result_ub, RESULT_UB_ADDR);
+    //
+    // CORRECTED. This example previously loaded a `half` GM workspace straight
+    // into a `float` UB tile with the comment "TLOAD converts half->float
+    // automatically if tile is float". **It does not, and it does not compile:**
+    //   static assertion failed: 'sizeof(float) == sizeof(__gm__ half)'
+    //   Fix: Source dtype must be same size
+    // TLOAD is a MOVE, not a convert. Load at the SOURCE width, then TCVT.
+    UbND<half, M_TILE, N_TILE> raw_ub;
+    TASSIGN(raw_ub, RAW_UB_ADDR);
     {
       Shape<1,1,1,M_TILE,N_TILE> gs;
       Stride<1,1,1,N_TILE,1> gst;
       GlobalTensor<half, decltype(gs), decltype(gst)> ws_gm(
           ws_ptr + slot * WS_RESULT_ELEMS, gs);
-      // Note: TLOAD converts half→float automatically if tile is float
-      TLOAD(result_ub, ws_gm);
+      TLOAD(raw_ub, ws_gm);            // half -> half
     }
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    UbND<float, M_TILE, N_TILE> result_ub;
+    TASSIGN(result_ub, RESULT_UB_ADDR);
+    TCVT(result_ub, raw_ub);           // widen on the Vec pipe (COOK-§8.11, C32)
+    pipe_barrier(PIPE_V);
 
     // Vec post-processing: scale the result
     UbND<float, M_TILE, N_TILE> scaled_ub;
