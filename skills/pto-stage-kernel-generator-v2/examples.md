@@ -9,18 +9,27 @@ examples. Use these as reference during generation and review.
 
 Each example shows a **wrong** pattern, why it fails, and the **correct** replacement.
 
-### EX-§1.1: Direct GM Scalar Access (CRITICAL — NPU Crash)
+### EX-§1.1: Moving BULK data with a scalar loop (CRITICAL — throughput, not a crash)
 
 ```cpp
-// ❌ WRONG: Scalar indexing of GM pointer — crashes the NPU
+// ❌ WRONG: moving a whole tile 4 bytes at a time
 __gm__ float* out_ptr = output + offset;
 for (int i = 0; i < n; ++i) {
-    out_ptr[i] = computed_value[i];  // NPU Alarm state!
+    out_ptr[i] = computed_value[i];
 }
 ```
 
-**Why**: The Ascend AI Core cannot address GM directly. Scalar `ptr[idx]`
-on a `__gm__` pointer triggers an Alarm requiring hardware reset.
+**Why**: this is orders of magnitude slower than MTE — one store instruction per
+element, versus one MTE issue for an entire tile.
+
+**It is NOT a crash.** This example used to claim scalar `ptr[idx]` on a `__gm__`
+pointer "triggers an Alarm requiring hardware reset". That was **false and was
+probed** (`isa_probes/probe_gmscalar.cpp`): scalar read and scalar write, on both
+the Vec and the Cube core, all return exact values with the device healthy either
+side. Reading a *runtime scalar* — a group boundary, a token count — with
+`p[idx]` is legal and is the supported way to do it (see C1 and COOK-§11.5). The
+false rule blocked two independent `grouped_matmul` runs. What follows is the
+right way to move a **tile**, not a prohibition on touching GM.
 
 ```cpp
 // ✅ CORRECT: Use GlobalTensor + TSTORE

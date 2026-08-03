@@ -452,10 +452,20 @@ Before returning the JSON output, verify:
     owned at most ONE item and the prefetch branch was dead code. Half the sweep tested a
     kernel that, at production size, silently produced wrong data.
 
-    a. **Compute items-per-lane, do not eyeball it.** `items = ceil(rows / rows_per_item)`,
-       `lanes = block_dim * 2` (both AIV sub-blocks are workers -- verified), so
-       `items_per_lane = items / lanes`. Put it in the validation output next to each case
-       so a reader can see which cases exercised the loop.
+    a. **Compute items-per-lane, do not eyeball it.** `items = ceil(rows / rows_per_item)`
+       and `items_per_lane = items / lanes`, where **`lanes` depends on which engine the
+       stage runs on**:
+
+       | stage archetype | lanes | why |
+       |---|---|---|
+       | Vec (`vec_only`, and the Vec half of a mixed stage) | `block_dim * 2` | both AIV sub-blocks are workers -- verified |
+       | Cube (`cube_only`) | `block_dim` | one Cube worker per block; there are no sub-blocks |
+
+       An earlier version of this rule stated `lanes = block_dim * 2` universally. That
+       **double-counts a `cube_only` stage** and makes its `items_per_lane` read half its
+       true value, so a sweep can look like a coverage gap when it is fine (or, worse,
+       pass a `>= 3` check it did not actually meet). Put the figure and the engine in the
+       validation output next to each case so a reader can see which cases exercised the loop.
     b. **Require at least one case with `items_per_lane >= 3`** at the production
        `block_dim`. Three, not two: a 2-slot ring must WRAP and re-enter steady state, not
        just run prologue-then-epilogue. If the contract's largest size cannot reach 3,

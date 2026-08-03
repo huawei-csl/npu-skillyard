@@ -118,7 +118,16 @@ core. This is the basis for double-buffering and pipeline overlap.
 | Exceeding UB 192KB peak | Silent corruption or device trap |
 | Exceeding L0C 128KB peak | Silent corruption or device trap |
 | Reusing event ID while previous signal/wait is in flight | Race condition, data corruption |
-| Scalar indexing of `__gm__` pointer (`ptr[idx]`) | NPU Alarm crash requiring hardware reset |
+| `const` / `constexpr` qualifying an `event_t` variable | Compile error: "the 3rd parameter must be a type 'event_t'" |
+
+**Removed from this table: "scalar indexing of a `__gm__` pointer".** It used to
+say "NPU Alarm crash requiring hardware reset". **That is false** — probed on
+A2/dav-c220 (`isa_probes/probe_gmscalar.cpp`): scalar read and scalar write, on
+both the Vec and the Cube core, all return exact values with the device healthy
+before and after. It is legal and is the supported way to read a runtime scalar;
+see C1 for when to use it and for the `volatile` + `dcci` requirements. The false
+rule blocked two independent `grouped_matmul` runs, because a runtime-determined
+tile schedule cannot be built without it.
 
 ---
 

@@ -33,8 +33,11 @@ cannot be repaired safely.
 
 These take priority over all other considerations.
 
-**R-C1. GM access repair.** If any `__gm__` pointer is scalar-indexed,
-wrap it in `GlobalTensor` and convert to TLOAD/TSTORE. → SKILL C1
+**R-C1. GM bulk-access repair.** If a `__gm__` pointer is scalar-indexed **in a
+loop that moves a tile's worth of data**, wrap it in `GlobalTensor` and convert to
+TLOAD/TSTORE. Do **not** flag a scalar read of a *runtime scalar* (a group
+boundary, a token count, a dynamic tile schedule) — that is legal, probed, and is
+the only way to build a runtime-determined schedule. → SKILL C1, COOK-§11.5
 
 **R-C2. Include/namespace repair.** Remove any indirection guard macros.
 Ensure `#include <pto/pto-inst.hpp>` and `using namespace pto;` are both

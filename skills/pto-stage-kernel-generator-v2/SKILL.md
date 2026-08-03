@@ -234,14 +234,54 @@ strong form, device-in-the-loop).
 
 Violations cause NPU crashes, compile failures, or silent data corruption.
 
-**C1. GM access is ONLY through MTE.**
-The Ascend AI Core cannot address global memory directly. Any scalar indexing
-of a `__gm__` pointer (`ptr[idx]`, `ptr[idx] = val`) crashes the NPU into
-Alarm state requiring a hardware reset. ALL data transfer between GM and UB
-uses `TLOAD` (GM→UB) and `TSTORE` (UB→GM) with `GlobalTensor` descriptors.
-This applies to mask generation, workspace init, output writes, assertion
-checks — everything. Never `reinterpret_cast` then scalar-index; always wrap
-in `GlobalTensor` and use TLOAD/TSTORE. → PLAT-§Illegal
+**C1. Move BULK data between GM and UB only through MTE.**
+ALL bulk data transfer between GM and UB uses `TLOAD` (GM→UB) and `TSTORE`
+(UB→GM) with `GlobalTensor` descriptors — mask generation, workspace init,
+output writes, everything that moves a tile. A scalar loop is not a substitute
+for MTE and will be orders of magnitude slower: MTE moves a whole tile per
+issue, a scalar loop moves 4 bytes.
+
+**But a scalar `__gm__` access is legal, and is the supported way to read a
+runtime scalar.** An earlier version of this rule said `ptr[idx]` "crashes the
+NPU into Alarm state requiring a hardware reset". **That is false.** It was
+probed directly on A2/dav-c220 (`isa_probes/probe_gmscalar.cpp`, 64/64 exact
+values on every mode, device healthy before and after, each mode in its own
+process):
+
+| what was probed | result |
+|---|---|
+| scalar READ `p[i]` on Vec, no `dcci` | PASS |
+| scalar READ `p[i]` on Vec, `dcci` first | PASS |
+| scalar WRITE `out[i] = v` on Vec | PASS |
+| `TSTORE` then scalar read back, no `dcci` | PASS, fresh |
+| `TSTORE` then scalar read back, with `dcci` | PASS, fresh |
+| scalar READ on the **Cube** core | PASS |
+
+The library does this itself: `pto/comm/a2a3/TWait.hpp` spins on
+`basePtr[idx]` of a `volatile __gm__ int32_t *`, and
+`pto/comm/async_common/ccu_trigger.hpp` writes an MMIO register by scalar
+store — noting that `-cce-aicore-dcci-insert-for-scalar=false` *disables*
+automatic `dcci` insertion for scalar stores, i.e. the compiler inserts them by
+default.
+
+Use it for exactly one thing: **reading a runtime scalar you need before you can
+build a descriptor** — a group boundary, a token count, a dynamic tile schedule.
+This is what makes runtime-determined shapes implementable at 1x FLOPs instead
+of padding to a worst case. Note `Tile::GetValue` cannot serve this: it is
+`static_assert(Loc == TileType::Vec)` (`pto_tile.hpp:1457`), so it reads UB, not
+GM, and it is unavailable on Cube.
+
+Two real requirements, neither of which is a crash:
+* Declare the pointer `volatile __gm__ T *`. Without it the compiler may hoist
+  the load out of a spin loop.
+* For a value another agent may have written (another core, the host, a DMA),
+  invalidate first: `dcci((__gm__ void *)(p + i), SINGLE_CACHE_LINE);`. Omitting
+  it risks **stale data, not a fault**. The probe above saw no staleness in the
+  same-core store-then-read case, so this is the library's cross-agent practice
+  rather than a measured same-core requirement — follow it when a *different*
+  agent produced the value.
+
+→ PLAT-§Illegal
 
 **C2. Include and namespace gating.**
 Use ONLY `#include "kernel_common.h"` as the single include at the top of the file.
@@ -791,6 +831,31 @@ pipe_barrier(PIPE_ALL);
 ```
 
 This bypasses the pipeline register / tile buffer disconnect entirely. → PLAT-§Pipeline
+
+**C1x. An `event_t` variable must NOT be `const` or `constexpr` qualified.**
+`set_flag` / `wait_flag` are CCE builtins whose 3rd parameter check rejects a
+cv-qualified type. Naming the type and adding `const` is the trap, because it is
+the natural thing to write:
+
+```cpp
+const event_t     ev = EVENT_ID1;   // ERROR: "the 3rd parameter must be a type 'event_t'"
+constexpr event_t ev = EVENT_ID1;   // ERROR: same
+
+auto     ev = EVENT_ID1;            // OK -- deduces plain (non-const) event_t
+event_t  ev = EVENT_ID1;            // OK
+set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);          // OK -- literal at the call site
+wait_flag(PIPE_MTE3, PIPE_MTE2, (event_t)eid);   // OK -- cast of a computed id
+```
+
+All six forms above were compile-tested against `bisheng -xcce`
+`--cce-aicore-arch=dav-c220`; only the two `const`/`constexpr` ones fail. `auto`
+works in a loop, through a ternary, as a function parameter, and in a template.
+
+Three separate runs reported this as "`auto _we = EVENT_ID1;` does not compile"
+and repaired it by inlining the literal at every call site. **That diagnosis was
+wrong** — `auto` is fine, and inlining is an unnecessary readability cost that
+also makes a computed id impossible. The offending form was `const event_t`.
+If you hit this error, delete the `const`; do not un-name the variable.
 
 **C22. msprof op simulator validation.**
 Kernels can be validated without NPU hardware using the Ascend simulator:
@@ -1655,7 +1720,8 @@ appear in generated output. References point to the rule that forbids them.
 
 | Pattern | Rule | Why |
 |---------|------|-----|
-| `ptr[idx]` on `__gm__` pointer | C1 | NPU Alarm crash |
+| `const event_t e = EVENT_ID1;` or `constexpr event_t` | C1x | "the 3rd parameter must be a type 'event_t'" -- drop the `const`, or use `auto` |
+| Scalar loop instead of `TLOAD`/`TSTORE` to move a TILE | C1 | Orders of magnitude slower (4 B per issue vs a whole tile). NOT a crash -- a scalar `__gm__` read of a runtime scalar is legal, see C1 |
 | `#include <pto/pto_instr.hpp>` | C2 | Wrong header |
 | `#include <runtime/rt_ffts.h>` or any other include besides `kernel_common.h` | C2 | Redundant, conflicts with kernel_common.h |
 | `#include "acl/acl.h"` or `#include <cmath>` | C2 | Already provided by kernel_common.h |

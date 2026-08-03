@@ -176,7 +176,7 @@ SAME AIV core. This is the basis for double-buffering and pipeline overlap.
 | Exceeding UB 256KB peak | Silent corruption or device trap |
 | Exceeding L0C 256KB peak | Silent corruption or device trap |
 | Reusing event ID while previous signal/wait is in flight | Race condition, data corruption |
-| Scalar indexing of `__gm__` pointer (`ptr[idx]`) | NPU Alarm crash requiring hardware reset |
+| ~~Scalar indexing of `__gm__` pointer (`ptr[idx]`)~~ | **UNVERIFIED ON A5 — false on A2.** The identical claim in `platform_model.md` was disproved by direct probe on A2/dav-c220 (scalar read and write, Vec and Cube, all exact). The probe has NOT been run on A5, so this row is retained only as an untested inheritance, not as evidence. Do not treat it as a constraint without probing A5. |
 
 ---
 

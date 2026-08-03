@@ -596,8 +596,10 @@ set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
 for (uint32_t processed = 0, ping = 1; processed < elements_to_process;
      processed += tile_cols) {
   const int8_t buf = ping ? 0 : 1;
-  const event_t ev = ping ? static_cast<event_t>(EVENT_ID0)
-                          : static_cast<event_t>(EVENT_ID1);
+  // NOT `const event_t` -- the CCE builtin check rejects a cv-qualified event_t
+  // with "the 3rd parameter must be a type 'event_t'". See C1x.
+  event_t ev = ping ? static_cast<event_t>(EVENT_ID0)
+                    : static_cast<event_t>(EVENT_ID1);
 
   TileData xTile(1, tile_cols);
   TileData calTile(1, tile_cols);
@@ -1138,6 +1140,18 @@ using TileRightF = pto::Tile<pto::TileType::Right, T, R, C,
                              pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 // L0C accumulator: BLayout::ColMajor, SLayout::RowMajor.
+// The 512 here differs from the library's own alias, which uses
+//   using TileAcc = Tile<TileType::Acc, ..., TileConfig::fractalCSize>
+// (pto_tile.hpp:1767) where `fractalCSize = 1024` and `fractalABSize = 512`
+// (pto_tile.hpp:953-954). A run reported this as a bug -- "at 512 an fp32
+// accumulator gets a 16x8 fractal instead of 16x16".
+// PROBED, NOT REPRODUCED: `isa_probes/probe_accfrac.cpp` runs a real 128x128x128
+// fp16 matmul built both ways; both give rel err 2.960e-04 against an fp64
+// reference -- bit-for-bit the same answer. Both also compile (the static_assert
+// accepts either constant). So 512 is kept, because it is the value every
+// validated kernel here was built with, and switching a working constant on an
+// unreproduced report is how regressions get introduced.
+// If you find a shape where the two DIVERGE, that is a real finding -- record it.
 template <typename T, int R, int C, int RV = R, int CV = C>
 using TileAccF = pto::Tile<pto::TileType::Acc, T, R, C,
                            pto::BLayout::ColMajor, RV, CV,
@@ -1732,6 +1746,22 @@ Every reference kernel follows this exact mapping. Never swap the destination �
 L1MatZN into TileLeft or L1Mat into TileRight for transposed will fail with
 `static_assert`.
 
+**The table above is HARDWARE-VERIFIED.** `isa_probes/probe_accfrac.cpp` stages both
+operands through `L1Mat` (`SLayout::RowMajor`) and extracts the right one into a
+`TileRight` (`SLayout::ColMajor`), then checks the product against an fp64 reference:
+the answer is **`A @ B`** at rel err 2.960e-04, while `A @ B^T` is off by 1.399.
+So `L1Mat -> TileRight` is the **NO-transpose** path, exactly as the table says.
+
+A run reported the table as "backwards" on the theory that the library selects
+`Transpose = (Dst::SFractal != Src::SFractal)`. **Not reproduced** -- the SFractals
+do differ on that path (RowMajor vs ColMajor) and no transpose occurs. Do not
+"fix" this table.
+
+**What that run actually hit is the SNIPPET BELOW, which is wrong.** It performs
+the *transposed* feed (`TRESHAPE` to `L1MatZN`, then `TEXTRACT`) unconditionally,
+in a section whose table is about the untransposed case. Follow the snippet blindly
+for a plain `C = A @ B` and you get `B^T`. Pick the branch that matches your maths:
+
 ```cpp
 {
     TileLeft<half, M, K, M, K> _l0a;
@@ -1746,10 +1776,17 @@ L1MatZN into TileLeft or L1Mat into TileRight for transposed will fail with
     wait_flag(PIPE_M, PIPE_MTE1, _we);
 
     TEXTRACT(_l0a, a_l1, 0, 0);
-    // Transposed right operand: TRESHAPE to L1MatZN, then TEXTRACT
-    L1MatZN<half, K, N> _bzn;
-    TRESHAPE(_bzn, b_l1);
-    TEXTRACT(_l0b, _bzn, 0, 0);
+
+    // CHOOSE ONE -- these compute DIFFERENT products.
+    //
+    // (a) C = A @ B  -- the usual case. Feed the right operand straight from
+    //     L1Mat. No TRESHAPE, no L1MatZN. Hardware-verified above.
+    TEXTRACT(_l0b, b_l1, 0, 0);
+    //
+    // (b) C = A @ B^T -- only when your maths actually wants B transposed:
+    //     L1MatZN<half, K, N> _bzn;
+    //     TRESHAPE(_bzn, b_l1);
+    //     TEXTRACT(_l0b, _bzn, 0, 0);
 
     set_flag(PIPE_MTE1, PIPE_M, _we);
     wait_flag(PIPE_MTE1, PIPE_M, _we);
@@ -1865,6 +1902,55 @@ Use when:
 
 **Never**: Read L0C directly from Vec — they are separate physical cores.
 Always stage through GM. → PLAT-§Illegal
+
+### COOK-§8.9Q: int32 accumulator -> fp16 with a dequant scale, FUSED into the store
+
+For a quantized matmul (int8 x int8 -> int32, then `* scale` -> fp16) do **not**
+write int32 to GM and rescale it on Vec. The fixpipe applies the scale during the
+L0C->GM writeback, selected by the source/destination type pair:
+
+```cpp
+// acc is TileAcc<int32_t,...>, the GlobalTensor is <half>. The int32->fp16 type
+// pair selects QuantMode_t::DEQF16, which applies the scale AND does NZ->ND in
+// one pass. No int32 intermediate ever reaches GM: no second stage, no Vec work,
+// no cross-core handshake, no int32-sized workspace.
+TSTORE(gm_half, acc_int32, quant_pre);
+```
+
+**The `quant_pre` register encoding is documented nowhere** -- not in the ISA docs,
+not in the pto-isa headers, not in the CANN AscendC headers, which expose only the
+field name `deqScalar`. It is:
+
+```
+quant_pre = (1ULL << 46) | (uint64_t)(fp32_bits(scale) & 0xFFFFE000)
+```
+
+That is: bit 46 set, and the fp32 mantissa keeps only its **top 10 explicit bits**
+(bits 22..13; bit 12 is always cleared). The scale register is effectively a
+**19-bit float** (sign + 8 exponent + 10 mantissa).
+
+Evidence -- three independent derivations agree:
+1. Verified 800/800 against `torch_npu.npu_trans_quant_param` over random scales
+   spanning 1e-3..1e3, both signs. (`npu_trans_quant_param` is a documented public
+   *parameter-packing* API, so using it is not a provenance breach -- no kernel
+   source is read.)
+2. Independently re-derived by a later run that had no access to the first.
+3. `gen_ab_quant.py` asserts both packings and the vendor's own agree bit-for-bit
+   on a snapped scale, and the resulting kernel output is **bit-identical to a
+   CPU-fp64 reference** at every size from M=1024 to M=8192.
+
+**Consequence for your tolerance, and it is a trap.** The applied scale differs
+from the requested fp32 scale by up to `2^-10 = 9.77e-4` relative. That is LARGER
+than fp16 rounding, so a contract that says "the only error is one fp16 rounding"
+is wrong. Two defensible choices, and you must say which you took:
+* **truncate** (`& 0xFFFFE000`) -- matches the vendor exactly, so outputs can be
+  compared bit-for-bit against `npu_quant_matmul`;
+* **round to nearest-even** -- roughly halves the scale error, but then you are no
+  longer bit-comparable with the vendor and must validate against fp64 instead.
+
+Validate against a reference built with the **effective** (post-truncation) scale,
+never the requested one, or you will chase a 1e-3 "bug" that is the hardware's
+documented behaviour.
 
 ---
 
@@ -2344,6 +2430,64 @@ AICORE inline VarlenTileInfo get_tile_info(uint32_t tile_id,
 // Fast path: full tile_size rows.
 // Tail path: only the final partial tile narrows valid_size.
 ```
+
+**WARNING: the helper above is a STUB.** It takes `cu_seqlens` and ignores it,
+always returning `{0, tile_size}`. It is a shape placeholder, not a recipe. For an
+actual runtime-determined schedule use COOK-§11.5.
+
+### COOK-§11.5: Schedule resolved ON DEVICE from a runtime boundary tensor
+
+Use when the work partition is **data**, not shape: grouped matmul with a
+`group_list`, varlen attention with `cu_seqlens`, MoE with runtime expert counts.
+This was previously unimplementable here because C1 wrongly forbade the scalar
+`__gm__` read it needs; C1 is now corrected and probed
+(`isa_probes/probe_gmscalar.cpp`, including the read on the **Cube** core).
+
+The three alternatives and why they lose:
+* *host readback* -- adds a device->host sync per launch that the vendor does not pay;
+* *pad to the worst case* -- 3 equal groups instead of 256/1024/512 costs 3x the FLOPs;
+* *one group per core* -- 3 groups over 24 cores leaves 21 cores idle, and the
+  largest group is 4x the smallest, so the imbalance is the runtime.
+
+The pattern:
+
+```cpp
+// 1. EVERY core independently re-derives the SAME tile enumeration with an O(G)
+//    scalar prefix walk. No host sync, no inter-core communication, no barrier:
+//    the enumeration is a pure function of group_list, so all cores agree.
+volatile __gm__ int64_t *gl = (volatile __gm__ int64_t *)group_list;
+int32_t n_tiles = 0, prev = 0;
+for (int32_t g = 0; g < G; ++g) {
+  dcci((__gm__ void *)(gl + g), SINGLE_CACHE_LINE);   // host wrote it: invalidate
+  int32_t end = (int32_t)gl[g];
+  // Defensive: a malformed list must not generate an out-of-bounds tile.
+  if (end < prev) end = prev;
+  if (end > M)    end = M;
+  n_tiles += (end - prev + MT - 1) / MT;              // MT = rows per tile
+  prev = end;
+}
+
+// 2. Claim tiles by a grid stride. The WORK ITEM IS A TILE, NOT A GROUP -- that is
+//    what turns 3 uneven groups into n_tiles balanced items across all cores.
+for (int32_t t = get_block_idx(); t < n_tiles; t += get_block_num()) {
+  // 3. Map t -> (group, row range) with a second O(G) walk.
+  //    Generate the tile grid PER GROUP so no tile ever straddles a boundary:
+  //    only the GM load/store extents are runtime-variable, and every Cube tile
+  //    keeps a STATIC shape (Cube fractal tiles require static column extents).
+  ...
+}
+// 4. Rows not covered by any group must be explicitly ZEROED, not left undefined.
+```
+
+Non-negotiables, each of which was a real failure mode:
+* **Clamp the boundaries** non-decreasing and `<= M` before use. A malformed or
+  non-monotonic `group_list` must produce zeros, not an OOB access.
+* **Validate the degenerate cases**: zero-row first/middle/last group, two empty
+  groups, all-empty, single-row groups, unaligned boundaries, a boundary past M,
+  a short last boundary, non-monotonic input.
+* **The optimal `block_dim` is data-dependent** -- the tile count is a function of
+  runtime data, so no single value is right for all inputs. Measure the crossover
+  and report it; do not quote the flattering point as if it generalised.
 
 ---
 
