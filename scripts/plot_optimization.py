@@ -62,8 +62,15 @@ BAD_C, DIAG_C = "#c1121f", "#888"
 
 def plot(doc, out_png):
     att = sorted(doc.get("attempts", []), key=lambda a: a["n"])
+    # An attempt with no ratio is legitimate and must NOT crash the plot: a change
+    # that failed to COMPILE, or whose validation aborted, never produced a number.
+    # It is still an attempt and still consumed budget, so it is kept in the count
+    # and drawn as a marker on the "no measurement" rule at the top of the axis.
+    unmeasured = [a for a in att if a.get("ratio") is None]
+    att = [a for a in att if a.get("ratio") is not None]
     if not att:
-        print("  no attempts in %s -- nothing to plot" % out_png, file=sys.stderr)
+        print("  %s: %d attempt(s), none with a ratio -- nothing to plot"
+              % (out_png, len(unmeasured)), file=sys.stderr)
         return False
 
     stage = doc.get("stage", "stage")
@@ -94,18 +101,17 @@ def plot(doc, out_png):
         run.append(best if best < float("inf") else y)
     ax.step(xs, run, where="post", color=LINE_C, lw=1.6, alpha=.85,
             label="best kept so far", zorder=2)
+    # Warnings go ABOVE the axes, never over the data. Drawing them at a fixed
+    # axes fraction put them straight through the points whenever the campaign
+    # ended near the bottom of the range -- which is exactly when it went well.
+    warn = []
     if not any(kept):
-        ax.annotate("no attempt was kept -- shipped kernel is the baseline",
-                    xy=(0.5, 0.02), xycoords="axes fraction", ha="center",
-                    fontsize=9, color="#a33")
-    # If an INVALID attempt is the lowest point on the chart, say so outright --
-    # the eye reads the minimum as the winner.
+        warn.append("no attempt was kept -- shipped kernel is the baseline")
     valid_ys = [y for y, c, dg in zip(ys, ok, diag) if c and not dg]
     bad_ys = [y for y, c in zip(ys, ok) if not c]
     if bad_ys and (not valid_ys or min(bad_ys) < min(valid_ys)):
-        ax.annotate("lowest point FAILED VALIDATION -- not a result",
-                    xy=(0.5, 0.075), xycoords="axes fraction", ha="center",
-                    fontsize=9.5, color=BAD_C, weight="bold")
+        warn.append("an attempt at or below the best valid result FAILED VALIDATION "
+                    "-- it is not a result")
 
     if base is not None:
         ax.axhline(base, color="#888", ls=":", lw=1.2, zorder=1)
@@ -133,7 +139,7 @@ def plot(doc, out_png):
     # Always show all 10 slots: an early stop should be VISIBLE as unused budget.
     ax.set_xlim(0.4, BUDGET + 0.6)
     ax.set_xticks(range(1, BUDGET + 1))
-    used = len(att)
+    used = len(att) + len(unmeasured)
     if used < BUDGET:
         ax.axvspan(used + 0.5, BUDGET + 0.6, color="#bbb", alpha=.14, zorder=0)
         ax.annotate("budget not used (%d of %d)" % (used, BUDGET),
@@ -141,6 +147,11 @@ def plot(doc, out_png):
                     xycoords=("data", "axes fraction"), ha="center",
                     fontsize=8.5, color="#666")
 
+    if unmeasured:
+        top = max(ys) + 0.06 * (max(ys) - min(ys) + 1e-9)
+        for a in unmeasured:
+            ax.plot(a["n"], top, marker="$?$", ms=11, color="#777", zorder=3)
+        warn.append("? = attempt produced no measurement (build or validation aborted)")
     ax.set_xlabel("optimization attempt  (budget %d)" % BUDGET)
     ax.set_ylabel("latency ratio  ours / vendor   (lower is better)")
     ax.set_title("%s -- optimization campaign  [%s]" % (stage, arch),
@@ -151,10 +162,14 @@ def plot(doc, out_png):
     if stop == "hardware_limit":
         sub += "  --  gate %s: %s" % (doc.get("gate", "?"), doc.get("gate_value", "?"))
     elif used < BUDGET and arch == "mixed":
-        sub += "  --  PROCESS FAILURE: a mixed stage must run all %d attempts" % BUDGET
-    ax.text(0.0, 1.012, "\n".join(textwrap.wrap(sub, 110)), transform=ax.transAxes,
-            ha="left", va="bottom", fontsize=8.5,
-            color=("#a33" if "PROCESS FAILURE" in sub else "#555"), linespacing=1.4)
+        warn.append("PROCESS FAILURE: a mixed stage must run all %d attempts" % BUDGET)
+    lines = textwrap.wrap(sub, 110)
+    ax.text(0.0, 1.012, "\n".join(lines), transform=ax.transAxes, ha="left",
+            va="bottom", fontsize=8.5, color="#555", linespacing=1.4)
+    if warn:
+        ax.text(1.0, 1.012, "\n".join(warn), transform=ax.transAxes, ha="right",
+                va="bottom", fontsize=8.5, color=BAD_C, weight="bold",
+                linespacing=1.4)
 
     ax.grid(axis="y", alpha=.25)
     handles = [
