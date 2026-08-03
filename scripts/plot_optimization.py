@@ -20,6 +20,8 @@ Input schema (what Phase 6.5 must write, one file per stage):
          "ratio": 1.94,                  # ours/vendor latency, LOWER IS BETTER
          "ci": [1.93, 1.95],             # optional 95% CI
          "kept": true,
+         "correct": true,             # OPTIONAL, default true. FALSE = failed validation.
+         "kind": "candidate",         # OPTIONAL, default "candidate". Or "diagnostic".
          "why": "1.31x, determinism held",
          "kernel": "src/variants/kernel_attn_scores_a01.cpp"},   # optional, see below
         ...
@@ -34,6 +36,14 @@ Conventions this script assumes, and enforces in what it draws:
   * a reverted attempt is still an attempt and is still plotted -- the regressions
     are usually the most informative part of the campaign (full double buffering
     measurably made one kernel SLOWER here, which is the point);
+  * a kernel that FAILED VALIDATION must never read as a win. A real run produced an
+    attempt that measured as the fastest point on the whole chart and was numerically
+    wrong (0/14 cases, 2.65M elements off by more than 1). The eye goes straight to
+    the lowest point, so those are drawn as red crosses, excluded from the best-kept
+    line, and called out in a banner. Speed for a wrong kernel is not a result;
+  * a DIAGNOSTIC (a noop-floor probe, a strided-vs-contiguous test) is a measurement,
+    not a shippable kernel. Plotting it as a candidate conflates "something I
+    measured" with "something I could have shipped", so it is drawn separately;
   * the budget is 10, so the x-axis always shows all 10 slots even when fewer were
     used. An early stop is then visible as empty space, which is the intent: you
     should be able to SEE that the campaign stopped short and read why.
@@ -47,6 +57,7 @@ from matplotlib.lines import Line2D
 
 BUDGET = 10
 KEPT_C, DROP_C, LINE_C = "#2f5d3a", "#a33", "#4a6fa5"
+BAD_C, DIAG_C = "#c1121f", "#888"
 
 
 def plot(doc, out_png):
@@ -60,33 +71,60 @@ def plot(doc, out_png):
     xs = [a["n"] for a in att]
     ys = [a["ratio"] for a in att]
     kept = [bool(a.get("kept")) for a in att]
+    # Default to correct/candidate so older JSONs keep plotting unchanged.
+    ok = [a.get("correct", True) is not False for a in att]
+    diag = [a.get("kind", "candidate") == "diagnostic" for a in att]
 
     fig, ax = plt.subplots(figsize=(10.2, 5.6))
 
+    base = doc.get("baseline_ratio")
+
     # Running best: the line a reader actually cares about, since a campaign keeps
     # the best-so-far kernel and a regression does not undo earlier progress.
-    best, run = float("inf"), []
-    for y, k in zip(ys, kept):
-        if k:
+    #
+    # SEED IT WITH THE BASELINE. A campaign where nothing is kept is a real and
+    # informative outcome (one case here went 10/10 with 0 kept), and seeding with
+    # +inf made the line fall back to tracing the raw ratios -- so it wandered up
+    # and down while the legend called it "best kept so far". Held at the baseline
+    # it says the true thing: the shipped kernel never moved.
+    best, run = (base if base is not None else float("inf")), []
+    for y, k, c, dg in zip(ys, kept, ok, diag):
+        if k and c and not dg:          # only a CORRECT, KEPT candidate moves the best
             best = min(best, y)
         run.append(best if best < float("inf") else y)
     ax.step(xs, run, where="post", color=LINE_C, lw=1.6, alpha=.85,
             label="best kept so far", zorder=2)
+    if not any(kept):
+        ax.annotate("no attempt was kept -- shipped kernel is the baseline",
+                    xy=(0.5, 0.02), xycoords="axes fraction", ha="center",
+                    fontsize=9, color="#a33")
+    # If an INVALID attempt is the lowest point on the chart, say so outright --
+    # the eye reads the minimum as the winner.
+    valid_ys = [y for y, c, dg in zip(ys, ok, diag) if c and not dg]
+    bad_ys = [y for y, c in zip(ys, ok) if not c]
+    if bad_ys and (not valid_ys or min(bad_ys) < min(valid_ys)):
+        ax.annotate("lowest point FAILED VALIDATION -- not a result",
+                    xy=(0.5, 0.075), xycoords="axes fraction", ha="center",
+                    fontsize=9.5, color=BAD_C, weight="bold")
 
-    base = doc.get("baseline_ratio")
     if base is not None:
         ax.axhline(base, color="#888", ls=":", lw=1.2, zorder=1)
         ax.annotate("baseline %.3f" % base, xy=(0.015, base),
                     xycoords=("axes fraction", "data"), va="bottom", ha="left",
                     fontsize=8.5, color="#666")
 
-    for a, k in zip(att, kept):
+    for a, k, c, dg in zip(att, kept, ok, diag):
         ci = a.get("ci")
         err = [[a["ratio"] - ci[0]], [ci[1] - a["ratio"]]] if ci else None
-        ax.errorbar(a["n"], a["ratio"], yerr=err, fmt="o", ms=9, capsize=4,
-                    color=KEPT_C if k else DROP_C,
-                    mfc=(KEPT_C if k else "none"),
-                    mec=(KEPT_C if k else DROP_C), zorder=3)
+        if not c:            # failed validation -- must not read as a win
+            style = dict(fmt="X", ms=11, color=BAD_C, mec=BAD_C, mfc=BAD_C)
+        elif dg:             # a measurement, not a shippable kernel
+            style = dict(fmt="s", ms=8, color=DIAG_C, mec=DIAG_C, mfc="none")
+        else:
+            style = dict(fmt="o", ms=9, color=KEPT_C if k else DROP_C,
+                         mfc=(KEPT_C if k else "none"),
+                         mec=(KEPT_C if k else DROP_C))
+        ax.errorbar(a["n"], a["ratio"], yerr=err, capsize=4, zorder=3, **style)
 
     ax.axhline(1.0, color="#333", ls="--", lw=1.3, zorder=1)
     ax.annotate("vendor parity", xy=(0.015, 1.0), xycoords=("axes fraction", "data"),
@@ -119,12 +157,19 @@ def plot(doc, out_png):
             color=("#a33" if "PROCESS FAILURE" in sub else "#555"), linespacing=1.4)
 
     ax.grid(axis="y", alpha=.25)
-    ax.legend(handles=[
+    handles = [
         Line2D([], [], marker="o", ls="", mfc=KEPT_C, mec=KEPT_C, label="kept"),
         Line2D([], [], marker="o", ls="", mfc="none", mec=DROP_C,
                label="reverted / regressed"),
         Line2D([], [], color=LINE_C, lw=1.6, label="best kept so far"),
-    ], fontsize=9, loc="best")
+    ]
+    if not all(ok):
+        handles.append(Line2D([], [], marker="X", ls="", color=BAD_C,
+                              label="FAILED VALIDATION (speed is meaningless)"))
+    if any(diag):
+        handles.append(Line2D([], [], marker="s", ls="", mfc="none", mec=DIAG_C,
+                              label="diagnostic probe, not a candidate"))
+    ax.legend(handles=handles, fontsize=9, loc="best")
 
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)

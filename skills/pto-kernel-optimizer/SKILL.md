@@ -176,11 +176,22 @@ versions. An unoptimized kernel is not a result.
 ```json
 {"stage": "...", "archetype": "mixed|vec_only|cube_only", "baseline_ratio": 2.31,
  "attempts": [{"n": 1, "hypothesis": "...", "changed": "...", "ratio": 1.94,
-               "ci": [1.93, 1.95], "kept": true, "why": "...",
+               "ci": [1.93, 1.95], "kept": true,
+               "correct": true,          // FALSE if it failed validation
+               "kind": "candidate",      // or "diagnostic" for a probe
+               "why": "...",
                "kernel": "src/variants/kernel_<stage>_a01.cpp"}],
  "stop_reason": "budget_exhausted|hardware_limit",
  "gate": "...", "gate_value": "..."}
 ```
+
+`correct` and `kind` are not bookkeeping -- they change what the graph asserts. A real
+campaign produced an attempt that measured as **the fastest point on the whole chart**
+and was numerically wrong (0/14 cases, 2.65M elements off by more than 1); a reader's
+eye goes straight to the lowest point. Mark a failed-validation attempt `"correct":
+false` and it is drawn as a red cross, excluded from the best-kept line, and banner-ed.
+Mark a noop-floor or strided-vs-contiguous probe `"kind": "diagnostic"` so it is not
+read as a kernel you could have shipped. **Speed for a wrong kernel is not a result.**
 
 **Archive EVERY attempt's kernel** under `src/variants/kernel_<stage>_a<NN>.cpp` —
 including the one you keep. Overwriting the main kernel in place with the winner and
