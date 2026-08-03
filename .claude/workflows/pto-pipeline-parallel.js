@@ -78,7 +78,12 @@ const DEVICES = (ARGS?.devices && ARGS.devices.length) ? ARGS.devices : ['0']
 // name (e.g. "npu-skillyard:pto-stage-worker") if your install exposes it that way.
 const WORKER_AGENT = ARGS?.worker_agent ?? 'pto-stage-worker'
 const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimize:false to skip
-const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? 2
+// Default: optimize EVERY stage, not just the dominant few. A stage that merely
+// validates is not finished, and unoptimized stages made two regenerations of one
+// case differ by 1.16x vs 1.52x against the vendor at identical correctness.
+// Pass optimize_top_n to narrow it deliberately.
+const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? Infinity
+const OPTIMIZE_ATTEMPTS = ARGS?.optimize_attempts ?? 10
 const COMPOSE_MODE = (ARGS?.compose_mode === 'host-stream') ? 'host-stream' : 'ffts'  // default ffts (auto-falls back to host-stream)
 const FUSE = ARGS?.fuse === true                     // OPT-IN; default OFF -- fusion runs only if requested
 const REPORT = ARGS?.report !== false                // default ON; organize run dir + write report
@@ -411,14 +416,29 @@ and Phase 6 benchmarks exist. Apply the pto-kernel-optimizer skill to the DOMINA
 - benchmarks_json: ${OUT}/benchmarks.json
 - pto_python: ${PY}
 - devices available: ${DEVICES.join(', ')} (use ONE device; never run two timed harnesses on it at once)
-- optimize the top ${OPTIMIZE_TOP_N} stages by per-work-unit SLOPE (fall back to median share if no slope is recorded)
+- optimize ${OPTIMIZE_TOP_N === Infinity ? 'EVERY stage' : `the top ${OPTIMIZE_TOP_N} stages`}, ordered by per-work-unit SLOPE (fall back to median share if no slope is recorded)
 
-Method (pto-kernel-optimizer): for each dominant stage, decompose the slope, classify the
+Method (pto-kernel-optimizer): for each stage, decompose the slope, classify the
 bottleneck, apply the matching lever, and RE-MEASURE with a within-process paired A/B before
 trusting any win. PRIORITIZE the levers the generator already flagged: scan each stage .cpp for
 'OPTIMIZER-TARGET(' banner markers and attack those first (they name the exact pattern + reason).
-Bound the work: at most 3 levers per stage; stop at the irreducible floor (serial recurrence /
-wholesale-clone boundary) and record it honestly.
+
+ATTEMPT BUDGET -- MANDATORY, see pto-kernel-optimizer SKILL.md 3.5. ${OPTIMIZE_ATTEMPTS} measured
+attempts per stage, where an attempt is a change WITH a paired re-measurement. Reverted
+regressions COUNT and must still be recorded -- they are often the most informative rows.
+- 'mixed' stages (Cube+Vec, cross-core, composed/fused): ALL ${OPTIMIZE_ATTEMPTS}, always, even
+  when expensive. NO early stop -- their cost is a composition, and an engine can sit at its
+  roofline while the seam wastes the wall clock.
+- 'vec_only' / 'cube_only': may stop early ONLY at a MEASURED hardware limit -- within ~10% of
+  the measured streaming ceiling or the measured roofline at that shape, or a noop-one-resource
+  probe showing the remainder is the other resource's irreducible floor. Record WHICH gate fired
+  AND ITS NUMBER. "Looks memory-bound" is not a gate; a roofline percentage alone is not a gate.
+- Fewer than ${OPTIMIZE_ATTEMPTS} on a 'mixed' stage is a PROCESS FAILURE: say so, do not present
+  the run as complete.
+
+Write ${OUT}/reports/optimization_<stage>.json per stage:
+{attempts:[{n, hypothesis, changed, ratio, ci:[lo,hi], kept:bool, why}], stop_reason, gate?, gate_value?}
+so the report phase can plot the trajectory.
 
 HARD GATES (every step): re-validate vs the fp64 reference at small AND production sizes and
 re-run the determinism check after EVERY change. Never re-add a flush/barrier to mask a race.
@@ -426,8 +446,10 @@ Keep the last-good kernel as the deployable fallback; if a lever regresses or br
 revert it. PROVENANCE: study a reference's STRUCTURE only; the kernel stays generated/derived.
 Overwrite a stage's kernel_<stage>.cpp/.so and its benchmark entry IN PLACE only after a paired win.
 
-Return: {optimized: [{stage, lever, before_slope, after_slope, speedup_x, kept: bool, floor_reason?}],
-markers_closed: [..], benchmarks_json: path}. Final message IS the result.`
+Return: {optimized: [{stage, archetype, attempts_made, lever, before_slope, after_slope,
+speedup_x, kept: bool, stop_reason, gate?, gate_value?, budget_met: bool}],
+markers_closed: [..], benchmarks_json: path,
+optimization_json: [paths]}. Final message IS the result.`
 
   optimization = await agent(optPrompt, {
     label: 'optimize',
@@ -607,6 +629,13 @@ ${JSON.stringify(pipelineSummary)}
    - slope_by_stage.png    : bar of slope_per_unit_ns per stage (the per-work-unit production cost).
    - optimized_before_after.png : for stages with an "optimized" block, grouped before/after
                              slope bars annotated with speedup_x (skip if no stage was optimized).
+   - optimization_trajectory_<stage>.png : one per reports/optimization_<stage>.json (Phase 6.5).
+                             x = attempt number, y = measured ratio vs vendor (LOWER IS BETTER),
+                             a horizontal reference line at y=1.0 labelled "vendor parity",
+                             error bars from each attempt's ci, and KEPT vs REVERTED attempts
+                             visually distinct (filled vs hollow markers) with a legend. This
+                             graph is how a reader sees HOW the kernel was optimized rather than
+                             only where it landed -- do not skip it when the JSON exists.
    - fused_vs_chain.png    : ONLY if the summary's fusion has speedup_vs_chain -- fused vs chain per
                              sweep point (data from the summary above, NOT benchmarks.json).
    - accuracy_vs_tol.png   : per-stage relative error vs tolerance from the summary's
@@ -615,7 +644,11 @@ ${JSON.stringify(pipelineSummary)}
    Label axes + units and title each.
 4. reports/report.md: the shape_contract, a per-stage table (result | rel-err vs tol | headroom% |
    repair_attempts | last_error), a benchmark table, the graphs embedded via ![](relative.png),
-   the fusion classification + speedups, and the optimization outcomes.
+   the fusion classification + speedups, and the OPTIMIZATION CAMPAIGN per stage -- the trajectory
+   table (attempt # | hypothesis | what changed | measured ratio + 95% CI | kept or reverted | why),
+   the trajectory graph, the attempt count, and the STOP REASON (budget exhausted, or which
+   hardware-limit gate fired with its number). A 'mixed' stage with fewer than the required
+   attempts must be flagged as a PROCESS FAILURE, not presented as complete.
 5. output_dir/README.md: a top-level NARRATIVE -- what the run ACHIEVED (stages passed, the headline
    benchmark, fusion result), the BLOCKERS and what was TRIED (per failed stage: repair_attempts +
    last_error; any locked-dim contract amendments; sim advisory-mismatches; optimizer markers/floors;

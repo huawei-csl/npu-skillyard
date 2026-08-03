@@ -1884,6 +1884,13 @@ different-sized L0A/L0B tiles and does NOT use `PIPE_FIX→M` sync.
 
 After TMATMUL completes, store the accumulator result to GM workspace.
 
+**DANGER -- read C33 before using the `DYNAMIC` form below.** A boxed tile's valid
+extent is honoured only within its LAST 16-row fractal: `TileAcc<float, M, N,
+DYNAMIC, DYNAMIC>(valid_M, ...)` is correct **iff `ceil(valid_M/16) ==
+ceil(M/16)`**, and silently wrong otherwise (probed: at `M=128`, only
+`valid_M = 113..128` are correct; `valid_M = 16/32/64` are all WRONG, so this is
+not a multiple-of-16 rule). Declare the tile at the size you actually use.
+
 ```cpp
 {
     TileAcc<float, M, N, DYNAMIC, DYNAMIC> _l0(valid_M, valid_N);

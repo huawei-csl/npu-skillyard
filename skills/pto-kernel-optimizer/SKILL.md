@@ -130,7 +130,61 @@ advantage is almost always a leaner slope.
 5. **Overlap + residency.** Keep reused operands resident instead of re-fetching; overlap
    independent work of one resource behind another; run-ahead the work that does NOT
    depend on the previous step's result.
-6. **Stop** at the irreducible floor or a wholesale-clone boundary (see Stop-criteria).
+6. **Stop** at the irreducible floor or a wholesale-clone boundary (see Stop-criteria),
+   but not before the mandatory attempt budget below.
+
+## 3.5 MANDATORY attempt budget: 10 attempts, and they go in the report
+
+Every generated kernel gets an optimization campaign. It is not optional, and it is not
+finished when the kernel merely validates.
+
+**The budget is 10 measured attempts.** An "attempt" is a *change with a paired
+re-measurement* — a hypothesis, a build, a number. Reverted regressions COUNT, and are
+often the most informative entries; do not quietly drop them.
+
+| stage archetype | minimum attempts | early stop allowed? |
+|---|---|---|
+| `mixed` (Cube + Vec, cross-core, composed/fused) | **10, always** | **No.** Run all 10 even when it is expensive. |
+| `vec_only` | 10 | Yes — see the gate below |
+| `cube_only` | 10 | Yes — see the gate below |
+
+**Early-stop gate (single-engine stages only).** You may stop before 10 *only* if you can
+show the kernel is at a **hardware limit**, with a measurement, not an argument:
+* achieved bandwidth is within ~10% of the measured streaming ceiling (A2/A3: ~811 GB/s
+  HBM; measure it, do not quote it), **or**
+* achieved FLOP/s is within ~10% of the engine's measured roofline at this shape, **or**
+* a noop-one-resource probe shows the remaining time IS the irreducible floor of the
+  other resource.
+
+State which gate fired and the number that fired it. **"It looks memory-bound" is not a
+gate. A roofline percentage on its own is not a gate** — a marginal-cost probe once
+disproved exactly that reasoning here (doubling every matmul cost 4.8%, while doubling
+the Vec loads cost 32.2%, in a kernel diagnosed as Cube-underfilled).
+
+Why `mixed` gets no early stop: its cost is a *composition* — cross-core handshakes,
+seam sync, and overlap between two engines that a single-engine roofline does not model.
+An engine can sit at its roofline while the composition wastes most of the wall clock.
+
+**Why this rule exists.** Two regenerations of the same case differed by **1.16x vs
+1.52x against the vendor** with *identical* correctness, purely because one run spent an
+optimization pass on tile geometry and the other declared it out of scope. Run-to-run
+variance in optimization effort was larger than every rule change between the two plugin
+versions. An unoptimized kernel is not a result.
+
+**Required in the report (Phase 8):**
+1. **A trajectory table** — one row per attempt: `#`, hypothesis, what changed, measured
+   ratio (+95% CI), kept or reverted, and *why*.
+2. **A trajectory graph** — attempt number on x, ratio-vs-vendor on y (lower better),
+   with the vendor at 1.0 drawn as a reference line, kept and reverted points visually
+   distinct. `matplotlib`, saved under `reports/`.
+3. **The stop reason**, explicitly: budget exhausted, or which hardware-limit gate fired
+   with its number.
+4. If fewer than 10 attempts were made on a single-engine stage, the gate evidence.
+   If fewer than 10 on a `mixed` stage, that is a **process failure** — say so plainly
+   in the report rather than presenting the result as complete.
+
+Attempts must be measured under the same protocol throughout the campaign (see §2), and
+correctness must be re-verified on the kept kernel — a faster wrong kernel scores zero.
 
 ## 4. Bottleneck taxonomy -> lever (the decision tree)
 Classify the dominant part, then apply the matching lever:

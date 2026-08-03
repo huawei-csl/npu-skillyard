@@ -500,6 +500,33 @@ When the gate passes, benchmark **each** stage on real NPU (not the simulator):
    `pto-kernel-optimizer` BEFORE Phase 7 -- the gap lives in the per-stage kernels, not in
    the composition.
 
+### Phase 6.5: Optimization campaign -- MANDATORY, 10 attempts (not optional)
+
+Every stage gets an optimization campaign via `pto-kernel-optimizer`. A stage that merely
+validates is NOT finished. See `pto-kernel-optimizer` SKILL.md §3.5 for the full rule; the
+binding parts:
+
+- **10 measured attempts** per stage. An attempt is a change WITH a paired re-measurement.
+  Reverted regressions count and must still be reported -- they are often the most
+  informative rows.
+- **`mixed` stages (Cube+Vec, cross-core, composed/fused): all 10, always**, even when
+  expensive. No early stop. Their cost is a composition, and a single-engine roofline does
+  not model the seam -- an engine can sit at its roofline while the composition wastes the
+  wall clock.
+- **`vec_only` / `cube_only`: may stop early ONLY at a measured hardware limit** -- within
+  ~10% of the measured streaming ceiling or the measured roofline at that shape, or a
+  noop-one-resource probe showing the remainder is the other resource's irreducible floor.
+  Record which gate fired **and its number**. "Looks memory-bound" is not a gate; a
+  roofline percentage alone is not a gate.
+- Fewer than 10 on a `mixed` stage is a **process failure** -- report it as such rather
+  than presenting the run as complete.
+
+Rationale, measured: two regenerations of one case landed at **1.16x vs 1.52x** against
+the vendor with identical correctness, differing only in whether an optimization pass was
+spent. Run-to-run variance in optimization effort exceeded every rule change between the
+two plugin versions. Record the campaign in `reports/optimization_<stage>.json` so Phase 8
+can plot it.
+
 ### Phase 7: Composition (after Phase 6) -- Compose the chain (default) + optional compute-fusion
 
 The pipeline ALWAYS ships ONE integrated deliverable, not just loose per-stage kernels.
@@ -676,9 +703,19 @@ modify kernels, re-validate, or re-benchmark here.
    fused-vs-chain speedup (from the fusion result, if fusion ran); per-stage accuracy
    (rel-err vs tolerance, from each stage's `accuracy`, NOT benchmarks.json). Label axes +
    units; plot only what the data supports.
+   **Plus, per stage, the OPTIMIZATION TRAJECTORY graph** (from
+   `reports/optimization_<stage>.json`, Phase 6.5): attempt number on x, ratio-vs-vendor on
+   y (lower is better), a horizontal reference line at 1.0 = vendor parity, and kept vs
+   reverted attempts visually distinct (e.g. filled vs hollow markers). This is how a
+   reader sees HOW the kernel was optimized, not just where it landed.
 3. **`reports/report.md`** -- the `shape_contract`, a per-stage table (result | rel-err vs
    tol | headroom% | repair_attempts | last_error), a benchmark table, the embedded graphs,
-   fusion classification + speedups, optimization outcomes.
+   fusion classification + speedups, and the **optimization campaign per stage**: the
+   trajectory table (attempt # | hypothesis | what changed | measured ratio + 95% CI | kept
+   or reverted | why), the trajectory graph, the attempt count, and the STOP REASON --
+   budget exhausted, or which hardware-limit gate fired with its number. A `mixed` stage
+   with fewer than 10 attempts must be flagged as a process failure, not presented as
+   complete.
 4. **`<output_dir>/README.md`** -- the top-level narrative a human reads first: what the run
    ACHIEVED, the BLOCKERS and what was TRIED (per failed stage: repair_attempts +
    last_error; locked-dim contract amendments; sim advisory-mismatches; optimizer

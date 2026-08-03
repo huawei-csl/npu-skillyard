@@ -857,6 +857,40 @@ wrong** — `auto` is fine, and inlining is an unnecessary readability cost that
 also makes a computed id impossible. The offending form was `const event_t`.
 If you hit this error, delete the `const`; do not un-name the variable.
 
+**C33. A BOXED tile's valid extent is honoured only within its LAST 16-row fractal.**
+For `Mat` / `Left` / `Right` / `Acc` tiles, declaring `Rows` larger than the rows you
+actually use and passing a smaller runtime valid extent produces **silently wrong
+numbers** — no fault, no compile error, no out-of-bounds write.
+
+The condition is exact and predictive:
+
+> a boxed tile with declared `Rows` and valid extent `V` is correct **iff
+> `ceil(V/16) == ceil(Rows/16)`**.
+
+Probed on A2/dav-c220 (`isa_probes/probe_boxvalid.cpp`), `C = A[0:V] @ B`, sweeping
+**every** `V` in `1..Rows` at five declared sizes:
+
+| declared `Rows` | `V` that are CORRECT | everything else |
+|---|---|---|
+| 16 | 1-16 | — |
+| 32 | 17-32 | wrong |
+| 64 | 49-64 | wrong |
+| 96 | 81-96 | wrong |
+| 128 | 113-128 | wrong (worst rel err **1.30**) |
+
+Note what this is **not**: `V = 16, 32, 64` are all *wrong* at `Rows = 128`, so it is
+not a "must be a multiple of 16" rule. Only the last fractal may be partial. Nothing
+is ever written outside the valid box, so a bounds check will not catch it.
+
+**The fix is to declare the tile at the size you use.** `Rows = 16` makes `V = 1..16`
+all correct. For a runtime row count, pick the tile shape per case (template over a
+small set of `Rows`, or tile the rows and let only the final tile be partial) rather
+than declaring one big tile and narrowing it.
+
+**COOK-§8.9's `TileAcc<float, M, N, DYNAMIC, DYNAMIC>` idiom invites the broken
+form** — it is safe only when the runtime extent lands in the last fractal. This cost
+one run 3 of its 4 repair attempts.
+
 **C22. msprof op simulator validation.**
 Kernels can be validated without NPU hardware using the Ascend simulator:
 ```bash
