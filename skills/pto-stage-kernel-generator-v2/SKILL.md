@@ -271,7 +271,36 @@ of padding to a worst case. Note `Tile::GetValue` cannot serve this: it is
 `static_assert(Loc == TileType::Vec)` (`pto_tile.hpp:1457`), so it reads UB, not
 GM, and it is unavailable on Cube.
 
-Two real requirements, neither of which is a crash:
+**A scalar `__gm__` WRITE has 32-byte cache-line granularity. Never use one to
+materialize an array whose words are spread across lanes.** This is the one
+genuinely dangerous case, and the first version of this rule missed it because
+its probe used a single lane. Measured (`isa_probes/probe_scalarscatter.cpp`,
+8192 words, lanes = 2 x block_dim since both AIV sub-blocks are workers):
+
+| store pattern | bd=1 | 2 | 4 | 8 | 16 | 24 | 48 |
+|---|---|---|---|---|---|---|---|
+| `TSTORE`, contiguous per lane | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| scalar, contiguous per lane | 0 | 0 | 0 | 0 | 0 | 0 | 312 |
+| scalar, **interleaved across lanes** | **4096** | 6132 | 7152 | 7633 | 7649 | 7662 | 7589 |
+
+Interleaved means lane `L` writes indices `i % nlanes == L`, so adjacent words
+belong to different lanes -- the shape a permutation or scatter has. At
+`block_dim=1` that is **exactly half the array lost**, and `block_dim=1` is a
+SINGLE core: the two AIV sub-blocks alone are enough to destroy it. A scalar store
+commits a whole 32-byte line, so when two lanes hold different words of one line,
+one lane's words are overwritten. No fault, no partial write -- just missing data.
+
+So:
+* **Reading a runtime scalar: fine, use it.**
+* **Writing a single scalar or a contiguous run owned by one lane: fine** (clean to
+  48 lanes; 96 lanes showed losses even contiguous, so do not oversubscribe).
+* **Writing an array whose words interleave across lanes: NEVER.** Use `TSTORE`,
+  which is exact at every lane count tested. If the natural formulation scatters,
+  restructure so each worker owns a contiguous run and stores it with MTE. This is
+  the same failure mode as the known `MSCATTER<Elem>` defect, so it is not
+  `MSCATTER`-specific -- it is the scalar store path itself.
+
+Two further requirements, neither of which is a crash:
 * Declare the pointer `volatile __gm__ T *`. Without it the compiler may hoist
   the load out of a spin loop.
 * For a value another agent may have written (another core, the host, a DMA),

@@ -39,6 +39,14 @@ TLOAD/TSTORE. Do **not** flag a scalar read of a *runtime scalar* (a group
 boundary, a token count, a dynamic tile schedule) — that is legal, probed, and is
 the only way to build a runtime-determined schedule. → SKILL C1, COOK-§11.5
 
+**DO flag, as a correctness bug and not a style nit: a scalar `__gm__` WRITE
+whose indices interleave across lanes** (`p[i] = v` where consecutive `i` belong
+to different workers — any scatter, permute or histogram written that way). A
+scalar store commits a whole 32-byte line, so lanes sharing a line overwrite each
+other: measured **half the array lost at `block_dim=1`**, i.e. from the two AIV
+sub-blocks of a single core alone. It fails silently. Require the worker to own a
+contiguous run and store it with `TSTORE`. → SKILL C1
+
 **R-C2. Include/namespace repair.** Remove any indirection guard macros.
 Ensure `#include <pto/pto-inst.hpp>` and `using namespace pto;` are both
 under `#if defined(__CCE_AICORE__)`. Ensure the `AICORE` fallback is defined. → SKILL C2
