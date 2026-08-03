@@ -139,7 +139,9 @@ def plot(doc, out_png):
     # Always show all 10 slots: an early stop should be VISIBLE as unused budget.
     ax.set_xlim(0.4, BUDGET + 0.6)
     ax.set_xticks(range(1, BUDGET + 1))
-    used = len(att) + len(unmeasured)
+    # Diagnostics are measurements, not budget-consuming attempts -- counting them
+    # printed "11/10" on a run that had made exactly 10 real attempts plus a probe.
+    used = sum(1 for d in diag if not d) + len(unmeasured)
     if used < BUDGET:
         ax.axvspan(used + 0.5, BUDGET + 0.6, color="#bbb", alpha=.14, zorder=0)
         ax.annotate("budget not used (%d of %d)" % (used, BUDGET),
