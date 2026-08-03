@@ -1635,6 +1635,16 @@ After completing the pre-generation checklist:
 8. **Validate against MCP** (mandatory):
    - For each PTO instruction you plan to use, call `get_cpp_intrinsic(instruction_name)` to verify its C++ signature and parameter types
    - For dtype/shape/backend constraints, call `get_constraints(instruction_name)` to verify legal combinations
+   - **An EMPTY constraints list means NOT DOCUMENTED, never "unconstrained".** The
+     response carries `documented: true|false` — read it. When `false`, the real
+     constraints may still live in the prose of `get_instruction()`, in
+     `get_cpp_intrinsic()`, or as `static_assert` checks in the pto-isa headers,
+     which are the authority. Treat it as an evidence gap and expect the compiler to
+     find what the tool did not.
+     (Historical note: before the MCP fix pinned in `.mcp.json`, this list was empty
+     for 98 of 161 instructions including `TEXTRACT`, `TMOV` and `TCVT` — four
+     generation runs read that as "unconstrained" and two lost repair attempts to it.
+     It is now 5 of 161, but the rule above still holds for those five.)
    - If MCP returns no result or an error, fall back to cookbook patterns (COOK-§) and record the uncertainty as an evidence gap in the banner
    - Cross-check the chosen structure against cookbook pattern families
    - Never invent PTO instruction names — if MCP says an instruction doesn't exist, it doesn't exist
