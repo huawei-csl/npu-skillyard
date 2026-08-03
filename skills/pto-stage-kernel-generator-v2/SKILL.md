@@ -139,8 +139,11 @@ a cookbook section or platform model section for details.
      If Cube path: allocate addresses for L1 Mat staging tiles and L0 tiles (C26).
 10. □ Plan data path to TMATMUL — GM -> L1 Mat (TLOAD) -> TEXTRACT -> L0 Left/Right -> TMATMUL (C26).
       Never use TMOV from Vec to Left/Right. Pad M to 16 if needed for TEXTRACT alignment.
-11. □ Plan Vec pipeline data flow — after every TLOAD, push data to pipeline with TMULS(x, x, 1.0f)
-      before any Vec op (TMUL, TADD, TEXP, etc.) reads it (C27).
+11. □ Plan Vec pipeline data flow — after every TLOAD, `set_flag`/`wait_flag`
+      `MTE2 -> V` before any Vec op reads the tile (C27). Do NOT add a
+      `TMULS(x, x, 1.0f)` "push": it is unnecessary when the handshake is present,
+      and when the handshake is MISSING it makes the kernel wrong on every run
+      instead of some. Probed, see C27.
 12. □ Generate kernel — follow the structure below
 ```
 
@@ -1039,26 +1042,48 @@ pipe_barrier(PIPE_CUBE);
 fp32 inputs are NEVER a valid reason to skip TMATMUL or fall back to scalar loops.
 → PLAT-§Cube, COOK-§8.5, §8.7
 
-**C27. TMUL reads BOTH sources from the pipeline — push TLOAD'd data first.**
-`TMUL` (elementwise multiply) reads both source operands from the Vec pipeline,
-NOT the tile buffer. `TLOAD` writes to the buffer only. `TMULS` (scalar multiply)
-reads from the buffer and writes to the pipeline. Therefore:
+**C27 (CORRECTED). After a `TLOAD`, SYNC `MTE2 -> V` before any Vec op reads the
+tile. Do NOT "push" with `TMULS(x, x, 1.0f)` — that was a misdiagnosis.**
 
 ```cpp
-// WRONG: TLOAD→TMUL — k_tile in buffer, TMUL reads pipeline garbage
-TLOAD(k_tile, ...); TEXP(gate_tile, gate_tile);
-TMUL(k_tile, k_tile, gate_tile);  // FAILS!
-
-// CORRECT: push k_tile to pipeline with TMULS(*1.0) before TMUL
+// CORRECT, and sufficient:
 TLOAD(k_tile, ...);
-TMULS(k_tile, k_tile, 1.0f); pipe_barrier(PIPE_V);  // push buffer→pipeline
-TEXP(gate_tile, gate_tile); pipe_barrier(PIPE_V);    // TEXP: pipeline→pipeline
-TMUL(k_tile, k_tile, gate_tile);  // OK: both in pipeline
+TLOAD(gate_tile, ...);
+set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);      // <-- THIS is the requirement
+wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+TEXP(gate_tile, gate_tile);
+pipe_barrier(PIPE_V);
+TMUL(k_tile, k_tile, gate_tile);             // no push needed
 ```
 
-This applies to ALL Vec ops that read from the pipeline: `TEXP`, `TADD`, `TSUB`,
-`TMUL`, `TSEL`, `TROWSUM`, `TCOLSUM`. If an operand came from `TLOAD`, push it
-with `TMULS(x, x, 1.0f)` first. → PLAT-§Pipeline
+This rule previously claimed `TMUL`/`TADD`/`TEXP`/`TSEL`/`TROWSUM`/`TCOLSUM` read
+their sources from the Vec *pipeline* while `TLOAD` writes only the *buffer*, and
+mandated a `TMULS(x, x, 1.0f)` push on every `TLOAD`ed operand. **Probed and
+falsified** (`isa_probes/probe_c27.cpp`, 20 repeats per cell, exact CPU reference):
+
+| configuration | WITH the push | WITHOUT the push |
+|---|---|---|
+| `TLOAD` -> op, proper MTE2->V sync (`TMAX/TADD/TMUL/TSUB/TMIN`) | 20/20 exact | **20/20 exact** |
+| C27's own shape: `TLOAD a,b` -> `TEXP(b)` -> `op(a,b)`, with sync | 20/20 exact | **20/20 exact** |
+| same shape, **MTE2->V sync REMOVED** | **WRONG 20/20** | WRONG 4/20 |
+
+Two things follow, and the second is why this matters:
+
+1. **The push is pure overhead when the sync is present.** A flash_attention run
+   measured removing it as bit-identical and 1.011x faster; that reproduces here as
+   exactness at every op tested.
+2. **The push does not substitute for the sync — it makes the failure WORSE.**
+   Without the handshake the pushed form is wrong on *every* run while the unpushed
+   form is wrong on 4 of 20. `TMULS` reads the tile before MTE2 has landed it and
+   commits that garbage into the pipeline deterministically; without it the binary
+   op sometimes wins the race. So a generator that dutifully adds the push and omits
+   the handshake gets a kernel that is *always* wrong, produced by following the
+   rule.
+
+The original observation was real — a Vec op reading a `TLOAD`ed tile did return
+garbage — but the cause was the missing `MTE2 -> V` handshake, and `TMULS` +
+`pipe_barrier` merely perturbed the timing enough to hide it sometimes.
+→ PLAT-§Pipeline
 
 **C27-escape: `TAXPY` reads BOTH operands from the BUFFER.** `TAXPY(dst, src, a)`
 computes `dst += a * src` reading `dst` and `src` from the tile buffer, so it does

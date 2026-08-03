@@ -1565,7 +1565,10 @@ Vec result to GM via a `TSTORE`->`TLOAD` round-trip and (b) inserts `TMULS(x,x,1
 "push-to-pipeline" no-ops between DEPENDENT Vec ops -- believing both are needed for
 buffer-stability/correctness (a C19/C31 cargo-cult). For a Vec->Vec dependency neither is
 needed: a single `pipe_barrier(PIPE_V)` between the producer and consumer is sufficient and
-gives BIT-IDENTICAL output. The GM round-trip is pure per-item slope. Reserve GM commits /
+gives BIT-IDENTICAL output. **Now confirmed by direct probe and generalized: the
+`TMULS(x,x,1.0f)` push is unnecessary after a `TLOAD` too, provided the `MTE2 -> V`
+handshake is present -- and if that handshake is MISSING the push makes the kernel
+wrong on every run rather than some. See the corrected C27.** The GM round-trip is pure per-item slope. Reserve GM commits /
 explicit flags for GENUINE CROSS-ENGINE boundaries only (Vec<->Cube via PIPE_FIX/PIPE_MTE3,
 or Vec<->MTE). Second lever: HOIST any item-INDEPENDENT tensor (a strict-lower/causal mask,
 a constant) OUT of the work-item loop and keep it UB-resident -- rebuilding a 0/1 `TTRI` mask
