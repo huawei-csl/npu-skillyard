@@ -174,7 +174,20 @@ the Vec loads cost 32.2%, in a kernel diagnosed as Cube-underfilled).
   rate whenever the schedule re-reads anything (that same stage issued **1.50x** its
   essential weight). Compute both; the gate uses issued bytes.
 
-When this gate fires on an out-of-L2 stream, **try the uncached address alias FIRST**
+**Check the barrier scope before anything else on a Vec-heavy stage.** `pipe_barrier(PIPE_ALL)`
+drains every pipe and destroys the overlap you are trying to create. A census of the shipped
+vendor kernels finds it in **0.3%** of files (19 of ~5900) against 1198 using scoped
+`PipeBarrier<pipe>` — while **95% of our generated kernels use it** (105 of 111, 417
+occurrences). `pipe_barrier` accepts any `pipe_t`, so the scoped form was always available.
+See `references/vendor_idiom_census.md`.
+
+This is an unmeasured hypothesis, and a delicate one: barrier *removal* has already failed
+validation once (`dequant_swiglu_requant` attempt 1) and a per-item `PIPE_ALL` was silently
+protecting output tiles against a WAR hazard (`deep_norm_backward` D6). The work is to
+**replace each barrier with the correctly scoped flag class and re-validate**, never to
+delete barriers and hope.
+
+When the bandwidth gate fires on an out-of-L2 stream, **try the uncached address alias FIRST**
 (`PLAT-§L2Bypass`): a streamed operand read once and never reused should be loaded through
 `ptr + rtGetL2CacheOffset()`, which measured **1.67x** (915 -> 1527 GB/s) on an identical
 kernel binary and is bit-exact. Wider bursts, deeper rings, more cores and an NZ ABI are
