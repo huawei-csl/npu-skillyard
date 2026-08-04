@@ -304,7 +304,16 @@ Key points:
 - `set_flag(PIPE_MTE2, PIPE_V, ...)` then `wait_flag(...)`: ensures DMA complete
   before Vec reads the loaded data
 - The braces `{...}` scope the gm view objects so their destructors run cleanly
-- Always use `EVENT_ID0` as the default event index unless double-buffering
+- **`EVENT_ID0` is safe HERE and only here: an ADJACENT set/wait pair.** The pattern
+  above sets and waits on consecutive lines with no PTO call in between, so the token
+  is consumed before anything can clobber it.
+  **It is NOT safe for a token that must SURVIVE a PTO call.** `EVENT_ID0` is the
+  library's internal scratch id -- used inside `TROWSUM`, `TROWMAX`, `TROWMIN`,
+  `TROWEXPAND`, `TEXTRACT`, `TTRANS`, `TDEQUANT` and 7 more -- so a slot-free or
+  data-ready token parked on `EVENT_ID0` across any of them is destroyed. That is the
+  distinction COOK-§6.5 is about, and the two rules do not conflict once it is stated:
+  adjacent pair -> `EVENT_ID0` fine; held across a call (any pipeline, ring or
+  double-buffer) -> ids start at 1, `eid = 1 + slot + (vid ? 4 : 0)`.
 
 ---
 
@@ -588,18 +597,22 @@ constexpr unsigned X_PONG = 0x08100;
 constexpr unsigned CAL_PING = 0x10000;
 constexpr unsigned CAL_PONG = 0x18100;
 
-set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+// Ids 3/4, NOT 0/1. These tokens are HELD ACROSS the loop body, so they must avoid
+// every id the library touches: EVENT_ID0 is its internal scratch (14 core
+// instructions), and ID1/ID2 are used by the comm/ collectives. ID3-ID6 are unused
+// on device. Costs nothing and removes a whole class of "mysterious hang".
+set_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
+set_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
+set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+set_flag(PIPE_MTE3, PIPE_V, EVENT_ID4);
 
 for (uint32_t processed = 0, ping = 1; processed < elements_to_process;
      processed += tile_cols) {
   const int8_t buf = ping ? 0 : 1;
   // NOT `const event_t` -- the CCE builtin check rejects a cv-qualified event_t
   // with "the 3rd parameter must be a type 'event_t'". See C1x.
-  event_t ev = ping ? static_cast<event_t>(EVENT_ID0)
-                    : static_cast<event_t>(EVENT_ID1);
+  event_t ev = ping ? static_cast<event_t>(EVENT_ID3)
+                    : static_cast<event_t>(EVENT_ID4);
 
   TileData xTile(1, tile_cols);
   TileData calTile(1, tile_cols);
@@ -720,6 +733,23 @@ standalone probe at depths 2/3/4, 2-4096 iterations, block_dim 1-48, one and two
 1-16 KB tiles, and 600 launches across 30 processes per form: zero hangs, bit-identical output. The
 vendor's own `pto-isa/demos/torch_jit/add/add_custom.cpp` ships the same separated form.
 
+> **OPEN, reported but not yet root-caused (2026-08-04).** A `deep_norm_backward` run
+> reported two deadlocks against this paragraph: (a) a collapsed counting-id prefetch
+> ring safe at depth 2 that hung at depth 3, reproduced on two kernels, and (b) a hang
+> on `wait_flag(PIPE_V, PIPE_MTE2, id)` specifically.
+>
+> The pipe pair itself is NOT the problem -- the library uses it, e.g.
+> `pto/comm/a2a3/TReduce.hpp:79` does `set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0)`. The
+> leading hypothesis is **id contention rather than pipe-pair support**: the example
+> above previously bootstrapped its held tokens on `EVENT_ID0`/`ID1`, the two most
+> contended ids, and a deeper ring consumes more ids and so collides more readily.
+> That is why the ids were moved to 3/4.
+>
+> Not yet probed, because a probe whose failure mode is a DEADLOCK wedges the device
+> for ~30 minutes and only `npu0` is currently usable (see `isa_probes/README.md`).
+> Treat the "zero hangs at depths 2/3/4" verification above as conditional on ids that
+> avoid the library's, until this is settled on a dedicated device.
+
 **The single failure mode is an unbalanced set/wait count on a `(srcPipe, dstPipe, event_id)`
 triple.** Every `wait_flag` that executes must have a `set_flag` that executed before it -- from the
 bootstrap, a prior iteration, or the same iteration. Deadlock is what an unbalanced count looks
@@ -796,7 +826,15 @@ for (int i = 0; i < validRow; i++) {
 ```
 
 **So any outstanding user token on `EVENT_ID0` is destroyed the moment you call one
-of these.** A slot-free token you set before a `TROWSUM` and wait on after it is
+of these.**
+
+**This does NOT ban `EVENT_ID0` outright, and COOK-§1.65 is not in conflict.** The
+distinction is whether the token has to SURVIVE a call:
+
+| shape | `EVENT_ID0`? |
+|---|---|
+| adjacent `set_flag` / `wait_flag` with no PTO call between them | **fine** -- consumed immediately (COOK-§1.65, EX-§2) |
+| a token held across ANY PTO call -- ring slot, double-buffer, prefetch, cross-stage | **never** -- start ids at 1 | A slot-free token you set before a `TROWSUM` and wait on after it is
 simply gone -- the `wait_flag` is satisfied by the library's token, the ring
 advances early, and you get corruption or a hang depending on timing.
 
@@ -1655,7 +1693,23 @@ needed: a single `pipe_barrier(PIPE_V)` between the producer and consumer is suf
 gives BIT-IDENTICAL output. **Now confirmed by direct probe and generalized: the
 `TMULS(x,x,1.0f)` push is unnecessary after a `TLOAD` too, provided the `MTE2 -> V`
 handshake is present -- and if that handshake is MISSING the push makes the kernel
-wrong on every run rather than some. See the corrected C27.** The GM round-trip is pure per-item slope. Reserve GM commits /
+wrong on every run rather than some. See the corrected C27.**
+
+**BUT there is one barrier you must NOT remove, and removing it is invisible at the
+shape most kernels are validated on.** The end-of-item `pipe_barrier(PIPE_ALL)` is
+NOT cargo-cult: it retires an **output WAR** as well as the input one -- the next
+item's Vec writes land on the output tiles while the previous item's MTE3 stores are
+still reading them. With **one item per lane there is no next item**, so the kernel is
+correct at `items_per_lane <= 1` and silently wrong from 2 upward. A stage validated
+only at its production shape can therefore pass while carrying the bug.
+
+If you remove it, replace it -- do not just delete it. Carry an explicit
+`MTE3 -> V` token on the output tiles (COOK-§6.7 has the complete loop and the
+two-hazard table), and validate at `items_per_lane >= 3` per artifact rule 31, which
+exists for exactly this failure mode: three, not two, so the ring must WRAP and
+re-enter steady state rather than just run prologue-then-epilogue.
+
+The GM round-trip is pure per-item slope. Reserve GM commits /
 explicit flags for GENUINE CROSS-ENGINE boundaries only (Vec<->Cube via PIPE_FIX/PIPE_MTE3,
 or Vec<->MTE). Second lever: HOIST any item-INDEPENDENT tensor (a strict-lower/causal mask,
 a constant) OUT of the work-item loop and keep it UB-resident -- rebuilding a 0/1 `TTRI` mask
