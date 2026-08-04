@@ -171,6 +171,28 @@ optimization pass on tile geometry and the other declared it out of scope. Run-t
 variance in optimization effort was larger than every rule change between the two plugin
 versions. An unoptimized kernel is not a result.
 
+**RE-VALIDATE EVERY ATTEMPT ON THE DEGENERATE CASES, NOT THE PRODUCTION SHAPE.**
+This is the most dangerous hole in a measure-decide-attack loop and it has now been
+demonstrated. In one campaign, two attempts passed **15 consecutive paired
+measurements** while being non-deterministically wrong, and a third measured as **the
+fastest point of the entire campaign** while being wrong on 110,066 elements. A paired
+A/B re-measurement checks SPEED; it does not check correctness, and the production
+shape is usually the *least* discriminating one -- it is the shape with no ragged
+tail, no empty group, no partial tile.
+
+So after every attempt, before recording a ratio:
+* re-run the FULL validation sweep, including the degenerate cases (empty group, zero
+  rows, unaligned boundary, single-element tail, `items_per_lane >= 3`), not just the
+  contract point;
+* re-run the determinism check -- a race can pass one validation and fail the next,
+  so a single clean run is not evidence;
+* if it fails, mark the attempt `"correct": false` and keep it in the JSON. Do NOT
+  drop it: a fast wrong attempt is exactly what the trajectory graph must show, and
+  the plotter draws it as a red cross excluded from the best-kept line.
+
+An attempt whose correctness was not re-checked has no ratio. Record it as
+`"ratio": null` rather than reporting a number you cannot stand behind.
+
 **Record every attempt as you go, in `reports/optimization_<stage>.json`:**
 
 ```json

@@ -370,8 +370,15 @@ Before returning the JSON output, verify:
        with `torch.zeros` vs 1.179 with `torch.empty` on the same kernel. Use
        `torch.empty` per call. Do NOT preallocate once outside the window either: that
        skips an allocation the vendor pays for and biases the other way.
-    d. **Randomize the issue order per repetition.** A fixed "ours then vendor" order
-       carries a ~0.9% slot bias -- large enough to have flipped an optimizer decision.
+    d. **Randomize the issue order per repetition, and make it BALANCED.** A fixed
+       "ours then vendor" order carries a ~0.9% slot bias -- large enough to have
+       flipped an optimizer decision. But a free coin flip is not enough either: an
+       unbalanced draw leaves a residual positional bias, and one run's null control
+       came out 1.0016 CI [1.0007, 1.0027] -- **excluding 1.0 on slot bias alone**,
+       which voids every ratio from that harness by (e). Use a balanced permutation:
+       exactly half the repetitions "ours first", half "vendor first", shuffled --
+       e.g. `order = rng.permutation([True]*(n//2) + [False]*(n - n//2))`. Costs
+       nothing and removes the failure mode rather than relying on it averaging out.
     e. **Run a NULL CONTROL.** Time one callable against ITSELF through the identical
        harness. If its confidence interval excludes 1.0, the harness is broken and every
        ratio from it is void. Report the null control alongside the ratio, always.
