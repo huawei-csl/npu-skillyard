@@ -603,6 +603,45 @@ opposite; see PLAT-§UB for the hardware probe and its positive control.
 
 ---
 
+## PLAT-§Arity: Tile constructor arity == number of DYNAMIC extents
+
+Verified in `pto_tile.hpp`; the overloads are SFINAE-gated, so a wrong count produces a
+confusing template error rather than a clear one:
+
+```cpp
+Tile()                                                  // no DYNAMIC extent
+Tile(VR, VC)   if RowValid == DYNAMIC && ColValid == DYNAMIC   // BOTH -> 2 args
+Tile(VR)       if RowValid == DYNAMIC && ColValid  >  0        // row only -> 1 arg
+Tile(VC)       if RowValid  >  0      && ColValid == DYNAMIC   // col only -> 1 arg
+```
+
+**Pass exactly as many runtime extents as you declared `DYNAMIC`.** `COOK-§1.65`'s example
+declares both (`..., DYNAMIC, DYNAMIC, ...`) and correctly passes two — it was reported as a
+compile error by a pipeline run and re-checked against the source: **the example is right**,
+the failure mode is declaring one `DYNAMIC` and passing two (or vice versa).
+
+---
+
+## PLAT-§A2Gaps: instructions the MCP documents that A2/A3 cannot run
+
+The MCP serves the PTO-ISA docs, which cover **all** backends. `documented: true` does not
+mean "available on your target". Verified against the pinned pto-isa tree:
+
+| instruction | reality on A2/A3 (`dav-c220`) |
+|---|---|
+| `TDEINTERLEAVE` | **Not implemented at all** — zero occurrences anywhere in `pto-isa/include/`. The MCP returns a constraints block tagged `backend: "a5"` only. A generator that reads `documented: true` and emits it gets a compile failure. |
+| `TAND` / `TANDS` | **16-bit and 8-bit only.** `a2a3/TAnd.hpp` carries `static_assert((sizeof(T) == 2) \|\| (sizeof(T) == 1), "Fix: TAND has invalid data type.")`, so `uint32_t` masking is rejected. The MCP page has no A2A3 constraint block. Use `TSHRS` + `TSHLS` to build the mask instead. |
+
+**Rule: before emitting any instruction, check that the constraints block you got back is
+tagged for YOUR backend.** An `a5`-only block is an evidence gap, not a green light.
+
+**Worked substitution (kv_rmsnorm_rope_cache).** With `TDEINTERLEAVE` unavailable, a RoPE
+pair-deinterleave over bf16 was done by viewing 64 `bfloat16` as 32 `uint32` and computing
+`even = bitcast(w << 16)`, `odd = bitcast((w >> 16) << 16)` — an **exact** bf16->fp32
+widening *and* the deinterleave in three integer vector ops, replacing `TCVT` entirely.
+
+---
+
 ## PLAT-§Instructions: PTO Instruction Quick Reference
 
 | Category | Instructions | Memory | Core |

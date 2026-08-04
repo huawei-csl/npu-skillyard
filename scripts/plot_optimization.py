@@ -60,8 +60,47 @@ KEPT_C, DROP_C, LINE_C = "#2f5d3a", "#a33", "#4a6fa5"
 BAD_C, DIAG_C = "#c1121f", "#888"
 
 
+def _scalarize(v, what, n):
+    """Accept a per-sweep-point {size: ratio} mapping as well as a scalar.
+
+    A campaign that benchmarks several sizes naturally records `ratio` (and `ci`)
+    per size. Crashing on that shape cost a pipeline run its trajectory plot, so
+    collapse to the PRODUCTION point -- the largest numeric key, which is the size
+    the contract's coverage gate cares about -- and say so rather than silently
+    picking one.
+    """
+    if v is None or isinstance(v, (int, float)):
+        return v
+    if isinstance(v, dict):
+        if not v:
+            return None
+        try:
+            key = max(v, key=lambda k: float(k))
+        except (TypeError, ValueError):
+            key = sorted(v)[-1]
+        print("  attempt %s: %s is per-size; plotting the production point (%s)"
+              % (n, what, key), file=sys.stderr)
+        return _scalarize(v[key], what, n)
+    if isinstance(v, (list, tuple)) and what == "ratio":
+        return _scalarize(v[-1], what, n) if v else None
+    return v
+
+
 def plot(doc, out_png):
     att = sorted(doc.get("attempts", []), key=lambda a: a["n"])
+    # Normalise BEFORE any arithmetic: `ratio` and `ci` may arrive per sweep point.
+    for a in att:
+        a["ratio"] = _scalarize(a.get("ratio"), "ratio", a.get("n"))
+        ci = a.get("ci")
+        if isinstance(ci, dict):
+            ci = _scalarize(ci, "ci", a.get("n"))
+        if isinstance(ci, (list, tuple)) and len(ci) == 2 and \
+                all(isinstance(x, (int, float)) for x in ci):
+            a["ci"] = list(ci)
+        elif ci is not None:
+            a["ci"] = None          # unusable shape -> draw the point without a bar
+    if isinstance(doc.get("baseline_ratio"), dict):
+        doc["baseline_ratio"] = _scalarize(doc["baseline_ratio"], "baseline_ratio", 0)
     # An attempt with no ratio is legitimate and must NOT crash the plot: a change
     # that failed to COMPILE, or whose validation aborted, never produced a number.
     # It is still an attempt and still consumed budget, so it is kept in the count
