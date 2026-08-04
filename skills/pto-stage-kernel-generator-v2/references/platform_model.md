@@ -244,6 +244,60 @@ L0C budget guard:
 | L1 → L0A/L0B | per-element | `ceil(bytes / 32)` |
 | L0C → GM | burst | `ceil(bytes / 32)` |
 
+These are per-cycle *issue* rates. They do NOT bound a kernel that streams a working set
+larger than L2 -- for that, see the measured aggregate ceiling below.
+
+### PLAT-§ReadCeiling: the aggregate GM read ceiling (A2, measured)
+
+**A PTO `TLOAD` extracts ~920 GB/s from HBM-resident bytes, and nothing you can write in
+PTO changes that.** Measured on 910B2 by streaming 469.8 MB of int8 through pure load-only
+kernels (`grouped_matmul_swiglu_quant_v0170/reports/bandwidth_shortfall.md`):
+
+| variable swept | result |
+|---|---|
+| ND→NZ conversion vs plain ND→ND copy | 856 → 899 GB/s (+5%) |
+| contiguity, burst length (512 B … 4096 B) | flat, 880-899 |
+| ring depth 2/3, and **no handshake at all** | flat, 916-919 |
+| descriptor size 8 / 16 / 32 / 64 KB | flat, 897-919 |
+| `block_dim` 24 / 32 / 40 / 48 | flat, 857-916 |
+| interleaved vs contiguous per-lane partition | flat, 913-919 |
+| GM→L1 (24 AIC) vs GM→UB (48 AIV) | 899 vs 919 |
+| **both engine classes reading concurrently** | **911 -- bandwidth does NOT add** |
+
+The ceiling is HBM-side, not an MTE2 or descriptor limit. The identical load path run over a
+smaller footprint goes far faster:
+
+| footprint | 8 MB | 32 MB | 128 MB | 470 MB |
+|---|---|---|---|---|
+| GB/s | 4600 | 3393 | 1659 | **919** |
+
+**Two consequences for optimization.**
+
+1. **Know when to stop.** If a stage is streaming an out-of-L2 working set and measures
+   ~900 GB/s, it is *at the PTO ceiling*. Further load tuning (wider bursts, deeper rings,
+   more cores, NZ pre-layout, contiguous ABI) is measurably worthless -- all of it was swept
+   and is flat. Record a hardware-limit gate and spend the remaining attempts elsewhere.
+2. **The only lever that works is shrinking the footprint.** The curve above is the whole
+   optimization space: block the algorithm so the hot working set fits L2 and the same code
+   goes 1.8-5x faster. Re-reading bytes that stay in L2 is nearly free -- a schedule that
+   issued 1.94x the essential weight bytes cost only 9.5% more wall-clock.
+
+**Reporting rule.** If the schedule issues more bytes than are essential (e.g. one weight
+re-read per row-pass), GB/s computed on *essential* bytes understates the achieved rate.
+Report both, or the kernel looks slower than it is and you will chase a phantom.
+
+**Calibration.** On the same device: `zero_` writes at 1456 GB/s; torch's own `w.max()`
+*reads* at 862 GB/s (i.e. a generic vendor-library read is stuck near our ceiling too); a
+hand-written vendor fused operator streams at **1493 GB/s marginal**. So ~920 GB/s is a
+property of the PTO load path against HBM, not of the silicon. A vendor kernel beating a
+generated one by up to ~1.6x on a pure streaming stage is expected today and is not a
+kernel-quality defect -- say so in the report rather than recording it as unexplained.
+
+**Untested lead (do NOT state as fact).** Every GM→L1/GM→UB load in
+`pto/npu/a2a3/TLoad.hpp` hardcodes the DMA `sid` argument to `0`, with no PTO-level
+override. Whether `sid` carries a QoS/cache hint that would change the HBM stream is
+undocumented in the MCP corpus and unprobed.
+
 ---
 
 ## PLAT-§Manual: Manual Mode Constraints (`-DMEMORY_BASE`)

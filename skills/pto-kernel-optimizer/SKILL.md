@@ -150,8 +150,9 @@ often the most informative entries; do not quietly drop them.
 
 **Early-stop gate (single-engine stages only).** You may stop before 10 *only* if you can
 show the kernel is at a **hardware limit**, with a measurement, not an argument:
-* achieved bandwidth is within ~10% of the measured streaming ceiling (A2/A3: ~811 GB/s
-  HBM; measure it, do not quote it), **or**
+* achieved bandwidth is within ~10% of the measured streaming ceiling (A2/A3: a PTO
+  `TLOAD` extracts **~920 GB/s** from an out-of-L2 working set — see
+  `PLAT-§ReadCeiling`; measure it for your shape, do not quote it), **or**
 * achieved FLOP/s is within ~10% of the engine's measured roofline at this shape, **or**
 * a noop-one-resource probe shows the remaining time IS the irreducible floor of the
   other resource.
@@ -160,6 +161,22 @@ State which gate fired and the number that fired it. **"It looks memory-bound" i
 gate. A roofline percentage on its own is not a gate** — a marginal-cost probe once
 disproved exactly that reasoning here (doubling every matmul cost 4.8%, while doubling
 the Vec loads cost 32.2%, in a kernel diagnosed as Cube-underfilled).
+
+**Two ways this gate has been got wrong. Both cost a whole campaign.**
+
+* **Do not compare against the vendor's rate.** A vendor fused operator streams at
+  ~1493 GB/s where PTO reaches ~920; the vendor's number is not a ceiling you can reach,
+  so measuring yourself against it guarantees the gate never fires. `grouped_matmul_swiglu_quant`
+  burned 13 attempts concluding "754 GB/s against a 1244 GB/s vendor rate, no gate fired"
+  when it was already at the PTO ceiling by attempt 1. Compare against the **PTO** ceiling
+  (`PLAT-§ReadCeiling`), and report the vendor gap separately as a platform fact.
+* **Divide by the bytes you actually issue.** GB/s on *essential* bytes understates the
+  rate whenever the schedule re-reads anything (that same stage issued **1.50x** its
+  essential weight). Compute both; the gate uses issued bytes.
+
+When this gate fires on an out-of-L2 stream, the only lever left is **shrinking the
+footprint** so the hot set fits L2 — not wider bursts, deeper rings, more cores, or an NZ
+ABI, all of which are measurably flat (`PLAT-§ReadCeiling`).
 
 Why `mixed` gets no early stop: its cost is a *composition* — cross-core handshakes,
 seam sync, and overlap between two engines that a single-engine roofline does not model.
@@ -286,6 +303,15 @@ Classify the dominant part, then apply the matching lever:
   bandwidth-bound on a2a3") was disproven repeatedly by a working reference — each was a
   missing technique (a FIFO-pipelined hand-off, deeper run-ahead), not silicon. Distrust your
   own hardware-wall conclusion until a reference confirms the wall.
+  **One measured exception to (b): the wall can be the tile library rather than the chip OR
+  your kernel.** A PTO `TLOAD` extracts ~920 GB/s from an out-of-L2 stream where a vendor
+  fused operator reaches ~1493 GB/s on the same bytes — and every parameter a generated
+  kernel can vary (conversion, contiguity, burst length, ring depth, descriptor size,
+  `block_dim`, address partition, using both engine classes at once) is measurably **flat**
+  (`PLAT-§ReadCeiling`). So (b) still holds — a vendor being faster does mean *someone* can
+  go faster — but it does **not** follow that a technique exists at the PTO level. Claiming
+  this exception requires the sweep, not an assertion: if you have not swept those knobs and
+  shown them flat, (b) applies and the wall is your kernel.
 - The sum of irreducible per-part floors already exceeds the target -> the gap is
   intrinsic per-part work; closing it means re-deriving the baseline's algorithms (a
   clone). Stop, document the path.
