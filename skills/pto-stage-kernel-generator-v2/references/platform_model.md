@@ -271,7 +271,21 @@ smaller footprint goes far faster:
 |---|---|---|---|---|
 | GB/s | 4600 | 3393 | 1659 | **919** |
 
-**Two consequences for optimization.**
+**When to apply the bypass alias — the decision rule is measured.** Bypass pins the read
+rate at ~1530 GB/s *regardless of footprint*; the cached path is faster than that only
+while the working set fits L2. Same code, same 469.8 MB of load traffic, varying only the
+address range touched:
+
+| streamed footprint | 8 MB | 32 MB | 128 MB | 470 MB |
+|---|---|---|---|---|
+| cached | 4618 GB/s | 3406 | 1664 | 920 |
+| L2-bypass | 1539 | 1533 | 1528 | 1530 |
+| effect | **0.33x LOSS** | 0.45x LOSS | 0.92x | **1.66x WIN** |
+
+**Use bypass only when the streamed working set exceeds L2 (~150 MB on this part). Below
+that it is a 3x pessimization** — it is not a free win to sprinkle on every load.
+
+**Two further consequences for optimization.**
 
 1. **Know when to stop.** If a stage is streaming an out-of-L2 working set and measures
    ~900 GB/s, it is *at the PTO ceiling*. Further load tuning (wider bursts, deeper rings,
@@ -375,14 +389,28 @@ load-only kernel, varying only how many times the schedule re-reads each expert'
 | 1.50x | 593.2 us | 512.5 us | 1.16x faster |
 | 1.94x | 625.2 us | **667.7 us** | **0.94x — SLOWER** |
 
-So bypass and a reuse-free schedule are **one optimization, not two**. Applying bypass to a
-redundant schedule wastes most of it, and past ~1.9x it is a pessimization.
+So a redundant schedule wastes much of the bypass gain, and **past ~1.9x redundancy bypass
+is a pessimization** — check your schedule's redundancy before enabling it.
 
-**This also inverts how you rank the redundancy fix.** Under cached loads, cutting a 1.94x
-redundant schedule to 1.00x is worth ~9.5% — correctly judged low-value and deferred. Under
-bypass the same fix is worth ~81% (667.7 -> 367.9 us). **After changing cache policy,
-re-evaluate every optimization you previously rejected as low-value**; their measured cost
-was conditional on the policy you just changed.
+**But do NOT assume the converse: "remove redundancy and the load gain follows" was tried
+and FAILED.** Those numbers are a *load-only* probe. Rebuilding the real `grouped_matmul`
+Cube kernel for one row-pass per expert (`kRT=4`, `kRPP=64`, redundancy 1.50x -> 1.00x,
+validated `max|diff|=0` on all 12 cases) bought **1.3%**, not the ~40% the probe implied:
+
+| stage-1 kernel | cached | L2-bypass |
+|---|---|---|
+| `kRT=2`, 1.50x redundant (shipped) | 611.6 us | **533.3 us** |
+| `kRT=4`, 1.00x redundant | 692.4 us | 526.5 us |
+| `kRT=4, kNSUB=2` (lower L0C pressure) | 830.0 us | 657.0 us |
+
+Load imbalance was excluded (`block_dim=16` gives `kRT=4` a perfect 8.00 items/lane and is
+*slower*, 669.0 us) and so was L0C pressure (the `kNSUB=2` row above). The schedule change
+that removes load work adds Cube-side work of its own, and it roughly cancels.
+
+**The transferable lesson is about the probe, not the schedule:** a load-only probe bounds
+the *load*, and once bypass removes the load bottleneck that bound stops predicting the
+kernel. Re-derive the floor after any change that shifts the bottleneck, and treat a
+projection from an isolated probe as a hypothesis to measure, not a result.
 
 **Plumbing.** No kernel-side PTO change is needed — it is pointer arithmetic. Query the
 offset once on the host, and either alias the pointer in the harness before the launch or
