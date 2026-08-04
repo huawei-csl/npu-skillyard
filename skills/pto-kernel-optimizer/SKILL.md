@@ -303,15 +303,16 @@ Classify the dominant part, then apply the matching lever:
   bandwidth-bound on a2a3") was disproven repeatedly by a working reference — each was a
   missing technique (a FIFO-pipelined hand-off, deeper run-ahead), not silicon. Distrust your
   own hardware-wall conclusion until a reference confirms the wall.
-  **One measured exception to (b): the wall can be the tile library rather than the chip OR
-  your kernel.** A PTO `TLOAD` extracts ~920 GB/s from an out-of-L2 stream where a vendor
-  fused operator reaches ~1493 GB/s on the same bytes — and every parameter a generated
-  kernel can vary (conversion, contiguity, burst length, ring depth, descriptor size,
-  `block_dim`, address partition, using both engine classes at once) is measurably **flat**
-  (`PLAT-§ReadCeiling`). So (b) still holds — a vendor being faster does mean *someone* can
-  go faster — but it does **not** follow that a technique exists at the PTO level. Claiming
-  this exception requires the sweep, not an assertion: if you have not swept those knobs and
-  shown them flat, (b) applies and the wall is your kernel.
+  **One measured exception to (b): the wall can be below everything you control.** A PTO
+  `TLOAD` extracts ~920 GB/s from an out-of-L2 stream where a vendor fused operator reaches
+  ~1493 GB/s on the same bytes. Every parameter a generated kernel can vary (conversion,
+  contiguity, burst length, ring depth, descriptor size, `block_dim`, address partition,
+  both engine classes at once) is measurably **flat**, and so is the raw CCE DMA intrinsic
+  called directly with `TLOAD` bypassed (`PLAT-§ReadCeiling`). So (b) still holds — a vendor
+  being faster does mean *someone* can go faster — but it does **not** follow that a
+  technique exists at the level you are writing. Claiming this exception requires the sweep,
+  not an assertion: if you have not swept those knobs and shown them flat, (b) applies and
+  the wall is your kernel.
 - The sum of irreducible per-part floors already exceeds the target -> the gap is
   intrinsic per-part work; closing it means re-deriving the baseline's algorithms (a
   clone). Stop, document the path.

@@ -293,10 +293,23 @@ property of the PTO load path against HBM, not of the silicon. A vendor kernel b
 generated one by up to ~1.6x on a pure streaming stage is expected today and is not a
 kernel-quality defect -- say so in the report rather than recording it as unexplained.
 
-**Untested lead (do NOT state as fact).** Every GM→L1/GM→UB load in
-`pto/npu/a2a3/TLoad.hpp` hardcodes the DMA `sid` argument to `0`, with no PTO-level
-override. Whether `sid` carries a QoS/cache hint that would change the HBM stream is
-undocumented in the MCP corpus and unprobed.
+**The ceiling is NOT PTO's abstraction — measured.** PTO hardcodes the DMA `sid` argument
+to `0` on every load and exposes no override, which made it the obvious suspect. It is not:
+calling `copy_gm_to_ubuf_align_b8` **directly, bypassing `TLOAD`**, with byte-identical
+parameters and only `sid` varied, gives
+
+| sid | 0 (control) | 1 | 2 | 3 | 4 | 7 | 15 |
+|---|---|---|---|---|---|---|---|
+| GB/s | 923 | 918 | 922 | 916 | 922 | 917 | 921 |
+
+The `sid=0` control reproduces `TLOAD`'s 919 GB/s, so the hand-rolled call is measuring the
+same thing. **`sid` is inert, and PTO's wrapper neither adds nor removes anything** — the
+raw hardware DMA instruction hits exactly the same wall. So do not attribute this ceiling to
+the tile library, and do not propose a PTO change to lift it.
+
+What remains unexplained is only *how the vendor exceeds it*. Untested candidates: a
+different DMA mechanism/instruction family, or L2-aware scheduling that keeps more of the
+stream on-chip. Record it as an evidence gap, not as a kernel defect.
 
 ---
 
