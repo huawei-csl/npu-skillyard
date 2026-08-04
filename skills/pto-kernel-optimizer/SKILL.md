@@ -186,9 +186,16 @@ seam sync, and overlap between two engines that a single-engine roofline does no
 An engine can sit at its roofline while the composition wastes most of the wall clock.
 
 **And the inverse, which is just as expensive to learn late: a stage can be far off its own
-roofline and still be FREE.** Before optimizing any stage inside a composition, check
-whether it is on the critical path — compare the composed time against the dominant stage
-alone. On `grouped_matmul_swiglu_quant` the stage-2 Vec chain ran at 205 GB/s against a
+roofline and still be FREE.** Before optimizing any stage inside a composition, **bisect the
+composition** — compile the chain to stop at the seam (a `-DSTOP_AFTER_<stage>` flag is
+worth carrying in every generated chain kernel for exactly this) and time it. The
+difference bounds everything downstream of that seam, and it costs two commands.
+
+On `grouped_matmul_swiglu_quant` that bisection returned 568.4 us against a full chain of
+572.5 us: **the entire second stage — its GM intermediate read-back, its whole Vec chain and
+its stores — was worth 4.1 us of 572.** That single measurement retired both a stage-2
+optimization campaign and a proposed compute-fusion, each of which would otherwise have
+been days of work for <1%. Bound the prize before building. On `grouped_matmul_swiglu_quant` the stage-2 Vec chain ran at 205 GB/s against a
 ~790 GB/s roofline and looked like the obvious target; it was optimized 1.15x (47.75 ->
 41.54 us, validated), folded into the chain, and the chain moved **571.8 -> 572.5 us —
 nothing**, because that stage runs on AIV behind stage 1's AIC weight stream and was
