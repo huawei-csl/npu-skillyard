@@ -325,12 +325,52 @@ through L2 with allocate-on-miss and hit 0%.
 That single fact explains why every knob above is flat: **none of them changes whether the
 stream allocates in L2.**
 
-**So the rule is: do not tune the load, change what the stream does to L2.** Concretely,
-block the algorithm so the reused operand stays resident and the streamed operand does not
-evict it. PTO cannot currently express a non-allocating load — there is no cache-policy or
-non-temporal hint on `TLOAD`, and the only cache control shipped is `TPREFETCH_ASYNC`,
-which pulls *into* L2. Until that exists, a pure out-of-L2 stream is capped at ~920 GB/s
-and a vendor kernel may legitimately be ~1.55x faster on it.
+**So the rule is: do not tune the load, change what the stream does to L2.**
+
+### PLAT-§L2Bypass: the fix — stream through the uncached address alias
+
+On A2/A3 the L2 policy is **not** a DMA flag (which is why `sid` is inert). It is an
+**aliased address window**: the same physical memory mapped at `addr + offset` with L2
+disabled. CANN's own AscendC layer does exactly this
+(`L2CacheAlter` in `asc/impl/basic_api/utils/kernel_utils_macros.h`):
+
+```c
+if (mode == CacheMode::CACHE_MODE_DISABLE)
+    return (__gm__ T*)((uint64_t)addr + l2CacheOffset);
+```
+
+and the offset is a public runtime query:
+
+```c
+rtError_t rtGetL2CacheOffset(uint32_t deviceId, uint64_t *offset);  // rt_preload_task.h
+```
+
+On this 910B2 it returns **`0x80000000000`**. Measured on the identical kernel binary,
+469.8 MB streamed, changing only the pointer handed to the launch:
+
+| weight pointer | time | rate |
+|---|---|---|
+| `w` (cached, what we generate today) | 513.5 us | 915 GB/s |
+| `w + rtGetL2CacheOffset()` | **307.5 us** | **1527 GB/s** |
+
+**1.67x, and it beats the vendor's 1433 GB/s on the same operator.**
+
+**Correctness is verified, not assumed.** Running the real `grouped_matmul_i32` kernel both
+ways and comparing bit-exactly against a CPU int64 reference: identical in all three of
+`fresh`, `settled`, and an adversarial `rewrite` case where the weight is dirtied in cache
+immediately before the launch. Zero mismatching elements. The two views are coherent.
+
+**Apply it to the STREAMED operand only.** L2 is not the enemy — a 0% hit rate is. Alias
+the operand that is read once and never reused (here, the 470 MB weight); leave the reused
+operand (here, `x`) on the normal cached path, which is precisely what the vendor does
+(94% hits on its ~68 MB of cached traffic). Aliasing a reused operand will make it slower.
+
+**Plumbing.** No kernel-side PTO change is needed — it is pointer arithmetic. Query the
+offset once on the host, and either alias the pointer in the harness before the launch or
+pass the offset as an extra scalar arg and add it to the streamed operand's base inside the
+kernel. PTO has no API for this (`TLOAD` has no cache-policy parameter, and the only cache
+control it ships is `TPREFETCH_ASYNC`, which pulls *into* L2) — exposing a `CacheMode` on
+`GlobalTensor` is the natural upstream request.
 
 ---
 

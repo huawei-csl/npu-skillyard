@@ -174,9 +174,12 @@ the Vec loads cost 32.2%, in a kernel diagnosed as Cube-underfilled).
   rate whenever the schedule re-reads anything (that same stage issued **1.50x** its
   essential weight). Compute both; the gate uses issued bytes.
 
-When this gate fires on an out-of-L2 stream, the only lever left is **shrinking the
-footprint** so the hot set fits L2 — not wider bursts, deeper rings, more cores, or an NZ
-ABI, all of which are measurably flat (`PLAT-§ReadCeiling`).
+When this gate fires on an out-of-L2 stream, **try the uncached address alias FIRST**
+(`PLAT-§L2Bypass`): a streamed operand read once and never reused should be loaded through
+`ptr + rtGetL2CacheOffset()`, which measured **1.67x** (915 -> 1527 GB/s) on an identical
+kernel binary and is bit-exact. Wider bursts, deeper rings, more cores and an NZ ABI are
+all measurably flat and are not worth an attempt. After that, the remaining lever is
+**shrinking the footprint** so the hot set fits L2.
 
 Why `mixed` gets no early stop: its cost is a *composition* — cross-core handshakes,
 seam sync, and overlap between two engines that a single-engine roofline does not model.
