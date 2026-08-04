@@ -185,6 +185,17 @@ Why `mixed` gets no early stop: its cost is a *composition* — cross-core hands
 seam sync, and overlap between two engines that a single-engine roofline does not model.
 An engine can sit at its roofline while the composition wastes most of the wall clock.
 
+**And the inverse, which is just as expensive to learn late: a stage can be far off its own
+roofline and still be FREE.** Before optimizing any stage inside a composition, check
+whether it is on the critical path — compare the composed time against the dominant stage
+alone. On `grouped_matmul_swiglu_quant` the stage-2 Vec chain ran at 205 GB/s against a
+~790 GB/s roofline and looked like the obvious target; it was optimized 1.15x (47.75 ->
+41.54 us, validated), folded into the chain, and the chain moved **571.8 -> 572.5 us —
+nothing**, because that stage runs on AIV behind stage 1's AIC weight stream and was
+already fully hidden. The tell was available before the work: the chain (648.8 us) barely
+exceeded stage 1 alone (622.8 us), so there was ~26 us of exposed stage-2 cost to win, not
+46. **A roofline gap on a hidden stage is not an opportunity.**
+
 **Why this rule exists.** Two regenerations of the same case differed by **1.16x vs
 1.52x against the vendor** with *identical* correctness, purely because one run spent an
 optimization pass on tile geometry and the other declared it out of scope. Run-to-run
