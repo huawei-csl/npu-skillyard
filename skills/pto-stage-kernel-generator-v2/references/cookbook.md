@@ -688,6 +688,37 @@ Use when:
 > that, or serialize the sub-blocks (`if (get_subblockid() != 0) return;`) and accept
 > half the memory parallelism.
 >
+> ### Corroborated against the vendor's own runtime (CANN 9.1.0 AscendC)
+>
+> `asc/impl/basic_api/kernel_tpipe_impl.h` allocates flag ids like this:
+>
+> ```cpp
+> template <HardEvent evt> TEventID TPipe::AllocEventID() {
+>     auto ptr = this->g_tpipeImpl.eventPool_ + EventToIndex(evt);  // pool PER event class
+>     auto lastId = sff0(ptr->eventOccupy);                          // first free id
+>     ...
+> }
+> ```
+>
+> with `constexpr int32_t QUE_MAX_EVENT = 8;` for `__NPU_ARCH__ == 2201` (dav-c220), and
+> `HardEvent` enumerating every `(src,dst)` pipe pair (`MTE2_V`, `V_MTE2`, `MTE3_MTE2`, ...)
+> as a separate class. So the id space is **8 per pipe-pair class**, allocated dynamically
+> from a per-class occupancy bitmap — which is exactly the model this section assumes when
+> it hands sub-block 0 ids 0-3 and sub-block 1 ids 4-7 *on every pipe pair*. The rule above
+> stands; this is independent confirmation of its shape, not a change to it.
+>
+> **But the depth guidance was off-consensus.** Counting `BUFFER_NUM` across the ~490 shipped
+> AscendC kernels that declare one:
+>
+> | ring depth | 1 | **2** | 3 | 4 | 5+ |
+> |---|---|---|---|---|---|
+> | vendor kernels | 145 | **316** | 4 | 9 | 5 |
+>
+> **Depth 2 is the vendor norm and depth >=3 is under 4% of kernels.** `deep_norm_grad`
+> itself ships at `BUFFER_NUM = 1`. Prefer depth 2; treat depth >=3 as an exotic choice that
+> must earn its keep against a measurement, not as the default a "deep pipeline" section
+> implies. Two optimizer rounds were spent here chasing depth 3.
+>
 > **Why this looked like something else.** It is a race, so it is probabilistic, and
 > sampling one run per shape makes it look shape-selective -- which is exactly how
 > `dequant_swiglu_quant`'s parity round came to report a "shape-dependent deadlock"
