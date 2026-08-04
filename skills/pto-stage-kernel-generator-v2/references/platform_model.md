@@ -285,6 +285,25 @@ address range touched:
 **Use bypass only when the streamed working set exceeds L2 (~150 MB on this part). Below
 that it is a 3x pessimization** — it is not a free win to sprinkle on every load.
 
+**Cross-checked on an unrelated kernel, and it predicts the magnitude, not just the sign.**
+`quant_matmul_a8w8` (different operator, dtype path and generation; activation aliased):
+
+| M | working set | cached | bypass | effect | bit-exact |
+|---|---|---|---|---|---|
+| 1024 | 6.4 MB | 24.0 us | 44.5 us | **0.54x LOSS** | yes |
+| 4096 | 23.1 MB | 62.2 us | 130.5 us | **0.48x LOSS** | yes |
+| 8192 | 45.4 MB | 115.4 us | 254.4 us | **0.45x LOSS** | yes |
+
+against the table above predicting 0.45x at 32 MB. Note the outputs stay **bit-exact even
+when bypass is slower** — the alias is always semantically safe, so a wrong decision here
+costs performance only, never correctness.
+
+**Scope, stated honestly.** Of the suite cases whose contracts were checked
+(`grouped_matmul` ~10 MB, `quant_matmul` ~45 MB, `flash_attention` ~50 MB at S=2048,
+`grouped_matmul_swiglu_quant` 470 MB), **only one exceeds L2.** This rule is a large win on
+a narrow class: weight-streaming operators at MoE/LLM scale. Check the working set before
+reaching for it — for most kernels the correct action is to do nothing.
+
 **Two further consequences for optimization.**
 
 1. **Know when to stop.** If a stage is streaming an out-of-L2 working set and measures
