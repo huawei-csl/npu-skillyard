@@ -365,6 +365,25 @@ the operand that is read once and never reused (here, the 470 MB weight); leave 
 operand (here, `x`) on the normal cached path, which is precisely what the vendor does
 (94% hits on its ~68 MB of cached traffic). Aliasing a reused operand will make it slower.
 
+**"Never reused" includes reuse created by your own SCHEDULE.** Bypass removes L2 from the
+path, so any byte the schedule re-reads now costs full HBM price. Measured on the same
+load-only kernel, varying only how many times the schedule re-reads each expert's weight:
+
+| schedule redundancy | cached | L2-bypass | effect |
+|---|---|---|---|
+| 1.00x (each byte read once) | 560.2 us | **367.9 us** | **1.52x faster** |
+| 1.50x | 593.2 us | 512.5 us | 1.16x faster |
+| 1.94x | 625.2 us | **667.7 us** | **0.94x — SLOWER** |
+
+So bypass and a reuse-free schedule are **one optimization, not two**. Applying bypass to a
+redundant schedule wastes most of it, and past ~1.9x it is a pessimization.
+
+**This also inverts how you rank the redundancy fix.** Under cached loads, cutting a 1.94x
+redundant schedule to 1.00x is worth ~9.5% — correctly judged low-value and deferred. Under
+bypass the same fix is worth ~81% (667.7 -> 367.9 us). **After changing cache policy,
+re-evaluate every optimization you previously rejected as low-value**; their measured cost
+was conditional on the policy you just changed.
+
 **Plumbing.** No kernel-side PTO change is needed — it is pointer arithmetic. Query the
 offset once on the host, and either alias the pointer in the harness before the launch or
 pass the offset as an extra scalar arg and add it to the streamed operand's base inside the
