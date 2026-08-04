@@ -507,3 +507,25 @@ Before returning the JSON output, verify:
 - If ReferenceModel is unreadable, emit a ValidationScript that imports it at runtime and lets the import error surface.
 - Do not invent stronger invariants than StageSpec guarantees.
 - Do not claim support for shapes, dtypes, or layouts not justified by the inputs.
+
+## Benchmark reporting: one ratio definition, and cross-check it
+
+Two harness defects from `flash_attention_grad` that produced a **false headline win**
+(a claimed 1.331x at S=256 that was really 1.018x):
+
+1. **`ratio-of-medians` != `median-of-paired-ratios`.** Both are defensible; mixing them in
+   one table is not. Pick one, name it in the protocol block, and **cross-check it against
+   the ratio of the two medians printed in the same row**. If they disagree by more than a
+   few percent, that row is a bug — with a skewed kernel (min 38.9 us, max 171.8 us) the two
+   diverged by 30% and the wide CI `[1.151, 1.558]` next to neighbours at `[±0.005]` was the
+   only visible tell.
+2. **A JSON whose `protocol` block differs MUST have different data.** Two files recording
+   `reps=200` and `reps=400` carried bit-identical medians to 14 significant digits — one was
+   a stale copy written without re-running. Before trusting a re-measurement, confirm its
+   numbers actually moved.
+
+**Minimum reps scale with how short the kernel is relative to the flush.** When the timed
+region is much shorter than the 256 MiB L2 flush, 60 reps is not enough: the same case read
+`1.540x [1.271, 1.757]` at 60 reps and `0.903x [0.897, 0.908]` at 200 — the point estimate
+crossed parity. Use >=200 reps for kernels under ~100 us, and treat a CI wider than a few
+percent as "not yet measured" rather than as a result.

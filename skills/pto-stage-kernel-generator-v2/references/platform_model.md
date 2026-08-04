@@ -282,8 +282,23 @@ address range touched:
 | L2-bypass | 1539 | 1533 | 1528 | 1530 |
 | effect | **0.33x LOSS** | 0.45x LOSS | 0.92x | **1.66x WIN** |
 
-**Use bypass only when the streamed working set exceeds L2 (~150 MB on this part). Below
-that it is a 3x pessimization** — it is not a free win to sprinkle on every load.
+**Use bypass only when the streamed working set exceeds L2 (~150 MB on this part).** Below
+that it ranges from mildly negative to a 3x pessimization — it is not a free win to sprinkle
+on every load.
+
+**Two refinements measured on a second operator (`flash_attention_grad`), which correct the
+over-simple form of this rule:**
+
+* **The crossover is NOT fixed at ~150 MB.** There, aliasing won from ~34 MB upward
+  (1.230x at S=1024) — far below L2. The threshold is not the working-set size alone; it is
+  whether the aliased tensors are actually *re-read*. Decide from reuse, not from a number.
+* **"3x pessimization below L2" does not generalize.** The measured cost of a wrong alias
+  there was **4%**, not 3x. The 0.33x figure in the table above is one access pattern
+  (a tight re-read loop over a small footprint), which is the worst case, not the typical one.
+* **Aliasing MORE tensors can destroy a winning alias set.** Adding two redundancy-2.0
+  tensors to a winning redundancy-1.0 set took 1.230x down to 1.039x. Alias the
+  *never-re-read* tensors only, and re-measure after each addition rather than assuming the
+  set composes.
 
 **Cross-checked on an unrelated kernel, and it predicts the magnitude, not just the sign.**
 `quant_matmul_a8w8` (different operator, dtype path and generation; activation aliased):
