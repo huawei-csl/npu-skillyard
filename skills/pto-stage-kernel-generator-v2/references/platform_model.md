@@ -307,9 +307,30 @@ same thing. **`sid` is inert, and PTO's wrapper neither adds nor removes anythin
 raw hardware DMA instruction hits exactly the same wall. So do not attribute this ceiling to
 the tile library, and do not propose a PTO change to lift it.
 
-What remains unexplained is only *how the vendor exceeds it*. Untested candidates: a
-different DMA mechanism/instruction family, or L2-aware scheduling that keeps more of the
-stream on-chip. Record it as an evidence gap, not as a kernel defect.
+**Root cause: ~920 GB/s is the L2 miss-and-allocate fill rate, not HBM peak.** Hardware
+counters (`msprof --aic-metrics=L2Cache`) on both arms under the same flush:
+
+| | duration | L2 read hits | misses | hit rate |
+|---|---|---|---|---|
+| vendor fused op | 372.6 us | 502,453 | 30,799 | **94.2%** |
+| our load probe | 508.8 us | 47 | 3,670,017 | **0.0%** |
+
+Each event is one 128-byte line (validated: the same probe over an 8 MB footprint reports
+identical total events and misses = 65,537 x 128 B = exactly 8.4 MB, i.e. compulsory
+misses only). The vendor's 533,252 events cover just 68 MB of its 538 MB of GM reads, so
+**~87% of its read traffic never enters the L2 read path** — it streams the weight around
+L2 and spends L2 on the operand it actually reuses. We push 470 MB of never-reused data
+through L2 with allocate-on-miss and hit 0%.
+
+That single fact explains why every knob above is flat: **none of them changes whether the
+stream allocates in L2.**
+
+**So the rule is: do not tune the load, change what the stream does to L2.** Concretely,
+block the algorithm so the reused operand stays resident and the streamed operand does not
+evict it. PTO cannot currently express a non-allocating load — there is no cache-policy or
+non-temporal hint on `TLOAD`, and the only cache control shipped is `TPREFETCH_ASYNC`,
+which pulls *into* L2. Until that exists, a pure out-of-L2 stream is capped at ~920 GB/s
+and a vendor kernel may legitimately be ~1.55x faster on it.
 
 ---
 
