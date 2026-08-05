@@ -402,3 +402,22 @@ an algorithm swap (5.9x on the inverse), lean-then-compose fusion, resident stat
 recurrence run-ahead. The one lever that would have beaten the reference (a 2-sub-unit
 split of the recurrence) hit an irreducible cross-core coherence race on a per-head
 workspace — the documented wholesale-clone boundary. That whole campaign IS this method.
+
+## A large win against a vendor op is a claim about the VENDOR, until proven otherwise
+
+When a generated kernel beats a vendor operator by more than ~3x, the default explanation is
+**not** that the kernel is exceptional. It is that the vendor operator is off its own
+capability at that shape. Establish which before reporting:
+
+1. **Convert both arms to GB/s** (or FLOP/s) on the essential bytes.
+2. **Measure the vendor's OWN ceiling** by sweeping it to a shape it is built for, and
+   report our rate as a percentage of that.
+3. If our rate is unremarkable (say 50-70% of the vendor's own best) while the vendor's rate
+   at the tested shape is far below it, **the finding is "the vendor does not cover this
+   shape"** -- report it that way, with the GB/s pair, not as a bare speedup.
+
+Worked case: `nsa_select_attention` measured **18.6x**. Ours was 534 GB/s -- 64% of the
+830 GB/s the vendor itself reaches at BS1=64 -- while the vendor at BS1=1 ran at 28 GB/s,
+30x below its own capability, from a fixed ~2.7 ms floor flat across BS1=1..16. The same
+operator **overtakes us at BS1=16**. A bare "18.6x" would have been indefensible; the GB/s
+pair is both defensible and more informative.
