@@ -373,6 +373,25 @@ through L2 with allocate-on-miss and hit 0%.
 That single fact explains why every knob above is flat: **none of them changes whether the
 stream allocates in L2.**
 
+> **SCOPE CORRECTION -- that flatness is a property of the CACHED path only.** Every sweep in
+> the table above was run without the uncached alias. Re-measured on `grouped_matmul_swiglu_quant`
+> **through the alias**, two of those knobs are emphatically NOT flat:
+>
+> | knob, on the ALIASED path | result |
+> |---|---|
+> | 256 B -> 512 B bursts | 550.5 -> **446.5 us (1.233x)**; load-only probe 909 -> 1140 GB/s |
+> | ring depth 3 -> 1 | 526.7 vs 446.5 us -- **1.18x SLOWER** |
+> | 512 B strided -> fully contiguous | 428.4 vs 429.7 us -- 1.003x, flat again past ~512 B |
+>
+> The reading is consistent once stated properly: **while the stream is being absorbed by an
+> L2 miss-and-allocate at ~920 GB/s, nothing upstream of that bottleneck matters. Remove the
+> bottleneck with the alias and the DMA parameters become the constraint again.**
+>
+> **So the order is: alias FIRST, then re-tune burst width and ring depth against the aliased
+> baseline.** Tuning them on the cached path measures nothing, and quoting the flatness after
+> aliasing costs ~1.2x twice over. An alias-off control on the same run confirms the alias
+> itself is worth **1.42x** at that geometry.
+
 **So the rule is: do not tune the load, change what the stream does to L2.**
 
 ### PLAT-§L2Bypass: the fix — stream through the uncached address alias

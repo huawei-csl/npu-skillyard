@@ -579,3 +579,21 @@ different callable inflates that cost. It fades as the kernel grows (1.7% by S=5
 short kernel is dispatch-bound on BOTH arms, so per-call rows there measure ctypes overhead
 rather than the kernels. Prefer batched timing windows at small sizes, and state plainly
 which rows are dispatch-bound and therefore not quotable as an algorithmic result.
+
+### Validate each case MORE THAN ONCE -- single-run validation cannot see intermittent corruption
+
+A stage-2 event-ID collision produced **silent** `y_q` corruption in roughly **1-2 runs in 30**.
+It passed a 26-case validation sweep, because **each case ran once**. It was found only when a
+case was repeated, and the surgical fix took it to **0/200**.
+
+A validation suite whose cases each run once measures the wrong thing: it samples 26 points of
+a distribution whose failure rate is ~5%, so it misses the bug with probability ~0.95^26 ~ 26%
+per attempt -- and it will keep missing it, run after run, while the kernel ships.
+
+**Requirement:** every validation case runs **>= 3 times** with fresh GM allocations, and the
+production point runs **>= 20**. Report the pass count as a fraction (`30/30`), never as a bare
+PASS. A determinism check over repeated runs is not a substitute -- determinism compares our
+output to itself, so a consistently-wrong kernel passes it.
+
+This is the same failure mode as the benchmark null control: a check that only compares a thing
+to itself cannot see a fault that affects both sides equally.
