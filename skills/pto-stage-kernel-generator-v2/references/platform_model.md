@@ -848,3 +848,35 @@ Isolated cleanly in a campaign run: an `idx >= ip` predicate became `idx == ip`,
 (exact for magnitudes below 2^24, which covers any index into a tile), or build the predicate
 arithmetically. This is a defect in the library rather than a platform limit, and it is a
 strong upstream bug-report candidate: the parameter is in the signature and silently dropped.
+
+
+## PLAT-§ValidColTrunc: a tile narrower than its GM view silently TRUNCATES the load
+
+If a `Tile`'s `ValidCol` is narrower than the `GlobalTensor` view being loaded, `TLOAD`
+transfers only `ValidCol` columns and **the remaining columns of the destination are never
+written** -- no error, no warning. In a fused kernel this surfaces as a numerical error that
+looks like a math bug: one campaign run chased a 1.61 relative error that was simply the RoPE
+half of a fused `[kTok, 576]` load never arriving.
+
+**The tile's valid extent is the transfer size, not a window onto a larger transfer.** When
+one GM view feeds two logical halves, either load the full width into one tile and slice in
+UB, or issue two loads with correctly-sized tiles. State the widths in the StageSpec so the
+mismatch is visible at review rather than at 1.61.
+
+## PLAT-§MCPIdentity: the MCP is not an IDENTITY oracle either
+
+Already established: it is not an existence oracle (nine documented instructions have no NPU
+backend, `PLAT-§A2Gaps`). It is also not reliable about *which* instruction a page describes.
+
+`TGATHER` is the confirmed case, and the page is a **hybrid of two different instructions**:
+
+| part of the page | which instruction |
+|---|---|
+| summary ("gather/select elements using an index tile or mask pattern") | the in-UB element gather |
+| operands `["dst", "src0", "src1"]` | the in-UB element gather |
+| C++ signature, constraints, both examples | `comm::TGATHER(parallelGroup, dstGlobalData, stagingTile)` -- the **collective multi-NPU** gather across ranks |
+
+A generator looking for "gather elements by index" finds a summary that matches its need and
+a contract that belongs to a distributed collective. **Check that the `cpp_intrinsic` header
+and signature on an MCP page match the operation you think you are reading about** -- here the
+header is `include/pto/comm/pto_comm_inst.hpp`, which gives it away immediately.
