@@ -650,6 +650,37 @@ mean "available on your target". Verified against the pinned pto-isa tree:
 **Rule: before emitting any instruction, check that the constraints block you got back is
 tagged for YOUR backend.** An `a5`-only block is an evidence gap, not a green light.
 
+**Stronger rule, after a second run hit this independently: THE MCP IS NOT AN EXISTENCE
+ORACLE.** It documents instructions that exist on **no** backend at all. Confirmed absent
+from the entire pinned `pto-isa` tree (zero occurrences in `include/`):
+
+| documented by MCP | occurrences in pto-isa |
+|---|---|
+| `TDEINTERLEAVE` | 0 |
+| `THISTOGRAM` | 0 |
+| `TMULADDDST` | 0 |
+| `TFUSEDMULADD` | 0 |
+| `TFUSEDMULADDRELU` | 0 |
+| `TPairReduceSum` | 0 |
+
+`documented: true` means "there is a doc page", not "you can call it". **Before building a
+design around any instruction you have not already used, grep the pinned `pto-isa` tree for
+it.** One grep; it has now cost two separate runs a redesign — one of them lost the whole
+radix-select path and had to fall back to a merge sort.
+
+### PLAT-§Precision: `TRSQRT`'s 2-arg form is a hardware APPROXIMATION
+
+`TRSQRT(dst, src)` lowers to the hardware `vrsqrt` (`a2a3/TUnaryOp.hpp:271`). Only the
+**3-arg** form (with a scratch tile) is the exact `vsqrt` + `vdiv` path.
+
+Measured in an fp32 RMSNorm: the 2-arg form gives **1.194e-03** relative error against a
+CPU-fp64 reference -- **119x over a 1e-05 tolerance** -- and it was **not faster**. It is a
+silent accuracy bug in exactly the normalization kernels that reach for it. The MCP page
+documents neither overload's precision.
+
+**Use the 3-arg form unless you have measured that the approximation is inside your
+contract's tolerance.**
+
 **Worked substitution (kv_rmsnorm_rope_cache).** With `TDEINTERLEAVE` unavailable, a RoPE
 pair-deinterleave over bf16 was done by viewing 64 `bfloat16` as 32 `uint32` and computing
 `even = bitcast(w << 16)`, `odd = bitcast((w >> 16) << 16)` — an **exact** bf16->fp32
