@@ -1917,9 +1917,17 @@ instruction used in the proven cookbook patterns above. `TMOV` for L1→L0 may a
 in other PTO documentation or auto-mode code, but is not part of the approved
 surface here.
 
-Every reference kernel follows this exact mapping. Never swap the destination —
-L1MatZN into TileLeft or L1Mat into TileRight for transposed will fail with
-`static_assert`.
+Every reference kernel follows this exact mapping for the NON-transposed feed.
+
+> **CORRECTION -- "L1MatZN into TileLeft will fail with `static_assert`" is FALSE.**
+> A transposing extract exists in the pinned tree: `TExtractToATranspose`
+> (`pto/npu/a2a3/TExtract.hpp:28`, dispatched at :99, plus a `...Compact` variant at :235).
+> So a transposed left operand does **not** require a separate dual-layout staging scheme.
+> One campaign run built an entire `pT`/`dsT` dual-layout design around the supposed absence
+> of this path before finding it. Check `TExtract.hpp` before designing around a transpose.
+>
+> The mapping below is still the right default; it is the *impossibility* claim that was
+> wrong.
 
 **The table above is HARDWARE-VERIFIED.** `isa_probes/probe_accfrac.cpp` stages both
 operands through `L1Mat` (`SLayout::RowMajor`) and extracts the right one into a

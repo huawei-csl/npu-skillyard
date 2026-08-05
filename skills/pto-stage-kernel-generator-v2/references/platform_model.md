@@ -308,6 +308,13 @@ over-simple form of this rule:**
 * **"3x pessimization below L2" does not generalize.** The measured cost of a wrong alias
   there was **4%**, not 3x. The 0.33x figure in the table above is one access pattern
   (a tight re-read loop over a small footprint), which is the worst case, not the typical one.
+* **In a CHAIN, a producer-consumer intermediate is NOT cold.** An intermediate written by
+  an earlier stage is still L2-resident when the next stage reads it, so aliasing it bypasses
+  a cache that was about to hit. Measured on `flash_attention_grad`: aliasing `s_gm` gains
+  **1.15-1.20x standalone** and **loses in the chain** at S<=512 (0.917x at S=128) -- and the
+  sign flips exactly at L2 capacity, where the intermediate stops fitting. **Benchmark the
+  alias in the composed chain, never only standalone**; the standalone number has the
+  opposite sign in the regime that matters.
 * **The alias is for READS. A never-re-read WRITE is not a candidate.** On
   `moe_token_permute`, aliasing the 128 MiB output -- written once, never re-read, the
   textbook "no reuse" tensor -- was a **LOSS**, while aliasing the read-side `tokens` was

@@ -640,3 +640,23 @@ This is the fourth distinct instance of one failure: **a validation sweep that d
 dimension cannot see a bug that lives along it.** The others were single-run validation
 (intermittent corruption), determinism checking (inter-item races), and the within-arm null
 control (cross-arm interference). When a gate passes everywhere, ask which axis it never moved.
+
+### Randomized order balances SLOTS, not ADJACENCY -- counterbalance it
+
+A randomized interleave gives each arm the same *distribution* of positions, but not the same
+distribution of *predecessors*. Back-to-back identical arms were measured to differ by **~5%**
+on this hardware, so a schedule that happens to put more of arm A after arm B biases the
+comparison even though every arm got its fair share of slots.
+
+**Use a counterbalanced order** (e.g. ABBA / BAAB blocks) so each arm follows each arm equally
+often, and report the residual A-after-A vs A-after-B difference as a diagnostic.
+
+Two earlier symptoms of the same effect, now explained: two labels of an *identical* vendor arm
+split 3.9% at one size and 29% at another under a global multiset shuffle; and a vendor arm
+read 68.02 us interleaved against 34.86 us alone while its within-arm null control passed at
+0.998.
+
+**Before trusting a re-measurement that changes a conclusion, cross-check it against the rows
+you already have.** When this was fixed mid-run, the earlier 200-rep rows were re-checked and
+agreed to -0.11% / +0.84% / +1.11% / +0.10% -- so the defect was real but had not moved those
+numbers, which is worth establishing rather than assuming in either direction.

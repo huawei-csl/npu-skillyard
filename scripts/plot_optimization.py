@@ -193,9 +193,14 @@ def plot(doc, out_png):
     # Always show all 15 slots: an early stop should be VISIBLE as unused budget.
     ax.set_xlim(0.4, budget + 0.6)
     ax.set_xticks(range(1, budget + 1))
-    # Diagnostics are measurements, not budget-consuming attempts -- counting them
-    # printed "11/10" on a run that had made exactly 10 real attempts plus a probe.
-    used = sum(1 for d in diag if not d) + len(unmeasured)
+    # SKILL 3.5 defines an attempt as "a change WITH a paired re-measurement", and a
+    # diagnostic probe is exactly that -- the skill tells you to TAG probes
+    # `kind: diagnostic`, not to exclude them from the budget. Excluding them made a
+    # full 15-attempt campaign (3 of them tagged probes) render as "12 of 15" under a
+    # red PROCESS FAILURE banner. Budget consumption is the number of attempt SLOTS
+    # occupied, so take the highest attempt index present rather than a count -- that
+    # also keeps the shading right when indices are sparse.
+    used = max([a["n"] for a in att] + [a["n"] for a in unmeasured] + [0])
     if used < budget:
         ax.axvspan(used + 0.5, budget + 0.6, color="#bbb", alpha=.14, zorder=0)
         ax.annotate("budget not used (%d of %d)" % (used, budget),
