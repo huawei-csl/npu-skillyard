@@ -571,9 +571,17 @@ different callable inflates that cost. It fades as the kernel grows (1.7% by S=5
 
 **Therefore, for every reported row:**
 1. Measure each arm **ALONE** as well as interleaved.
-2. Report the comparand's **best** (alone) time -- conservative against us.
-3. If the two differ by more than a few percent, say so in the row; that difference is a
-   property of the harness, not of either kernel.
+2. Form the **ratio from PAIRED interleaved runs only** (median of repeated paired runs).
+3. Use the ALONE numbers as a **diagnostic**: if an arm's alone and interleaved medians differ
+   by more than a few percent, that row is contaminated -- say so, and treat any effect smaller
+   than the discrepancy as unmeasured.
+
+> **Do NOT build the ratio from `min(alone, interleaved)` per arm.** An earlier version of this
+> rule said "report the comparand's best time", and taking a per-arm minimum mixes two
+> different measurement conditions into one quotient. It produced an outright **sign error** on
+> a 3% effect -- an attempt read as 1.03x FASTER when it was in fact 1.04x SLOWER. The two arms
+> must come from the same interleaved stream for the pairing to cancel drift; the alone runs
+> tell you whether to trust that stream, not what to divide.
 
 **Small sizes are where this bites**, and it compounds with the other small-size hazard: a
 short kernel is dispatch-bound on BOTH arms, so per-call rows there measure ctypes overhead

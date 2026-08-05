@@ -794,3 +794,29 @@ a thing to itself cannot see a fault that affects both sides equally* (the other
 benchmark null control and single-run validation). Guard the L1 buffer with a flag class that
 actually stalls the producer, and validate with repeated runs at a size where lanes own
 multiple items.
+
+
+## PLAT-§RWSerial: read and write bandwidth do NOT overlap -- roofline on TOTAL traffic
+
+A kernel that both reads and writes does not get its loads for free behind its stores.
+Measured (PROBED) on `dequant_swiglu_quant`:
+
+| | time |
+|---|---|
+| loads alone | 28.73 us |
+| stores alone | 7.87 us |
+| **serial sum** | **36.60 us** |
+| **both together, measured** | **36.83 us** |
+
+The two add. **A read+write roofline must use `(bytes_read + bytes_written) / peak`, never
+`max(read_time, write_time)`** -- the `max()` form silently understates the floor by the
+smaller side and will make a kernel look like it has headroom it does not have.
+
+### Scope note on the ~920 / ~1530 GB/s figures in PLAT-§ReadCeiling
+
+Those numbers were measured on a **pure-read, fully out-of-L2 stream of ~470 MB**. They are
+not universal. On a 37.7 MB read+write stage the same probes give **574.7 GB/s cached** and
+**1313.9 GB/s aliased**. The *shape* of the finding holds -- aliasing a cold stream is worth
+roughly 2x, and the cached path is the one that is capped -- but **measure your own floor
+rather than quoting the headline numbers**. Also probed there: read *stride* is free (four
+access patterns within 0.3%), so a stride hypothesis is not worth an attempt.
