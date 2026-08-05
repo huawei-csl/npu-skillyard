@@ -133,22 +133,22 @@ advantage is almost always a leaner slope.
 6. **Stop** at the irreducible floor or a wholesale-clone boundary (see Stop-criteria),
    but not before the mandatory attempt budget below.
 
-## 3.5 MANDATORY attempt budget: 10 attempts, and they go in the report
+## 3.5 MANDATORY attempt budget: 15 attempts, and they go in the report
 
 Every generated kernel gets an optimization campaign. It is not optional, and it is not
 finished when the kernel merely validates.
 
-**The budget is 10 measured attempts.** An "attempt" is a *change with a paired
+**The budget is 15 measured attempts.** An "attempt" is a *change with a paired
 re-measurement* — a hypothesis, a build, a number. Reverted regressions COUNT, and are
 often the most informative entries; do not quietly drop them.
 
 | stage archetype | minimum attempts | early stop allowed? |
 |---|---|---|
-| `mixed` (Cube + Vec, cross-core, composed/fused) | **10, always** | **No.** Run all 10 even when it is expensive. |
-| `vec_only` | 10 | Yes — see the gate below |
-| `cube_only` | 10 | Yes — see the gate below |
+| `mixed` (Cube + Vec, cross-core, composed/fused) | **15, always** | **No.** Run all 15 even when it is expensive. |
+| `vec_only` | 15 | Yes — see the gate below |
+| `cube_only` | 15 | Yes — see the gate below |
 
-**Early-stop gate (single-engine stages only).** You may stop before 10 *only* if you can
+**Early-stop gate (single-engine stages only).** You may stop before 15 *only* if you can
 show the kernel is at a **hardware limit**, with a measurement, not an argument:
 * achieved bandwidth is within ~10% of the measured streaming ceiling (A2/A3: a PTO
   `TLOAD` extracts **~920 GB/s** from an out-of-L2 working set — see
@@ -278,7 +278,7 @@ recoverable because it happened to be the last one.
 <py> ${CLAUDE_PLUGIN_ROOT}/scripts/plot_optimization.py reports/optimization_<stage>.json
 ```
 
-It draws all 10 budget slots regardless of how many were used, so an early stop is
+It draws all 15 budget slots regardless of how many were used, so an early stop is
 *visible* as shaded unused budget, marks kept vs reverted attempts distinctly, traces
 best-kept-so-far, and prints a red PROCESS FAILURE banner on a `mixed` stage that ran
 short. That last part is deliberate: a campaign that stopped early should not be able to
@@ -290,7 +290,7 @@ look complete.
 2. **The trajectory graph** from the script above, embedded.
 3. **The stop reason**, explicitly: budget exhausted, or which hardware-limit gate fired
    with its number.
-4. If fewer than 10 attempts were made on a single-engine stage, the gate evidence.
+4. If fewer than 15 attempts were made on a single-engine stage, the gate evidence.
    If fewer than 10 on a `mixed` stage, that is a **process failure** — say so plainly
    in the report rather than presenting the result as complete.
 

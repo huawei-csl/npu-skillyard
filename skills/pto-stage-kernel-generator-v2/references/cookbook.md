@@ -1749,7 +1749,7 @@ per item is pure slope (build it once, keep resident). VALIDATED: kkt stage 84->
 lever, and this is the same class of inefficiency that makes a generated per-stage kernel
 ~3-5x slower than a hand-tuned one (the whole production gap is per-stage Vec compute, not
 fusion). AUDIT EVERY generated stage for cargo-cult commits before blaming the algorithm.
-Gotchas surfaced: `TROWEXPAND` requires RowMajor src AND dst (a ColMajor column gives nan);
+Gotchas surfaced: `TROWEXPAND` requires a RowMajor **dst**; the **src may be ND or DN** (see `COOK-§6.9` -- the earlier "RowMajor src AND dst, a ColMajor column gives nan" wording here was WRONG);
 `TTRI` is validated on fp32, not fp16 (build the mask in fp32, then `TCVT` to a resident fp16).
 
 **17. A per-row / per-scan-step GM round-trip inside a within-chunk reduction or scan is the
@@ -3098,3 +3098,42 @@ same kernel (`COOK-§6.5`).
 (`dequant_swiglu_requant` attempt 1), and a per-item `PIPE_ALL` was silently protecting
 output tiles against a WAR hazard no rule mentioned (`deep_norm_backward` D6). Replace,
 then re-validate.
+
+
+## COOK-§6.9: TROWEXPAND src may be ColMajor -- the dst is the one that must be RowMajor
+
+**Corrects an earlier claim in §8.6P #16** ("requires RowMajor src AND dst; a ColMajor column
+gives nan"). That is wrong about the src, and it steers a generator away from the natural
+form of a row-broadcast. Read straight off the A2/A3 backend
+(`pto/npu/a2a3/TRowExpand.hpp`), whose asserts are **asymmetric**:
+
+```cpp
+static_assert(TileDataSrc::SFractal == SLayout::NoneBox,
+              "Fix: TROWEXPAND Src layout must be ND or DN!");        // src: EITHER layout
+static_assert(TileDataDst::isRowMajor && TileDataDst::SFractal == SLayout::NoneBox,
+              "Fix: TROWEXPAND dst layout must be ND!");              // dst: RowMajor ONLY
+```
+
+and whose own comment names both supported forms:
+
+```
+[1, M] -> [M, elemPerBlock], src is row major.
+[M, 1] -> [M, elemPerBlock], src is column major.
+```
+
+So a **ColMajor `[M,1]` column is a first-class source**, not a bug. Which form you get is a
+compile-time branch on `TileDataSrc::isRowMajor`.
+
+**The fast path has extra conditions** -- miss any and you silently fall back to the generic
+(slower) `TRowExpand` rather than the `TRowExpandBrcb` broadcast:
+* dtype is b16 or b32 only;
+* fully static shapes (`Rows == ValidRow` and `Cols == ValidCol` on BOTH tiles);
+* `dst.Cols == elemPerBlock` (32 bytes / sizeof(T));
+* `sizeof(T) * M` a multiple of 32 B, i.e. **M a multiple of 8** for b32.
+
+**Method note, worth more than the rule.** This was reported by a pipeline run, rejected by
+me on the strength of the MCP page -- which says *"ND fractal (`isRowMajor` and
+`SLayout::NoneBox`) for both `src` and `dst`"* -- and then confirmed from the implementation,
+which does **not** require `isRowMajor` on the src. **The MCP constraint text is wrong here.**
+When a run's PROBED claim conflicts with a doc, the implementation is the tiebreaker, not the
+doc. Both had to be checked; only one was authoritative.

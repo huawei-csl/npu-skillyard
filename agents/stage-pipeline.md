@@ -500,7 +500,7 @@ When the gate passes, benchmark **each** stage on real NPU (not the simulator):
    `pto-kernel-optimizer` BEFORE Phase 7 -- the gap lives in the per-stage kernels, not in
    the composition.
 
-### Phase 6.5: Optimization campaign -- MANDATORY, 10 attempts (not optional)
+### Phase 6.5: Optimization campaign -- MANDATORY, 15 attempts (not optional)
 
 Every stage gets an optimization campaign via `pto-kernel-optimizer`. A stage that merely
 validates is NOT finished. See `pto-kernel-optimizer` SKILL.md §3.5 for the full rule; the
@@ -509,7 +509,7 @@ binding parts:
 - **10 measured attempts** per stage. An attempt is a change WITH a paired re-measurement.
   Reverted regressions count and must still be reported -- they are often the most
   informative rows.
-- **`mixed` stages (Cube+Vec, cross-core, composed/fused): all 10, always**, even when
+- **`mixed` stages (Cube+Vec, cross-core, composed/fused): all 15, always**, even when
   expensive. No early stop. Their cost is a composition, and a single-engine roofline does
   not model the seam -- an engine can sit at its roofline while the composition wastes the
   wall clock.
@@ -707,7 +707,7 @@ modify kernels, re-validate, or re-benchmark here.
    plugin's plotter over the Phase 6.5 JSON:
    `<py> ${CLAUDE_PLUGIN_ROOT}/scripts/plot_optimization.py <output_dir>/reports/`
    It emits `optimization_trajectory_<stage>.png` for every `optimization_<stage>.json`,
-   drawing all 10 budget slots (so an early stop shows as shaded unused budget), kept vs
+   drawing all 15 budget slots (so an early stop shows as shaded unused budget), kept vs
    reverted attempts distinctly, best-kept-so-far, vendor parity at 1.0, and a red PROCESS
    FAILURE banner on a `mixed` stage that ran short. This is how a reader sees HOW the
    kernel was optimized, not just where it landed.
@@ -717,7 +717,7 @@ modify kernels, re-validate, or re-benchmark here.
    trajectory table (attempt # | hypothesis | what changed | measured ratio + 95% CI | kept
    or reverted | why), the trajectory graph, the attempt count, and the STOP REASON --
    budget exhausted, or which hardware-limit gate fired with its number. A `mixed` stage
-   with fewer than 10 attempts must be flagged as a process failure, not presented as
+   with fewer than 15 attempts must be flagged as a process failure, not presented as
    complete.
 4. **`<output_dir>/README.md`** -- the top-level narrative a human reads first: what the run
    ACHIEVED, the BLOCKERS and what was TRIED (per failed stage: repair_attempts +
