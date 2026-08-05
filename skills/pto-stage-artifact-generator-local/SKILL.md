@@ -551,3 +551,31 @@ into a summary, a table, or a paper.
 
 **Never report a bare ratio in a summary.** A number like `1.5` with no latencies beside it
 is not a result; it is a coin flip about which way the comparison ran.
+
+### A within-arm null control CANNOT detect cross-arm interference
+
+Rule 29's null control runs the same callable against itself and checks the ratio is ~1.0.
+That catches drift and ordering bias. **It cannot catch one arm perturbing the other**,
+because interleaving A-with-A perturbs both sides equally and the effect cancels.
+
+Measured on `attention_sdpa` at S=128, same process, 200 reps:
+
+| | vendor interleaved with ours | vendor run ALONE | within-arm null |
+|---|---|---|---|
+| median | **68.02 us** | **34.86 us** | 0.998 -- **PASSES** |
+
+Interleaving nearly **doubled** the comparand's time while the null control read clean. Taken
+at face value this is "2.04x FASTER"; the honest answer is **parity**. The mechanism is host
+dispatch: at small sizes the vendor arm is dispatch-bound, and alternating it with a
+different callable inflates that cost. It fades as the kernel grows (1.7% by S=512).
+
+**Therefore, for every reported row:**
+1. Measure each arm **ALONE** as well as interleaved.
+2. Report the comparand's **best** (alone) time -- conservative against us.
+3. If the two differ by more than a few percent, say so in the row; that difference is a
+   property of the harness, not of either kernel.
+
+**Small sizes are where this bites**, and it compounds with the other small-size hazard: a
+short kernel is dispatch-bound on BOTH arms, so per-call rows there measure ctypes overhead
+rather than the kernels. Prefer batched timing windows at small sizes, and state plainly
+which rows are dispatch-bound and therefore not quotable as an algorithmic result.
