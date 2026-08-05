@@ -738,3 +738,46 @@ widening *and* the deinterleave in three integer vector ops, replacing `TCVT` en
 | Async comm | `TPUT_ASYNC`, `TGET_ASYNC`, `TNOTIFY` | GM ↔ GM (remote) | AIC/AIV |
 | Sync | `set_flag`, `wait_flag`, `pipe_barrier`, `TSYNC` | Intra-core (all pipes) | Any |
 | Cross-core | `set_cross_core_flag`, `wait_flag_dev` | AIC ↔ AIV (FFTS) | AIC/AIV |
+
+
+## PLAT-§C33Col: C33's last-fractal rule governs the COLUMN axis too
+
+`C33` is written about rows: a boxed tile is correct iff `ceil(Valid/16) == ceil(Rows/16)`.
+**The same constraint applies to the column extent, and violating it is silently wrong** --
+no error, no fault, just incorrect data.
+
+Probed sharply on `dav-c220` (8/8 runs each side of the boundary):
+
+| valid column extent | result |
+|---|---|
+| 120 | **PASS** |
+| 112 | **FAIL** |
+
+The boundary lands exactly where the C33 fractal arithmetic says it should, which is what
+distinguishes this from a vague "make it a multiple of the tile width" rule -- it is C33,
+applied to the other axis.
+
+**Apply the C33 test to BOTH extents of every boxed tile**, and lock a contract dim rather
+than silently accepting a value that violates it. A generator that checks rows only will
+emit a kernel that validates on friendly shapes and returns wrong answers on others.
+
+## PLAT-§FixWAR: `PIPE_M <-> PIPE_FIX` flags do not block the scalar thread
+
+`set_flag(PIPE_M, PIPE_FIX, id)` / `set_flag(PIPE_FIX, PIPE_M, id)` do **not** stall the
+scalar thread. The loop therefore runs ahead and the next work item's `TLOAD` overwrites L1
+while a `TEXTRACT` from the previous item is still in flight -- a WAR window between work
+items.
+
+Measured: **2 wrong results in 30 runs at M=8192**, while **passing an 86-case validation
+sweep**. Two properties make this especially dangerous:
+
+* it is **inter-item**, so it only appears once a lane owns more than one work item -- the
+  rule-31 blind spot again;
+* **a determinism check does not catch it**, because the race is between work items and
+  reproduces identically run to run.
+
+That is the third distinct instance of the same trap in this project: *a check that compares
+a thing to itself cannot see a fault that affects both sides equally* (the others being the
+benchmark null control and single-run validation). Guard the L1 buffer with a flag class that
+actually stalls the producer, and validate with repeated runs at a size where lanes own
+multiple items.
