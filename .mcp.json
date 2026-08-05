@@ -5,7 +5,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/huawei-csl/npu-coding-mcp.git@997939b493f578194e33722623d68fcb1aa358b8",
+        "git+https://github.com/huawei-csl/npu-coding-mcp.git@b335fb2",
         "npu-coding-mcp",
         "serve",
         "--stdio"
