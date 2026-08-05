@@ -822,3 +822,29 @@ not universal. On a 37.7 MB read+write stage the same probes give **574.7 GB/s c
 roughly 2x, and the cached path is the one that is capped -- but **measure your own floor
 rather than quoting the headline numbers**. Also probed there: read *stride* is free (four
 access patterns within 0.3%), so a stride hypothesis is not worth an attempt.
+
+
+## PLAT-§CmpsInt32: `TCMPS` SILENTLY IGNORES `CmpMode` on an int32 source
+
+**Silent wrong answers. Verified in the A2/A3 backend** (`pto/npu/a2a3/TCmps.hpp`,
+`GenCmpCall`):
+
+```cpp
+if constexpr (std::is_same<TIN, int32_t>::value) {
+    vcmpvs_eq(dst, src0, src1, repeat, ...);       // cmpMode taken, then NEVER USED
+} else {
+    vcmp_dispatch(dst, src0, src1, cmpMode, ...);  // every other dtype honours it
+}
+```
+
+The int32 specialization accepts `cmpMode` and unconditionally emits `vcmpvs_eq`. So
+`TCMPS(dst, src_i32, scalar, CmpMode::GE)` computes **`==`**, not `>=` -- no error, no
+warning, wrong mask.
+
+Isolated cleanly in a campaign run: an `idx >= ip` predicate became `idx == ip`, and with
+`ip = V/2` the mask kept exactly `1662 + 1` elements -- the single matching index.
+
+**Do not use `TCMPS` with an int32 source for anything but equality.** Convert to fp32 first
+(exact for magnitudes below 2^24, which covers any index into a tile), or build the predicate
+arithmetically. This is a defect in the library rather than a platform limit, and it is a
+strong upstream bug-report candidate: the parameter is in the signature and silently dropped.
