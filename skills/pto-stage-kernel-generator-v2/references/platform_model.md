@@ -687,8 +687,28 @@ mean "available on your target". Verified against the pinned pto-isa tree:
 **Rule: before emitting any instruction, check that the constraints block you got back is
 tagged for YOUR backend.** An `a5`-only block is an evidence gap, not a green light.
 
-**Stronger rule, after a second run hit this independently: THE MCP IS NOT AN EXISTENCE
-ORACLE.** It documents instructions that exist on **no** backend at all. Confirmed absent
+> **ROOT CAUSE, FOUND: the MCP indexes a DIFFERENT pto-isa than we compile against.**
+>
+> | | MCP's doc corpus | what our kernels link against |
+> |---|---|---|
+> | remote | `gitcode.com/cann/pto-isa` | `github.com/hw-native-sys/pto-isa` |
+> | revision | `3b6fefaa` (branch `master`) | **`109c9f72`** (our pin) |
+> | `TDEINTERLEAVE` docs | present (`docs/isa/TDEINTERLEAVE.md`) | **absent -- 0 files** |
+>
+> The bundled `.mcp.json` passes no `docs_path`, and the server then **auto-clones pto-isa
+> into `~/.cache/npu-coding-mcp/pto-isa`** (README: "Zero-setup for PTO-ISA"). So the
+> instructions below are not "documented but unimplemented" in any deep sense -- they exist
+> in the revision the MCP read and not in the one we build against. **The MCP is extracting
+> correctly, from the wrong repository.**
+>
+> **Fixes, in order of value:** (1) pass an explicit `docs_path` pointing at the pinned
+> checkout (`npu-coding-mcp serve /path/to/pto-isa/docs`); (2) have the server report the
+> pto-isa revision it indexed so skew is detectable rather than silent; (3) until either
+> lands, keep grepping `include/pto/npu/` -- it is the only source that reflects the library
+> you actually compile against.
+
+**Working rule, unchanged in practice: THE MCP IS NOT AN EXISTENCE ORACLE.** It documents
+instructions absent from our pinned tree. Confirmed absent
 from the entire pinned `pto-isa` tree (zero occurrences in `include/`):
 
 | documented by MCP | occurrences in pto-isa |
