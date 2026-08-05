@@ -3094,6 +3094,28 @@ Each `(src,dst)` pair is its own `HardEvent` class with its own id pool, so both
 `evid(0, vid)` even when `MTE2->V`, `V->MTE2` and `V->MTE3` flags are already live in the
 same kernel (`COOK-§6.5`).
 
+> **AMENDMENT -- the direct `MTE3->MTE2` form above is only safe when the ring HAS Vec work.**
+> In a ring with **no Vec stage** (a pure DMA copy/permute: load -> store, nothing in
+> between), the direct DMA-to-DMA flag pairs do not hold the WAR guard on **AIV sub-block 1**.
+> Probed on `dav-c220`, T=16, 8 tokens/lane, each token filled with its own index:
+>
+> | | result |
+> |---|---|
+> | vid 0 | clean **100/100** across 10 different event-id bases |
+> | vid 1 | corrupt in **6 of those 10** -- the store read a slot the next load had refilled |
+> | onset | exactly the **3rd** item per lane -- the first ring wraparound |
+> | disjoint id ranges per pipe pair | did **NOT** fix it, so it is not an id collision |
+> | re-mediating both edges through `PIPE_V` | clean **70/70**, and every validation since |
+>
+> This is the `COOK-§6.7` signature: correct at small sizes, wrong at production, because the
+> pipelined path is never taken at small sizes. **For a ring with no Vec work, route both
+> edges through `PIPE_V`** (`MTE3->V->MTE2` and `MTE2->V->MTE3`) -- it costs nothing because
+> V is idle, and it is the same four pipe pairs the proven double-buffer recipe uses. The
+> mechanism is not established; only the reproduction and the fix.
+>
+> The measured 1.028x for the scoped form above stands -- that stage has a Vec chain between
+> load and store, which is the case the direct form is safe for.
+
 **Never simply delete the barrier.** Removing it has failed validation before
 (`dequant_swiglu_requant` attempt 1), and a per-item `PIPE_ALL` was silently protecting
 output tiles against a WAR hazard no rule mentioned (`deep_norm_backward` D6). Replace,

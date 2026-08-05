@@ -295,6 +295,11 @@ over-simple form of this rule:**
 * **"3x pessimization below L2" does not generalize.** The measured cost of a wrong alias
   there was **4%**, not 3x. The 0.33x figure in the table above is one access pattern
   (a tight re-read loop over a small footprint), which is the worst case, not the typical one.
+* **The alias is for READS. A never-re-read WRITE is not a candidate.** On
+  `moe_token_permute`, aliasing the 128 MiB output -- written once, never re-read, the
+  textbook "no reuse" tensor -- was a **LOSS**, while aliasing the read-side `tokens` was
+  worth **1.225x** (alias-off control, reproduced 1.23-1.54x at all 16 contract points).
+  The rule is about avoiding a useless L2 *fill* on a streamed read, not about write traffic.
 * **Aliasing MORE tensors can destroy a winning alias set.** Adding two redundancy-2.0
   tensors to a winning redundancy-1.0 set took 1.230x down to 1.039x. Alias the
   *never-re-read* tensors only, and re-measure after each addition rather than assuming the
