@@ -529,3 +529,25 @@ region is much shorter than the 256 MiB L2 flush, 60 reps is not enough: the sam
 `1.540x [1.271, 1.757]` at 60 reps and `0.903x [0.897, 0.908]` at 200 — the point estimate
 crossed parity. Use >=200 reps for kernels under ~100 us, and treat a CI wider than a few
 percent as "not yet measured" rather than as a result.
+
+### The ratio direction MUST be unmissable
+
+Two runs in the same suite reported `1.4975` (meaning **we are slower**) and `18.590x`
+(meaning **we are faster**). Both were internally documented; neither was readable at a
+glance, and a reader comparing them across cases is silently misled about which way the
+suite is going.
+
+**Every reported ratio MUST be accompanied by, in the same row or object:**
+
+1. **both raw medians**, `ours_us` and `vendor_us` -- these are unambiguous under any
+   convention and are what a reader should be able to fall back on;
+2. an explicit **`ratio_definition`** string naming the numerator and denominator;
+3. a **plain-language verdict**: `"we are 2.12x FASTER"` / `"we are 1.50x SLOWER"`.
+
+Prefer the project convention -- **`ours / vendor`, lower is better, `< 1` beats the
+vendor** -- but the convention alone is not the safeguard. The safeguard is that the raw
+medians and the worded verdict are always present, so the direction survives being copied
+into a summary, a table, or a paper.
+
+**Never report a bare ratio in a summary.** A number like `1.5` with no latencies beside it
+is not a result; it is a coin flip about which way the comparison ran.
