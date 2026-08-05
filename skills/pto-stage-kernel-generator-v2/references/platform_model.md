@@ -282,9 +282,22 @@ address range touched:
 | L2-bypass | 1539 | 1533 | 1528 | 1530 |
 | effect | **0.33x LOSS** | 0.45x LOSS | 0.92x | **1.66x WIN** |
 
-**Use bypass only when the streamed working set exceeds L2 (~150 MB on this part).** Below
-that it ranges from mildly negative to a 3x pessimization — it is not a free win to sprinkle
-on every load.
+**The discriminator is whether the operand is already resident in L2 WHEN IT IS READ — not
+its size.** Two campaign cases settle this, and they point opposite ways at similar
+footprints:
+
+| case | footprint | state at read | alias |
+|---|---|---|---|
+| `quant_matmul` | 6-45 MB | L2-**resident** (re-read operands) | **0.45-0.54x LOSS** |
+| `group_norm_silu` | 67.5 MB | **cold** (streamed once) | **1.23x WIN**, bit-identical |
+| `group_norm_silu`, L2-warm | 67.5 MB | warm | neutral |
+
+An earlier version of this section led with "only above ~150 MB". That is **wrong** and was
+falsified from both directions: a 45 MB resident operand loses, a 67.5 MB cold operand wins.
+Size only ever worked as a proxy for residency, and it is a bad one.
+
+**So: alias an operand iff it is read cold and not re-read. Confirm with an alias-off
+control on the same run — every case that has run one has changed somebody's mind.**
 
 **Two refinements measured on a second operator (`flash_attention_grad`), which correct the
 over-simple form of this rule:**

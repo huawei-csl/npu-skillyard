@@ -597,3 +597,22 @@ output to itself, so a consistently-wrong kernel passes it.
 
 This is the same failure mode as the benchmark null control: a check that only compares a thing
 to itself cannot see a fault that affects both sides equally.
+
+### A null control needs a WIDTH check, not just "the CI contains 1.0"
+
+"Null control valid iff its 95% CI contains 1.0" is necessary but **not sufficient**. A
+contended or noisy row produces a CI wide enough to contain 1.0 *while the two identical arms
+differ by 30%* — the check passes precisely because the measurement is bad.
+
+**Require both:**
+1. the CI contains 1.0, **and**
+2. the point estimate is within a few percent of 1.0 **and the CI is narrow** (a practical
+   bar: width <= ~3% of the estimate).
+
+A wide CI is not evidence of validity; it is evidence that the row is not yet measured. Widen
+reps until the interval tightens, or mark the row not reportable.
+
+**Related harness bug, worth checking for in any bootstrap you write:** pairing the two arms'
+**sorted** samples elementwise before resampling destroys the very variation the interval is
+supposed to capture. It spuriously rejected 3 of 5 rows in one run. Pair by *rep index* (the
+interleaved order they were measured in), never by rank.
