@@ -624,3 +624,19 @@ reps until the interval tightens, or mark the row not reportable.
 **sorted** samples elementwise before resampling destroys the very variation the interval is
 supposed to capture. It spuriously rejected 3 of 5 rows in one run. Pair by *rep index* (the
 interleaved order they were measured in), never by rank.
+
+### `block_dim` is a VALIDATION axis, not just a tuning knob
+
+A `masked_softmax` kernel passed **49/49 at `block_dim=24`** and was **broken at
+`block_dim=1`**. The bug was a slot-recycling race that only manifests when a lane owns more
+than one work item -- at the default `block_dim` every lane owned exactly one, so the race
+could not occur and the gate reported a clean sweep.
+
+**Validate at a LOW `block_dim` as well as the production one**, chosen so lanes own several
+items (`items_per_lane >= 3`, rule 31). `block_dim=1` is the sharpest setting and costs one
+extra run per case.
+
+This is the fourth distinct instance of one failure: **a validation sweep that does not vary a
+dimension cannot see a bug that lives along it.** The others were single-run validation
+(intermittent corruption), determinism checking (inter-item races), and the within-arm null
+control (cross-arm interference). When a gate passes everywhere, ask which axis it never moved.

@@ -3058,7 +3058,27 @@ Cube L0C:   acc_bytes ≤ 131072 (A2/A3) or 262144 (A5)
 Always emit `static_assert` guards for computed budgets. → COOK-§4
 
 
-## COOK-§6.8: prefer a SCOPED barrier to `pipe_barrier(PIPE_ALL)` -- measured
+## COOK-§6.8: `pipe_barrier(PIPE_ALL)` is over-used -- but the obvious replacement is UNSAFE
+
+> **RETRACTION (this section previously recommended the direct `MTE3->MTE2` guard; do not
+> use it).** Two independent runs contradicted it:
+>
+> * **The safety claim failed.** A `masked_softmax` kernel validated **49/49 at
+>   `block_dim=24`** and was **broken at `block_dim=1`**. The in-place compute-and-store slot
+>   needs a *separated* token; the direct `MTE3->MTE2` form does **not** hold beyond one item
+>   per lane -- **even with Vec work in the ring**, which is exactly the case the earlier
+>   amendment declared safe. (`moe_token_permute` had already shown it failing on AIV
+>   sub-block 1 in a ring with no Vec work.)
+> * **The performance claim did not reproduce.** The original 1.028x re-measured as
+>   **1.003x** on another kernel -- noise.
+>
+> **So the corrected guidance is conservative: use the `COOK-§6.7` pipe-role split for slot
+> recycling, and do NOT hand-roll direct DMA-to-DMA tokens.** The census observation below
+> stands and is still worth knowing, but at a measured 0.3-2.8% the upside does not justify
+> hand-rolling a guard whose failure mode is *silent corruption that appears only at
+> production item counts*. Change a barrier only with a measurement AND a `block_dim` sweep.
+
+### The census observation (still valid)
 
 `pipe_barrier(PIPE_ALL)` drains **every** pipe, so nothing of the next work item can start
 until the current one has fully retired. The vendor almost never does this: a census of the

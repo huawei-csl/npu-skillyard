@@ -700,6 +700,8 @@ from the entire pinned `pto-isa` tree (zero occurrences in `include/`):
 | `TFUSEDMULADDRELU` | 0 |
 | `TPairReduceSum` | 0 |
 | `SET_QUANT_SCALAR` | 0 -- the real path is `TSTORE(dst, acc, uint64_t preQuantScalar)` |
+| `TADDC` | 0 NPU backend files (present in the generic header, cost model, CPU sim and README -- so it *compiles* for the CPU simulator and cannot run on device) |
+| `TSUBC` | 0 NPU backend files, same shape |
 
 `documented: true` means "there is a doc page", not "you can call it". **Seven and counting**, found by three independent runs. **Before building a
 design around any instruction you have not already used, grep the pinned `pto-isa` tree for
