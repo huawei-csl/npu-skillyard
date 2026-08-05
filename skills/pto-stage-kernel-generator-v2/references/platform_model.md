@@ -681,8 +681,9 @@ from the entire pinned `pto-isa` tree (zero occurrences in `include/`):
 | `TFUSEDMULADD` | 0 |
 | `TFUSEDMULADDRELU` | 0 |
 | `TPairReduceSum` | 0 |
+| `SET_QUANT_SCALAR` | 0 -- the real path is `TSTORE(dst, acc, uint64_t preQuantScalar)` |
 
-`documented: true` means "there is a doc page", not "you can call it". **Before building a
+`documented: true` means "there is a doc page", not "you can call it". **Seven and counting**, found by three independent runs. **Before building a
 design around any instruction you have not already used, grep the pinned `pto-isa` tree for
 it.** One grep; it has now cost two separate runs a redesign — one of them lost the whole
 radix-select path and had to fall back to a merge sort.

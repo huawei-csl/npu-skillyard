@@ -55,7 +55,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-BUDGET = 15
+BUDGET_DEFAULT = 15
+
+
+def _budget(doc, att):
+    """Budget comes from the JSON, never from a constant in this file.
+
+    A hard-coded budget silently CLIPS a campaign that ran longer: one run made 24
+    attempts against a nominal 15 and lost attempts 11-24 off the chart. And the
+    constant goes stale every time the mandate changes. Take the declared budget if
+    the campaign wrote one, and always stretch to cover the attempts actually made,
+    so nothing measured is ever dropped.
+    """
+    declared = doc.get("budget") or doc.get("attempt_budget") or BUDGET_DEFAULT
+    highest = max((a.get("n") or 0) for a in att) if att else 0
+    return max(int(declared), int(highest))
 KEPT_C, DROP_C, LINE_C = "#2f5d3a", "#a33", "#4a6fa5"
 BAD_C, DIAG_C = "#c1121f", "#888"
 
@@ -112,6 +126,7 @@ def plot(doc, out_png):
               % (out_png, len(unmeasured)), file=sys.stderr)
         return False
 
+    budget = _budget(doc, att + unmeasured)
     stage = doc.get("stage", "stage")
     arch = doc.get("archetype", "?")
     xs = [a["n"] for a in att]
@@ -176,15 +191,15 @@ def plot(doc, out_png):
                 va="bottom", ha="left", fontsize=9, color="#333")
 
     # Always show all 15 slots: an early stop should be VISIBLE as unused budget.
-    ax.set_xlim(0.4, BUDGET + 0.6)
-    ax.set_xticks(range(1, BUDGET + 1))
+    ax.set_xlim(0.4, budget + 0.6)
+    ax.set_xticks(range(1, budget + 1))
     # Diagnostics are measurements, not budget-consuming attempts -- counting them
     # printed "11/10" on a run that had made exactly 10 real attempts plus a probe.
     used = sum(1 for d in diag if not d) + len(unmeasured)
-    if used < BUDGET:
-        ax.axvspan(used + 0.5, BUDGET + 0.6, color="#bbb", alpha=.14, zorder=0)
-        ax.annotate("budget not used (%d of %d)" % (used, BUDGET),
-                    xy=((used + 0.5 + BUDGET + 0.6) / 2, 0.965),
+    if used < budget:
+        ax.axvspan(used + 0.5, budget + 0.6, color="#bbb", alpha=.14, zorder=0)
+        ax.annotate("budget not used (%d of %d)" % (used, budget),
+                    xy=((used + 0.5 + budget + 0.6) / 2, 0.965),
                     xycoords=("data", "axes fraction"), ha="center",
                     fontsize=8.5, color="#666")
 
@@ -193,7 +208,7 @@ def plot(doc, out_png):
         for a in unmeasured:
             ax.plot(a["n"], top, marker="$?$", ms=11, color="#777", zorder=3)
         warn.append("? = attempt produced no measurement (build or validation aborted)")
-    ax.set_xlabel("optimization attempt  (budget %d)" % BUDGET)
+    ax.set_xlabel("optimization attempt  (budget %d)" % budget)
     ax.set_ylabel("latency ratio  ours / vendor   (lower is better)")
     ax.set_title("%s -- optimization campaign  [%s]" % (stage, arch),
                  fontsize=12.5, pad=30, loc="left")
@@ -202,8 +217,8 @@ def plot(doc, out_png):
     sub = "stop: %s" % stop
     if stop == "hardware_limit":
         sub += "  --  gate %s: %s" % (doc.get("gate", "?"), doc.get("gate_value", "?"))
-    elif used < BUDGET and arch == "mixed":
-        warn.append("PROCESS FAILURE: a mixed stage must run all %d attempts" % BUDGET)
+    elif used < budget and arch == "mixed":
+        warn.append("PROCESS FAILURE: a mixed stage must run all %d attempts" % budget)
     lines = textwrap.wrap(sub, 110)
     ax.text(0.0, 1.012, "\n".join(lines), transform=ax.transAxes, ha="left",
             va="bottom", fontsize=8.5, color="#555", linespacing=1.4)
@@ -230,7 +245,7 @@ def plot(doc, out_png):
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
-    print("  wrote %s  (%d/%d attempts, stop: %s)" % (out_png, used, BUDGET, stop))
+    print("  wrote %s  (%d/%d attempts, stop: %s)" % (out_png, used, budget, stop))
     return True
 
 
