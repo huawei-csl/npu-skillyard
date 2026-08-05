@@ -3056,3 +3056,45 @@ Cube L0C:   acc_bytes ≤ 131072 (A2/A3) or 262144 (A5)
 ```
 
 Always emit `static_assert` guards for computed budgets. → COOK-§4
+
+
+## COOK-§6.8: prefer a SCOPED barrier to `pipe_barrier(PIPE_ALL)` -- measured
+
+`pipe_barrier(PIPE_ALL)` drains **every** pipe, so nothing of the next work item can start
+until the current one has fully retired. The vendor almost never does this: a census of the
+shipped AscendC kernels finds `PIPE_ALL` in **0.3%** of files (19 of ~5900) against 1198
+using a scoped `PipeBarrier<pipe>` -- while **95% of our generated kernels use it**
+(105 of 111, 417 occurrences). See `references/vendor_idiom_census.md`.
+
+**Measured on a real stage** (`dequant_swiglu_requant`, two end-of-item `PIPE_ALL` barriers
+replaced), validation PASS, same device, serialized runs:
+
+| | time | GB/s |
+|---|---|---|
+| `pipe_barrier(PIPE_ALL)` | 46.06 us | 204.9 |
+| scoped `MTE3->MTE2` + `MTE3->V` | **44.81 us** | 210.6 |
+
+**1.028x.** Real, safe, and modest. Do not expect more than low single digits on a
+memory-bound stage whose barriers sit at the end of an item; expect more where a `PIPE_ALL`
+sits *inside* a hot loop, and less where the stage is already hidden behind another engine.
+
+**The replacement, not the deletion.** Name the actual hazard and guard exactly it. At an
+end-of-item seam the hazards against the outstanding `TSTORE` are both WAR:
+
+```cpp
+// MTE3 -> MTE2 : the next item's load must not overwrite UB the store is still reading
+// MTE3 -> V    : the next item's first Vec op must not overwrite that tile   (D6)
+set_flag(PIPE_MTE3, PIPE_MTE2, (event_t)evid(0, vid));
+wait_flag(PIPE_MTE3, PIPE_MTE2, (event_t)evid(0, vid));
+set_flag(PIPE_MTE3, PIPE_V,    (event_t)evid(0, vid));
+wait_flag(PIPE_MTE3, PIPE_V,   (event_t)evid(0, vid));
+```
+
+Each `(src,dst)` pair is its own `HardEvent` class with its own id pool, so both may reuse
+`evid(0, vid)` even when `MTE2->V`, `V->MTE2` and `V->MTE3` flags are already live in the
+same kernel (`COOK-§6.5`).
+
+**Never simply delete the barrier.** Removing it has failed validation before
+(`dequant_swiglu_requant` attempt 1), and a per-item `PIPE_ALL` was silently protecting
+output tiles against a WAR hazard no rule mentioned (`deep_norm_backward` D6). Replace,
+then re-validate.
