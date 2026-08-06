@@ -922,3 +922,25 @@ is relative to host enqueue, so sub-50 us rows are the exposed ones -- the same 
 already near the dispatch floor. When a fast kernel is compared against a slower vendor op,
 the *faster* arm starves proportionally more, which **understates your own speedup**. Both
 runs that hit this found the fix moved the result in their favour.
+
+
+### The null control must run in the TREATMENT ARM'S SLOT
+
+A null control that runs the unchanged kernel in a **third** buffer is blind to a
+**buffer-slot bias**, and slot bias is real: `rope` measured **slot 2 as 0.8-1.5% faster
+regardless of which kernel occupied it**. The giveaway was a swapped-arm test in which the
+ratio **did not invert** -- a genuine kernel effect reverses when you swap the arms; a slot
+effect does not.
+
+That bias retracted a claimed **"+6% from kTT=108/109"** and demoted two further attempts to
+noise.
+
+**Required:** run the null control with the unchanged kernel **in the slot the treatment arm
+occupies**, not in a spare one. And when an effect is small, **swap the arms and confirm the
+ratio inverts.** If it does not invert, you are measuring the harness, not the kernel.
+
+This is the fourth distinct instance of the same structural blind spot -- after the within-arm
+control, host contention, and queue starvation. State it as a standing habit rather than a
+list of special cases: **any control that holds the suspect factor constant across both arms
+cannot see that factor.** Before trusting a control, name what it varies, and check that the
+thing you are worried about is actually one of those things.

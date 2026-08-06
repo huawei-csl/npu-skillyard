@@ -988,3 +988,43 @@ finished; after aliasing the floor moved and the kernel was **24.5% above** it. 
 
 "We are at the roofline" is the single easiest wrong conclusion to reach, because it is
 comfortable and arrives with a number attached. Ask which path the number came from.
+
+
+## PLAT-SS-LineReuse -- "read once" is about CACHE LINES, not elements
+
+This is the correction that makes the previous L2-alias guidance usable. The bypass decision
+was framed around whether a *tensor* is re-read. That is the wrong unit.
+
+`rope` aliased `q`/`k` -- read exactly once, element for element, the textbook "wasted fill"
+case -- and measured **1.35x SLOWER** (340.77 vs 251.44 us, null control valid). In the same
+kernel it aliased the `cos`/`sin` tables -- small and heavily re-read, the textbook "do NOT
+alias" case -- and measured **+2.5% / +1.8% FASTER**, 4 replicates, bit-identical output.
+
+Both heuristics were exactly backwards, for one reason:
+
+* **`q`/`k` rows are 256 B (D=128 fp16). A row does not fill an L2 line by itself** -- it
+  shares that line with the adjacent head, which is read on the **next `n` iteration**. Every
+  element is read once; every *line* is read twice. Bypassing throws away a fill that was
+  about to be used.
+* **`cos`/`sin` are hot WITHIN a lane but never shared ACROSS lanes.** Each lane re-reads its
+  own copy from its own L1/UB; L2 residency buys nothing between lanes, so the fill is pure
+  cost.
+
+**The question to ask is not "is this tensor re-read?" but:**
+
+1. **What is the access granule vs the 128 B line?** If a logical row is smaller than -- or
+   not aligned to -- the line, neighbouring rows share lines, and an "each element once" walk
+   is a *multi-touch line* walk. Look at the iteration order: is the line's other occupant
+   read soon, by this lane?
+2. **Is the reuse WITHIN a lane or ACROSS lanes?** Only across-lane reuse needs L2. Within-lane
+   reuse is served by L1/UB and gains nothing from an L2 fill.
+
+This subsumes the earlier read/write framing: `deep_norm`'s `y` write benefited because
+bypassing stopped it evicting the read streams; `moe_token_permute`'s output did not, because
+nothing needed protecting. In every case the real question is **what the L2 line is worth to
+somebody else**, not how many times this tensor touches it.
+
+**Practically: probe every tensor in both directions, in the final configuration.** `rope`,
+`deep_norm` and `rotary_mul` all found tensors whose alias sign was the opposite of the
+heuristic, and `rotary_mul` found one (`r1`/`r2`) that was 1.018x FASTER in isolation and
+1.015x SLOWER on top of the winning alias -- **isolated readings do not compose.**
