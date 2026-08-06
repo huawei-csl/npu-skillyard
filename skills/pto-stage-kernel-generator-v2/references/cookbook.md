@@ -3539,3 +3539,46 @@ denormal-flush behaviour collapses them silently.
 
 **Do not use `TCMPS` for integer comparison on this architecture at any width.** fp32 is the
 only source type it handles correctly.
+
+
+## COOK-§6.23 -- SUB-BYTE: `pto::int4b_t` and `vconv_f162s4` exist; the route is fp16
+
+PTO has **no int4 arithmetic**, but it does have the type and the conversion:
+
+* `pto::int4b_t` -- the packed 4-bit tile element type.
+* `vconv_f162s4` -- fp16 -> int4 conversion.
+
+So a sub-byte pack is `TLOAD int32 -> TCVT fp16 -> TCVT int4 -> TSTORE`. Going *through fp16*
+is the supported path; there is no int32 -> int4 direct conversion. Verified end-to-end:
+**0 differing bytes out of 66,324,480** against both an independent CPU reference and the
+vendor, reaching **1365 GB/s = 85.3% of the analytic roofline**.
+
+**Measured packing semantics on A2** (byte-level probe against the vendor, not inferred from
+shapes):
+
+* **Element `2j` occupies the LOW nibble.** `w[0,0]=7 -> 0x07`, `w[0,1]=7 -> 0x70`; a 16-code
+  ramp gives `0x10 0x32 0x54 0x76 0x98 0xba 0xdc 0xfe`.
+* **4-bit two's complement**: `-8 -> 0x8`, `-7 -> 0x9`, `-2 -> 0xe`, `-1 -> 0xf`.
+* **Packing axis is N**, provable only from the byte layout -- a lit *column* gives bytes
+  `0, 8, 16, ...`, a lit *row* gives `0..7`. Shape arithmetic cannot distinguish these.
+* Out of range the vendor **truncates mod 16** (`100 -> 0x4`); it does **not** clamp.
+
+**Constraint:** the smallest legal packed `TSTORE` is 8 int32 words, so `K*N % 64 == 0`. Shapes
+the vendor accepts (e.g. `K=3, N=8`) are therefore out of reach -- lock and disclose rather
+than silently rounding.
+
+**`msprof` cannot simulate `vconv_f162s4`** -- there is no sim path for int4 kernels, so the
+advisory sim stage is unavailable for this family. Go straight to the real-NPU gate.
+
+## COOK-§6.24 -- Two more sync traps confirmed on a loop BACK EDGE
+
+* **`pipe_barrier(PIPE_V)` gives MTE2 no dependency on the PREVIOUS ITERATION's reads.** A
+  kernel passed every shape and every semantic probe and still failed whenever a lane took more
+  than one chunk: **27,726 bad bytes at `block_dim=1`, 0 at `block_dim=40/48`** (more lanes than
+  chunks, so no lane ever looped). `block_dim` is what exposed it. This is `COOK-§6.17` on the
+  loop back edge -- and it is the second case where a race hid behind a fortunate lane count.
+* **`EX-§2` teaches `pipe_barrier(PIPE_ALL)`.** Narrowing it per A2/S11 without adding the
+  explicit `V -> MTE2` flag pair **silently loses the back edge**. If you narrow a `PIPE_ALL`,
+  enumerate every dependency it was covering.
+* **Library defect:** `TShiftCheck` (`TBitwiseSOp.hpp`) asserts `dstValidRow == srcValidCol` --
+  comparing a row extent against a column extent. Wrong dimension.

@@ -1284,3 +1284,45 @@ wall-clock cross-validation, exactly as for the concurrent-engine case.
 **Rule of thumb now covering all three:** before trusting a paired ratio, confirm (a) the arms
 serialize, (b) each arm's own median is stable across partners, and (c) the resulting rate is
 physically possible.
+
+
+### SET `TASK_QUEUE_ENABLE=0` -- torch_npu's async queue REORDERS against ctypes launches
+
+**This is a precondition for the output-poisoning rule above, and for any mixed
+ctypes/torch A/B.**
+
+torch_npu dispatches its ops through an asynchronous task queue. A raw ctypes `<<<>>>` kernel
+launch does not go through that queue. They can therefore **reorder**:
+
+> A `fill_` enqueued **before** the launch landed **after** it -- **8/8 runs**, surviving both
+> `torch.npu.synchronize()` and a 0.5 s sleep.
+
+Corroborated by torch_npu itself: `torch_npu/__init__.py` sets `TASK_QUEUE_ENABLE = '0'` on
+interactive interfaces and warns *"Do not set it to 1 to prevent some unknown errors."*
+
+**Consequences, both silent:**
+
+* **Output poisoning breaks.** `out.fill_(nan)` can land *after* the kernel writes, wiping a
+  correct result (false failure) -- or non-deterministically, making the check flaky.
+* **`npu.Event` can bracket the wrong work**, since the events are torch-side and the kernel is
+  not.
+
+**Set `TASK_QUEUE_ENABLE=0` in the environment before importing `torch_npu`**, in every
+validation and benchmark harness that launches kernels via ctypes. Record it in the run
+metadata so a reader knows the ordering regime the numbers were taken in.
+
+### L2 alias directions are NOT ADDITIVE -- probe the combination, not just each side
+
+Measured on one kernel, same binary, runtime flags:
+
+| aliased | effect |
+|---|---|
+| OUT only | **1.2% SLOWER** |
+| IN only | **1.857x** |
+| **IN + OUT** | **2.059x** |
+
+The output alias is a small *loss* alone and a clear *gain* on top of the input alias. Neither
+"probe each tensor" nor "sum the wins" predicts that.
+
+Combined with the alias-first ordering rule: **land the input alias, then re-probe every other
+tensor in that configuration**, including ones already rejected in isolation.
