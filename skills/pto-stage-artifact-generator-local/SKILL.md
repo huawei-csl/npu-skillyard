@@ -758,3 +758,60 @@ reported as a speedup that will not reproduce.
 **Corollary for the stop gate.** "We are within 1% of the floor" is not a measurement at this
 resolution either -- it is inside the same band. Claim a hardware limit from a margin larger
 than your replication spread, or say the margin is not resolvable.
+
+
+### Contention: a null control cannot see it, and the arms are NOT inflated equally
+
+A concurrent timed benchmark in another case inflated a batch mid-campaign. Measured on the
+same kernel, same shape, ~1 hour apart, with the null control valid at 0.17-0.62% throughout:
+
+```
+clean    ours 258 us   vendor 426 us
+CONTENDED ours 312 us   vendor 711 us    <- ours x1.21, vendor x1.67
+clean    ours 258 us   vendor 427 us
+```
+
+Two things matter here.
+
+**(1) The null control is blind to it.** It is an ours-vs-ours ratio measured inside the same
+contended window, so a slowdown affecting both sides cancels. This is the same structural blind
+spot as within-arm controls generally: *a check that compares a thing to itself cannot see a
+fault affecting both sides equally.*
+
+**(2) The arms are NOT inflated equally**, so ratios do not survive either. The batch above
+claimed `bd=16` was **1.09x faster**; measured clean it is **1.11x slower**. Whichever arm has
+more host-side work per device microsecond stretches more.
+
+**Required: an ABSOLUTE ANCHOR, re-checked per batch.** Time one fixed reference configuration
+(the shipped kernel at the production shape) at the start and end of every benchmarking session.
+If the anchor moves more than a few percent between checks, the whole batch is contaminated --
+discard and re-measure. A null control tests for *bias within* a comparison; the anchor tests
+whether *the machine itself* was the same. You need both.
+
+**Diagnose contention by cause, not by coincidence.** In the run that found this, the blame was
+put on a 21-hour orphaned `--sim-mode` process at 574% CPU. That process was real, and it was
+leaked waste -- but on a 192-core host it is **3% of the machine**, and it was running
+continuously across the clean measurements *and* the contended one. A constant cannot explain a
+transient. The actual cause was a second case benchmarking concurrently. Before blaming a
+process you happen to notice, check that it was **absent** when the measurement was clean.
+
+**Never leave a sim process unbounded.** Run every `--sim-mode` / msprof invocation under
+`timeout 1800`, and reap it -- the orphan above had been reparented to init after its pipeline
+exited, so nothing was left to kill it.
+
+### Scale the null-control gate to the effect size
+
+The gate "null-control CI must contain 1.0" is calibrated for small effects and is wrong for
+large ones. On a **quiet** host, a re-check measured a null control of `0.9984`,
+CI `[0.9978, 0.9996]`, width `0.18%` -- technically INVALID because the CI excludes 1.0, on a
+row claiming **3.63x**. A 0.16% systematic bias cannot threaten a 263% effect.
+
+Judge the null control **relative to the claimed effect**:
+
+* Null-control bias `>= 1/3` of the claimed effect -> **row void**, re-measure.
+* Bias `>= 1/10` of the claimed effect -> report the row **with the bias stated**.
+* Bias `< 1/10` -> the row stands; still record the null control.
+
+This pairs with the replication rule above: a **sub-3% effect needs more** than a valid null
+control (independent replication), and a **multi-x effect needs less** (a sub-1% bias is noise
+against it). One fixed threshold serves neither.
