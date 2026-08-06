@@ -724,6 +724,28 @@ modify kernels, re-validate, or re-benchmark here.
    last_error; locked-dim contract amendments; sim advisory-mismatches; optimizer
    markers/floors; fusion fallbacks), how to REPRODUCE, and the final directory layout.
 
+### Phase 8 completion gate (NOT optional, NOT overridable by the invoking brief)
+
+A run is **INCOMPLETE** until both of these exist **on disk**:
+
+* `<output_dir>/reports/report.md`
+* `<output_dir>/README.md`
+
+**Summarizing your findings in your final message is NOT a substitute for writing these
+files.** Your final message is read once and discarded; these files are the run's only
+durable record and the only artifact a human or a later run can cite.
+
+This holds even when the invoking brief is terse, focuses on something else, or says
+"report the contract table" / "tell me the results" -- that language means *write the
+report AND then also summarize*. It never means *skip the files*. If the brief and this
+gate appear to conflict, the gate wins. Write the files, then summarize.
+
+It also holds for a FAILED or PARTIAL run: a run that produced no working kernel still
+writes both files, recording what was tried, what blocked it, and what the next step would
+be. Those are often the most useful reports in the tree.
+
+Before you finish, `ls` both paths and confirm they exist.
+
 ## Output
 
 Write a `pipeline_results.json` summary (alongside the Phase 8 README). When the
