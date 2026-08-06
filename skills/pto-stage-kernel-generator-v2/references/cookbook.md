@@ -3237,3 +3237,26 @@ belongs OUTSIDE any `#ifdef` that a variant can disable.
 
 This is the sixth instance of the project's recurring blind spot: **a validation sweep that
 never varies a dimension cannot see a bug that lives along it** -- here, tile width.
+
+
+## COOK-§8.15 CORRECTION: the duplicate-the-op marginal-cost probe gives FALSE NEGATIVES
+
+The marginal-cost probe -- duplicate an operation, measure the delta, conclude what it costs
+-- returned **"every op is free" (0.6-3.1%)** on a kernel where the ops were emphatically not
+free. It was wrong **twice, for two different reasons**:
+
+* **Duplicated Vec ops are compiler-elidable.** The second copy has no observable effect, so
+  it is removed and you measure nothing.
+* **A duplicated `TLOAD` targeting the next block acts as a PREFETCH.** It does not add cost;
+  it *hides* cost, and can make the probe read faster than the baseline.
+
+Both failures point the same way -- toward "this resource is free" -- which is the most
+expensive wrong answer available, because it retires the correct lever.
+
+**Use an engine-nulled ablation instead: REMOVE the work and keep every flag, barrier and
+descriptor.** Deleting is not elidable and cannot prefetch. It got the same kernel right
+immediately, and it is the same construction as the noop-floor probe already used elsewhere
+in this cookbook.
+
+If you must duplicate rather than remove, make the duplicate observable (write to a distinct
+live destination) and point any duplicated load at data the kernel will not touch again.

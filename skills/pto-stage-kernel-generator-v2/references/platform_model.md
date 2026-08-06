@@ -292,6 +292,18 @@ footprints:
 | `group_norm_silu` | 67.5 MB | **cold** (streamed once) | **1.23x WIN**, bit-identical |
 | `group_norm_silu`, L2-warm | 67.5 MB | warm | neutral |
 
+**The cleanest demonstration, one operator, one kernel, footprint scaling with the batch
+dimension** (`nsa_select_attention`, alias vs alias-off on the same source):
+
+| BS1 | cached | aliased | alias |
+|---|---|---|---|
+| 1 | 158.9 us | **109.6 us** | **1.480x FASTER** |
+| 4 | 342.1 us | 327.1 us | 1.053x faster |
+| 8 | 604.8 us | 643.6 us | **1.049x SLOWER** |
+
+Nothing about the code changes across those rows. The alias flips sign as the working set
+stops being cold, which is the rule stated as plainly as it can be.
+
 An earlier version of this section led with "only above ~150 MB". That is **wrong** and was
 falsified from both directions: a 45 MB resident operand loses, a 67.5 MB cold operand wins.
 Size only ever worked as a proxy for residency, and it is a bad one.
@@ -942,7 +954,9 @@ never-re-read input moved the floor to **1305 GB/s**, and the kernel gained **1.
 against an alias-off control built from the same source.
 
 **A ceiling measured on the cached path will make an aliased kernel look finished when it is
-30% short.** So:
+30% short.** Independently confirmed on a second operator the next run: before aliasing,
+`nsa_select_attention` sat within **4.7% of its cached floor** and would have been declared
+finished; after aliasing the floor moved and the kernel was **24.5% above** it. So:
 
 1. Decide the alias FIRST (`PLAT-§L2Bypass`).
 2. Re-measure the floor **through the same path** -- same alias decision, same access
