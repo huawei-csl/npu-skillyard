@@ -930,3 +930,26 @@ Either zero the pad explicitly after the load, or size the valid extent to a mul
 `TCMPS` writes its mask rounded up to 64 lanes; `TSELS` writes exactly `validCol`. Splitting a
 tile mid-width between the two therefore corrupts the tail of the earlier partition unless the
 split is **64-aligned**. Align mid-tile splits to 64, or place the `TCMPS` partition last.
+
+
+## PLAT-§WrongCeiling: measure the floor on the PATH THE KERNEL WILL RUN ON
+
+A measured ceiling is only a ceiling for the path it was measured on. `gelu` probed a copy
+floor of **890.0 GB/s** and found the vendor's own `copy_` hit **exactly the same 890.0** --
+so "both arms are at the memory roof, this is parity" was available, self-consistent, and
+**wrong**. 890 is the **L2 fill rate**, not the achievable rate: aliasing the cold,
+never-re-read input moved the floor to **1305 GB/s**, and the kernel gained **1.382x**
+against an alias-off control built from the same source.
+
+**A ceiling measured on the cached path will make an aliased kernel look finished when it is
+30% short.** So:
+
+1. Decide the alias FIRST (`PLAT-§L2Bypass`).
+2. Re-measure the floor **through the same path** -- same alias decision, same access
+   pattern, same read/write mix (`PLAT-§RWSerial`: total traffic, never `max()`).
+3. Only then compare, and re-tune everything else against that floor -- `gelu`'s `block_dim`
+   optimum moved 48 -> 24 after aliasing, and arithmetic that had been hidden re-appeared.
+   Tuning before the alias measures the wrong machine.
+
+"We are at the roofline" is the single easiest wrong conclusion to reach, because it is
+comfortable and arrives with a number attached. Ask which path the number came from.

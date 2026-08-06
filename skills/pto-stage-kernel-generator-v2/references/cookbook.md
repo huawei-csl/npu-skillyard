@@ -3209,3 +3209,31 @@ me on the strength of the MCP page -- which says *"ND fractal (`isRowMajor` and
 which does **not** require `isRowMajor` on the src. **The MCP constraint text is wrong here.**
 When a run's PROBED claim conflicts with a doc, the implementation is the tiebreaker, not the
 doc. Both had to be checked; only one was authoritative.
+
+
+## COOK-§6.10: NEVER remove `pipe_barrier(PIPE_V)` between dependent Vec tile ops
+
+Three independent campaign runs have now tried this as an optimization. All three found it
+unsafe, and the failure mode gets harder to detect each time:
+
+| run | what removing it did |
+|---|---|
+| `dequant_swiglu_requant` | 1.011x faster and **wrong on all 96 runs** |
+| `masked_softmax` / `top_k_top_p` | wrong **and** ~10% slower -- it is not even a speed win |
+| `gelu` | 1.038x faster, **passed the entire validation suite AND an exhaustive sweep of the whole finite fp16 domain**, and is silently wrong at tile widths <= 768 |
+
+The `gelu` case is the one to remember. It was correct at every width the suite happened to
+use, and only surfaced because a *later, unrelated* optimization started producing narrower
+tiles. An exhaustive value-domain check did not catch it, because the bug lives along the
+**tile width** axis, not the value axis.
+
+**Treat the barrier as load-bearing and do not spend an attempt on removing it.** If a
+profile says it costs real time, change the tiling so fewer are needed -- do not delete them.
+
+Two compounding hazards from the same run: two *individually safe* changes (aliasing the
+output tile onto a scratch tile, and removing a barrier) combined into an intra-Vec WAR, so
+**validate combinations, not just each change against the baseline**; and a mandatory barrier
+belongs OUTSIDE any `#ifdef` that a variant can disable.
+
+This is the sixth instance of the project's recurring blind spot: **a validation sweep that
+never varies a dimension cannot see a bug that lives along it** -- here, tile width.
