@@ -1028,3 +1028,24 @@ somebody else**, not how many times this tensor touches it.
 `deep_norm` and `rotary_mul` all found tensors whose alias sign was the opposite of the
 heuristic, and `rotary_mul` found one (`r1`/`r2`) that was 1.018x FASTER in isolation and
 1.015x SLOWER on top of the winning alias -- **isolated readings do not compose.**
+
+
+## PLAT-SS-BitOps -- what A2 actually has for bit manipulation
+
+Probed while building a PRNG. Establish these BEFORE designing anything bit-serial, not at
+attempt 12:
+
+* **`TRANDOM` is A5-only.** There is no `TRandom.hpp` under `a2a3/`. A PRNG on A2 must be built
+  from integer arithmetic.
+* **Tile-tile `TSHR` / `TSHL` on a2a3 are SCALAR LOOPS.** Only the scalar-operand forms
+  **`TSHRS` / `TSHLS`** lower to `vshr` / `vshl`. A shift by a per-element vector operand is
+  therefore enormously more expensive than a shift by a compile-time or scalar amount --
+  restructure to use a uniform shift where possible.
+* **`TCMPS` is a genuine BIT-PACKING primitive.** It emits a packed **1-bit-per-element** mask,
+  **LSB-first**, and that layout **matches the vendor dropout-mask ABI exactly** (probed
+  256/256; an independent whole-buffer check found 0 disagreements in 65536). If you need a
+  packed bitmask, this is the instruction -- do not hand-roll one from shifts and ORs.
+* `TCMPS` still **silently ignores `CmpMode` on int32 sources** (separate verified defect).
+
+Also confirmed by the same run: `TCVT` int16->fp32 is **correct** (256/256) -- a failure first
+blamed on it was the caller's.

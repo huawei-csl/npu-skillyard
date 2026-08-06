@@ -1153,3 +1153,91 @@ v1 97.83us -> attempts 2-4: 100.90us (NULL)
 
 One real win out of fifteen attempts. The neutral variants shipped anyway (bit-identical and
 validated) but were **not credited**. Report the ladder, not the product of the attempt ratios.
+
+
+### A CONCURRENT ENGINE INVALIDATES PAIRED INTERLEAVING -- test for it before pairing
+
+Paired interleaving assumes both arms contend for the same execution resource. When the vendor
+op runs on a **different engine that overlaps with the compute stream**, the assumption breaks
+and the measurement is worthless:
+
+```
+ours alone     299.9 us
+vendor alone   136.5 us
+INTERLEAVED    300.2 us      <-- ~= max(alone), NOT the sum: they OVERLAP
+```
+
+With per-call `npu.Event` + flush, that harness reported **0.047 us for 2 MB of generated mask**
+-- off by roughly **2000x**. Paired interleaving made it *worse*, not better.
+
+**Required precondition test, before trusting any paired ratio:**
+
+* measure **arm A alone**, **arm B alone**, and **interleaved total**;
+* if `interleaved ~= alone_A + alone_B` the arms **serialize** -> paired interleaving is valid,
+  and it remains the default because it cancels drift;
+* if `interleaved ~= max(alone_A, alone_B)` the arms **overlap on separate engines** -> paired
+  interleaving is **INVALID**. Report **alone-times**, and cross-validate both arms against
+  wall-clock to <1%.
+
+This does not overturn the paired-interleaved-only rule -- that rule exists because reporting
+"the comparand's best time" once produced a sign error. It adds the precondition the rule
+always assumed and never checked. **State which regime you measured in.**
+
+### Validating a STOCHASTIC kernel: split "correct" into three questions
+
+There is no CPU-fp64 reference for a PRNG. Split the gate:
+
+* **Q1 spec conformance** -- bit-exact against *your own specified generator*. Reachable only
+  because you chose a published, specified algorithm. This is the real correctness gate.
+* **Q2 generator quality** -- statistical, and **unfalsifiable by any diff**. Rate vs a binomial
+  CI, byte chi-square, serial correlation at several lags, and **cross-lane correlation over all
+  lane pairs at several periods**.
+* **Q3 vendor equivalence** -- may be **unreachable**. Establish whether it is, and say so.
+
+**Determine whether the vendor is even matchable, and record how you know.** One run recovered
+the vendor's per-element uniform by sweeping `p` on a 256-point grid, then scored **276
+hypotheses** (Philox-4x32-{7,10}, Threefry-2x32-{13,20}, three key encodings, four counter
+layouts, both bump orders, all four words, interleaved, both polarities): best match **0.0205**
+against chance 0.0117 and a true match of 1.000. Two independent corroborations settled it -- a
+**DSA hardware-RNG error** raised by the vendor op, and a stream that **depends on the input
+dtype**, which is impossible for a counter-based software PRNG. Conclusion: hardware RNG,
+Q3 unreachable, fall back to Q2 + ABI checks.
+
+#### Why the cross-lane check is the one that matters
+
+**Power-test your gate against deliberately broken kernels compiled from the same source.**
+Measured, on two mutants:
+
+| check | one-avalanche-stage mutant | add-shift mixer mutant |
+|---|---|---|
+| keep-rate vs binomial CI | **MISSED** | **MISSED** |
+| byte chi-square | fires | fires |
+| **cross-lane correlation** | **fires (r=0.709)** | **fires (r=0.638)** |
+| serial correlation | fires | fires |
+
+**A per-element rate check passes a broken PRNG.** Cross-lane correlation is the classic
+parallel-RNG failure and the check a naive suite omits.
+
+#### The result that justifies the whole case
+
+Optimization attempt 13 (`x += x>>s` instead of `x ^= x>>s`) was **1.63x faster than the
+baseline and 1.58x FASTER THAN THE VENDOR**, and it passed: bit-exactness against its own
+reference, both degenerate endpoints, determinism, `block_dim` invariance, vendor interop, and
+keep-rates of 0.899965 / 0.749960 / 0.499950 **inside the 4-sigma binomial CI**.
+
+It is also **broken**: cross-lane |r| = 0.638 (z = 231), serial |z| = 1280 at lag 2, byte
+chi-square 4.05e6.
+
+**A conventional diff-based pipeline would have shipped it** -- faster than the vendor, passing
+every check such a pipeline knows how to run. It was rejected. This is what a stochastic gate is
+*for*, and it is why "it matches the reference" is not a definition of correct for this class.
+
+### A FLAT response to an ablation that removes the work is a HARNESS fault first
+
+One run measured nine structurally different variants -- **including one with no PRNG work at
+all** -- agreeing to within 0.5%, and concluded it had found a hardware limit. It had not: its
+optimization driver drained the stream once per window, inflating cheap kernels 2-5x
+(**2382 us drained vs 471 us queued**). A real 1.127x was still available.
+
+**If removing all the work does not change the time, your harness is measuring itself.** Check
+that before writing "hardware_limit" as a stop reason.
