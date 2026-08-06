@@ -3323,3 +3323,71 @@ small term into a large one. Suspect it wherever a normalizing factor can blow u
 **And note where it was caught:** the *smallest* source case, not the production shape. A
 degenerate small shape is where a near-zero variance actually occurs; at production scale the
 same kernel looked fine.
+
+
+## COOK-§6.13 -- NEVER alias dst and src on an op that uses dst as SCRATCH (TDIVS confirmed)
+
+`TDIVS(dst, scalar, src)` with **`dst == src` silently corrupts**: measured **1,038,441 of
+1,048,576 elements wrong**, max integer deviation 125, **no fault, no error, no hang**.
+
+Confirmed at source (`a2a3/TDivS.hpp:69-71`):
+
+```cpp
+vector_dup(dst, src1, repeats, 1, 1, 8, 0);        // fill dst with the SCALAR numerator
+pipe_barrier(PIPE_V);
+vdiv(dst, dst, src0, repeats, 1, 1, 1, 8, 8, 8);   // dst = dst / src0
+```
+
+**`dst` IS the scratch buffer.** The broadcast overwrites the destination with the scalar
+*before* `vdiv` reads the source, so when they alias, the source is already gone. The integer
+paths (`prepare_s32_data` / `prepare_s16_data`) do the same thing.
+
+**Rule: give a scalar-numerator divide its own destination tile.** Do not write
+`TDIVS(t, 1.0f, t)` to invert a tile in place.
+
+**Generalize it.** This is not special to `TDIVS`. Any tile op implemented as "stage something
+into `dst`, then combine `dst` with `src`" is unsafe under aliasing, and PTO does **not**
+mark these with `__restrict__` or check them. Before reusing a tile as both operand and
+result, open the header and check whether `dst` appears as a *source* of the first
+instruction. If it does, use a separate destination.
+
+**Why this one is nasty:** it produces a plausible-looking wrong answer rather than a crash,
+and it survives a Frobenius-norm check on a large tensor if only part of the buffer aliases.
+The run that found it bisected with a control build that computed the same reciprocal into a
+**separate** tile and still divided -- bit-identical -- which isolated the defect to in-place
+`TDIVS` and exonerated the reduction op it was first blamed on.
+
+## COOK-§6.14 -- There is NO fp32->int8 TCVT, and the two-step workaround is SILENTLY WRONG
+
+pto-isa has **no direct fp32 -> int8 `TCVT`**. The obvious workaround --
+**fp32 -> fp16 -> int8** -- is not merely lossy, it **rounds to the wrong integer**:
+
+> fp16 ulp near 100 is **0.0625**, so `100.53` snaps to `100.5` on the way through fp16, and
+> round-half-to-even then returns **100** instead of the correct **101**.
+
+The intermediate narrowing manufactures a tie that did not exist in the fp32 value.
+
+**Do the rounding while still in fp32** -- round to an integral fp32 value first -- after
+which both narrowing hops (fp32->fp16->int8) are **exact** and the intermediate format cannot
+change the result.
+
+This generalizes to any narrowing chain: **round once, in the widest format, then narrow.**
+Never let an intermediate precision decide a tie.
+
+## COOK-§6.15 -- TCVT fp16->int8 defaults to SaturationMode::OFF, which is the SLOW path
+
+`SaturationMode::OFF` selects a row-by-row path capped at <=64 elements per step with a
+`pipe_barrier` **per step**. `SaturationMode::ON` compiles to a single `vconv_f162s8r`.
+
+For a quantization epilogue that has already clamped to `[-127, 127]`, `ON` is both **correct
+and dramatically cheaper**. Pass it explicitly -- the default is the pessimistic one.
+
+## COOK-§6.16 -- TRowMax's fp32 fast path is SHAPE-GATED
+
+The fp32 fast path is reached only for **exactly** `[64,128]`, `[32,256]`, `[16,512]` or
+`[8,1024]`, with a **ColMajor `[R,1]`** destination. Any other shape silently takes a slower
+generic path.
+
+Note all four gated shapes are **8192 elements**. Sizing each work item to 8192 elements
+therefore lands on the fast path at *every* one of those widths -- a useful tiling constraint
+to adopt deliberately rather than discover.
