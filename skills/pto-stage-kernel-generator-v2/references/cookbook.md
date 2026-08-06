@@ -70,6 +70,13 @@ TASSIGN(xGlobal, x + offset + x_offset);
 TASSIGN(xTile, TILE_UB_ADDR);
 ```
 
+**Tile constructor arity = the number of DYNAMIC dims, not the rank.** The two `-1`s above
+make BOTH dims dynamic, which is why `xTile(1, cur_cols)` takes two arguments. Declare only
+one dim dynamic -- e.g. `UbND<float, 1, W, 1, DYNAMIC>` -- and the constructor takes **one**
+argument, `t(cols)`; passing two is a compile error. Copying this example verbatim onto a
+partially-static tile was the first compile failure of a recent run. Count the `-1` /
+`DYNAMIC` masks in the tile type and pass exactly that many extents.
+
 Use when:
 - the kernel walks one contiguous logical span at a time
 - a fixed compile-time outer tile width with runtime valid columns is enough

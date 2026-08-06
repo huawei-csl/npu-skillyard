@@ -672,6 +672,34 @@ PTO reduction instructions have specific input/output shape requirements:
   - `temp`: **must scale with the SOURCE width, not the destination.** `src/2` is
     exact; `src/4` is silently WRONG (measured ~0.22 relative error). A `[R,8]`
     scratch is correct only for a narrow `src` -- see the corrected note below.
+  - **A too-narrow `temp` can make TROWSUM write NOTHING AT ALL.** Verified in
+    `a2a3/TRowReduceOps.hpp:281-285`. In the band
+    `elemPerRpt < validCol < 2 * elemPerRpt` the implementation does:
+
+    ```cpp
+    if (validCol < 2 * elemPerRpt) {
+        // comment in the library: present only to satisfy a ccec compile check
+        if constexpr ((srcRptStride < BLOCK_MAX_PER_REPEAT) || (tmpRptStride < BLOCK_MAX_PER_REPEAT)) {
+            return;                     // <-- dst is NEVER WRITTEN
+        }
+        ...
+    ```
+
+    `BLOCK_MAX_PER_REPEAT = 8` (32 B blocks), so a stride below it means a tile row
+    narrower than 256 B = **64 floats**. `elemPerRpt = 256/sizeof(T)`, so for fp32 the
+    exposed band is `64 < validCol < 128`. Because `validCol > 64` already forces the
+    *source* stride above the threshold, **the trigger in practice is a narrow `temp`** --
+    exactly the `[R,8]` scratch this rule already warns about.
+
+    The consequence is different from, and worse than, a wrong value: `dst` keeps
+    **whatever was in that UB region before**, so the symptom is stale or garbage data that
+    *changes between runs and disappears under a debugger*. That reads exactly like a
+    cross-core sync race, and it is not one -- it is a silent no-op. If a reduction result
+    looks uninitialized rather than merely inaccurate, check the scratch width **before**
+    adding barriers or flags.
+
+    Give `temp` at least `src/2` columns AND at least 64 floats (256 B) per row, and
+    `static_assert` both.
   - Result: `dst.GetValue(i)` contains sum of row `i` from `src`
 
 - `TCOLSUM(dst, src)`: Reduces each column of `src` to a single value in `dst`
