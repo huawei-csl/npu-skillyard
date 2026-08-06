@@ -1112,3 +1112,44 @@ workload, so it is recorded as **unconfirmed** rather than as a rule -- but the 
 so make it mandatory: after each measurement, count readings below ~half the expected duration
 and **report the count**. A null control cannot see a dropped timestamp, because both arms drop
 at the same rate.
+
+
+### "ARM SWAP" MEANS SWAPPING THE SLOT, NOT REORDERING THE CALLS
+
+The arm-swap rule shipped earlier is only meaningful if implemented correctly, and the obvious
+implementation is wrong.
+
+Permuting the call *order* -- ABBA to BAAB -- is **counterbalancing**, and it is necessary. It
+is **not** an arm swap. An arm swap exchanges **which binary occupies which buffer/allocator
+slot**. A run that permuted order but always left variant A in slot A believed it was
+arm-swapping and was not.
+
+**What that cost:** with a true slot swap, three attempts *inverted*. Double-buffering measured
+**1.162x FASTER as arm B and 1.047x SLOWER as arm A** -- the effect was the slot, not the code.
+
+**A null control cannot detect this**, and the reason is worth internalizing: with identical
+arms, a slot bias applies to both and **cancels exactly**. The null is structurally blind to
+the very thing it looks like it should catch. Same shape as every other blind spot in this
+campaign.
+
+**Implement it as:** run the comparison twice, exchanging which variant is loaded into which
+slot, and require the ratio to **invert**. If it does not invert, you measured the harness.
+
+### VERIFY THE CAMPAIGN TOTAL AGAINST A VENDOR-REFERENCED LADDER
+
+The same run found its per-attempt A/B ratios chained to **2.76x** while the campaign actually
+delivered **1.36x**. Chaining per-attempt ratios is not a measurement -- each one carries its
+own slot bias, ordering bias and noise, and they compound in the direction you were hoping for.
+
+**At the end of every campaign, re-measure the ladder end to end:** baseline, each kept
+variant, and the final kernel, each **against the vendor** in **dedicated processes**. That run
+did, and the honest result was:
+
+```
+v1 97.83us -> attempts 2-4: 100.90us (NULL)
+           -> attempt 6:     71.78us (1.406x -- the ONLY real win)
+           -> attempts 9/13/15: 72.80us (neutral, 1.4%)
+```
+
+One real win out of fifteen attempts. The neutral variants shipped anyway (bit-identical and
+validated) but were **not credited**. Report the ladder, not the product of the attempt ratios.

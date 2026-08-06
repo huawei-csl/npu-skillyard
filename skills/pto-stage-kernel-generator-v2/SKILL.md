@@ -2092,3 +2092,31 @@ Removing a **12.3% arithmetic overhead** from padding (1026 -> 1152 columns) mad
 
 **Do not remove padding on an arithmetic-count argument alone -- measure it.** Charge the
 padding overhead honestly to your own numbers (this run did), but expect removing it to lose.
+
+
+### C28(c) EXTENDED -- it is the whole TROWEXPAND* family, and the dispatch is on src1 LAYOUT
+
+`C28(c)` was written about `TROWEXPANDMUL`. It applies to the **entire `TROWEXPAND*` family**,
+and the mechanism is a **silent dispatch on the src1 layout**:
+
+> `TRowExpandBin` selects its path from `src1`'s layout. A **RowMajor** `src1` silently takes a
+> **32 B/row elementwise** path instead of the broadcast you asked for -- and the library's own
+> `PTO_ASSERT` **accepts it**, so nothing fires.
+
+Cost when it happened: `y = inf` everywhere, on the first kernel of the run.
+
+Two further undocumented constraints found alongside it, both hard `static_assert`s or silent
+failures:
+
+* **ColMajor / NoneBox requires `Rows * sizeof(T)` to be 32 B aligned.**
+* **`SetValidShape` requires BOTH valid dims to be DYNAMIC.**
+
+And one performance cliff: **crossing the 64-wide single-repeat threshold costs 2.03x.** Keep
+the reduction width inside one repeat where the shape allows it.
+
+### TROWARGMAX returns the LOWEST index on ties (probed, undocumented)
+
+Probed 8/8, including across the internal group boundaries of a two-stage reduction. This is
+load-bearing whenever a selection must be order-preserving: it is what makes a two-level top-k
+provably match a flat one. It is not documented anywhere -- verify it again if the pto-isa pin
+moves.
