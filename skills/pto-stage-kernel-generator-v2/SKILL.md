@@ -1153,9 +1153,23 @@ C14's minimum-size rule to the single-column case.)
 
 (c) **TROWEXPANDMUL needs a ColMajor `[N,1]` per-row scalar.**
 `TROWEXPANDMUL(dst, src0, src1)` computes `dst[i,j] = src0[i,j] * src1[i,0]` and
-requires `src1` as a ColMajor `[N,1]` tile. Passing a RowMajor `[N,8]` `src1`
-selects device Mode 2 (32B/row) and multiplies element-wise within the block,
-ZEROING the result outside column 0 -- a silent-wrong rank-1 update. When the
+requires `src1` as a ColMajor `[N,1]` tile for Mode 1.
+
+> **CORRECTION -- Mode 2 does NOT zero anything.** This rule said a RowMajor `[N,8]` `src1`
+> selects Mode 2 and "ZEROES the result outside column 0". Probed: Mode 2 validated
+> **216/216 exact**. The backend (`a2a3/TRowExpandAdd.hpp`) issues
+> `vmul(dst, src0, src1, repeats, 1, 1, 0, 8, 8, 0)` -- the **`src1BlockStride = 0`**
+> re-reads the same 32-byte block, so Mode 2 computes
+> **`dst[i,j] = src0[i,j] * src1[i, j mod 8]`**: a broadcast within the 8-element block, not
+> a zeroing. The original report's `src1` simply held the scalar in column 0 and **zeros
+> elsewhere**, so the zeros in the output were the operand's contents, not the instruction's
+> behaviour. Symptom attributed to the wrong cause -- the same failure as C19 and C27.
+>
+> Mode 1 still ships here: it measured **~1.28x faster** than Mode 2. Prefer it for speed,
+> not for correctness. And if you feed Mode 2 deliberately, remember its real semantics --
+> `j mod 8` broadcasting is only what you want when `src1`'s block genuinely repeats.
+
+When the
 per-row-scalar layout is not provably ColMajor `[N,1]`, build the outer product
 as `TROWEXPAND` (broadcast the scalar) + `TMUL` instead; it is layout-robust.
 → PLAT-§Pipeline, PLAT-§Alignment

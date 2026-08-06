@@ -723,3 +723,38 @@ a kernel bug and will send a repair loop chasing the kernel.
 **Always pass `torch.npu.current_stream().npu_stream`.** Generated harnesses must do this by
 construction, and a harness that produces nondeterministic output should have its stream
 argument checked before the kernel is suspected.
+
+
+### A valid null control and a tight CI do NOT make a small effect real -- REPLICATE
+
+This is the single most important measurement finding in the campaign, and it invalidates a
+class of results that look rigorous.
+
+Five runs of the **same** A/B comparison, each with a **valid null control** and each with a
+tight bootstrap CI, produced:
+
+```
+1.0212   1.0136   0.9553   0.9856   0.9588
+```
+
+**Mutually exclusive confidence intervals. Opposite signs.** A 6.9% spread on a comparison
+that has no true effect that large.
+
+**The bootstrap CI measures within-attempt precision, not across-attempt reproducibility.**
+It resamples the reps you happened to take in one session; it cannot see run-to-run state --
+allocator layout, cache residue, clock and thermal drift, whatever else moves between
+processes. A null control tests for *bias inside* an attempt; it says nothing about whether
+the attempt would repeat.
+
+**Rule: any effect under ~3% must be REPLICATED in independent runs before it is kept or
+reported.** Report the spread across replicates, not one CI. An effect that changes sign
+across replicates is noise regardless of how tight each interval was.
+
+The run that found this retroactively demoted **8 of its own 16 attempts** to "inside the
+noise band", leaving only the three that were 1.28x or larger. Do the same: a campaign that
+keeps a stack of 1.02x attempts has probably kept a stack of noise, and their product is
+reported as a speedup that will not reproduce.
+
+**Corollary for the stop gate.** "We are within 1% of the floor" is not a measurement at this
+resolution either -- it is inside the same band. Claim a hardware limit from a margin larger
+than your replication spread, or say the margin is not resolvable.
