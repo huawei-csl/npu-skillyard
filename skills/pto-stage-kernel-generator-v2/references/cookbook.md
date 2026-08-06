@@ -3391,3 +3391,31 @@ generic path.
 Note all four gated shapes are **8192 elements**. Sizing each work item to 8192 elements
 therefore lands on the fast path at *every* one of those widths -- a useful tiling constraint
 to adopt deliberately rather than discover.
+
+
+## COOK-§6.17 -- Reusing one UB buffer across two sequential calls needs an explicit V->MTE2 flag
+
+`COOK-§6.10` covers Vec<->Vec ordering and `COOK-§6.7` covers the double-buffered WAR pair.
+Neither covers the simplest case, and that gap produced a real silent-wrong-answer bug:
+
+> **A straight-line kernel that calls a helper twice into the SAME UB buffer still needs an
+> explicit `V -> MTE2` dependency between the calls.**
+
+`pipe_barrier(PIPE_V)` orders Vec against Vec. It gives **MTE2 no dependency at all**, so the
+second call's `TLOAD` can land in the buffer **while the first call's reduction is still
+reading it**.
+
+**The measured symptom is why this matters:**
+
+* accuracy gate: **passed 44/45 at 4.6e-08**
+* determinism gate: **61 DISTINCT loss values from bit-identical inputs across 200 runs**
+  (7.7440 to 9.5484; the correct 9.5484 appeared 39/200)
+
+A kernel can be *mostly right* and *completely non-deterministic*. **The determinism check is
+not a formality -- it is the only gate that catches this class**, because a race that lands
+correctly ~20% of the time sails through an accuracy threshold.
+
+Emit `set_flag(PIPE_V, PIPE_MTE2)` / `wait_flag(PIPE_V, PIPE_MTE2)` around any buffer reused
+across sequential helper calls, and check the **loop back edge** too -- in the run that found
+this, a second kernel had the identical hazard latent on its row-loop back edge, where the
+next iteration's `TLOAD` races the current iteration's reduction.

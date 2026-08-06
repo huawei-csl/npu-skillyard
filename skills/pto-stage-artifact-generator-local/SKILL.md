@@ -976,3 +976,39 @@ Sweeping five shapes in a single process produced an **aicore timeout `507014`**
 1300 unsynchronized tasks with per-call 100 MB allocations outran the runtime. It is not a
 kernel bug and it wastes a whole sweep. **Launch one process per shape**, and let the harness
 loop over processes rather than over shapes inside one process.
+
+
+### A SLOW HOST HIDES A DEVICE RACE -- run determinism checks back-to-back
+
+A UB-reuse race stayed hidden through an entire validation suite because the harness computed
+a **4096x8192 fp64 CPU reference between cases**. That host work drained the device queue
+between every launch, so the racing operations never overlapped. The kernel looked
+deterministic. Run back-to-back with no host work in between, the same binary returned
+**61 distinct results from bit-identical inputs in 200 runs**.
+
+**The validation harness's own cost can mask the defect it is meant to find.** This is the
+same structural blind spot as the rest: the check and the fault share a dependency, so the
+check cannot see the fault.
+
+**Required:**
+
+* Run the determinism check as a **tight back-to-back loop** -- launch N times with **no CPU
+  reference computation, no `.cpu()`, no printing, nothing** between iterations, then compare
+  afterwards.
+* Do **not** interleave the fp64 reference with the repeat launches. Compute the reference
+  once, run the repeats, then compare.
+* Treat a determinism failure as **higher severity than an accuracy failure**. An accuracy
+  failure is a wrong kernel; a determinism failure is a *race*, which means every previous
+  passing result was luck.
+
+### `x.clone()` is a REFERENCE, not a CEILING
+
+The floor ladder had `torch.clone()` on identical bytes as an acceptable ceiling estimate. A
+kernel measured **32% faster than it** (1173 GB/s vs 886), which makes it useless as an upper
+bound -- and worse, a kernel that stops at "we hit the clone rate" stops early and reports a
+fabricated headroom of zero.
+
+**Put the ENGINE-NULLED ABLATION first in the ladder**: the same kernel, same tiling, same
+access pattern, with the arithmetic removed. That is the only floor that measures *your* data
+path. `clone()`, `copy_()` and vendor ops are cross-checks to report alongside it, not gates
+to stop on.
