@@ -623,7 +623,10 @@ AICORE void stage_kernel(
 
     UbND<float, M_TILE, N_TILE> result_ub;
     TASSIGN(result_ub, RESULT_UB_ADDR);
-    TCVT(result_ub, raw_ub);           // widen on the Vec pipe (COOK-§8.11, C32)
+    // TCVT has NO 2-arg overload -- the RoundMode is mandatory. The lowest-arity form
+    // is TCVT(dst, src, RoundMode). This line previously read `TCVT(result_ub, raw_ub);`
+    // and did not compile; two runs hit it. (Line ~638 below already had it right.)
+    TCVT(result_ub, raw_ub, pto::RoundMode::CAST_NONE);   // widen on Vec (COOK-§8.11, C32)
     pipe_barrier(PIPE_V);
 
     // Vec post-processing: scale the result

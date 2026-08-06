@@ -1066,13 +1066,27 @@ never taken. That is precisely how it failed here: exact at T=8 and T=64, wrong 
 T=512 up. See COOK-6.5 for why event ids are partitioned by sub-block.
 
 ```cpp
-// Event ids are a PER-CORE resource shared by both AIV sub-blocks (COOK-6.5),
-// so each sub-block gets a disjoint range: vid 0 -> 0..3, vid 1 -> 4..7.
-const int32_t eb       = static_cast<int32_t>(get_subblockid()) * 4;
+// Event ids are a per-core resource shared by both AIV sub-blocks (COOK-6.5), AND
+// they are allocated PER PIPE-PAIR CLASS -- confirmed against CANN's own allocator,
+// `TPipe::AllocEventID<HardEvent evt>`, which indexes `eventPool_ + EventToIndex(evt)`
+// with QUE_MAX_EVENT = 8 on arch 2201. So each (src,dst) class has its own 8 ids.
+//
+// FIXED: this used to read `eb = get_subblockid() * 4`, which gives vid 0 the range
+// 0..3 -- putting its first slot on EVENT_ID0, the id COOK-6.5 reserves. §6.5 even
+// names `slot + vid*4` as the wrong formula, so the cookbook was documenting the bug
+// in one section and committing it in another.
+//
+// Because the pools are per class, each class only has to partition ITS OWN slots
+// across the two sub-blocks, so 2 slots x 2 sub-blocks fits in 1..4 with 0 free:
+const int32_t eb       = 1 + static_cast<int32_t>(get_subblockid()) * 2;
 const int32_t kSlotA   = eb + 0;   // slot 0 free / ready
 const int32_t kSlotB   = eb + 1;   // slot 1 free / ready
-const int32_t kStoreEv = eb + 2;   // V -> MTE3 before the stores
-const int32_t kOutEv   = eb + 3;   // MTE3 -> V : output tiles free again
+// kStoreEv / kOutEv live on DIFFERENT pipe-pair classes (V->MTE3 and MTE3->V) from
+// the slot tokens, so they may reuse the same NUMBERS without colliding. If you are
+// unsure which class a flag lands on, keep the numbers distinct -- ids are cheap
+// per class and a collision is a silent hang.
+const int32_t kStoreEv = eb + 0;   // V -> MTE3 before the stores
+const int32_t kOutEv   = eb + 1;   // MTE3 -> V : output tiles free again
 
 // How many items THIS lane owns -- needed so prologue and drain are exact for
 // every trip count, including 0 and 1.
@@ -2032,15 +2046,23 @@ for (int32_t item = get_block_idx(); item < n_items; item += get_block_num()) {
   TLOAD(a_l1, a_macro_row);          // MB*MT x K
   TLOAD(b_l1, b_macro_col);          // K x NB*NT
   for (int32_t j = 0; j < NB; ++j) {         // N-MAJOR: see below
-    TEXTRACT(l0b, b_l1, 0, j);
+    // TEXTRACT indices are ELEMENT offsets, NOT tile indices -- see the note below.
+    TEXTRACT(l0b, b_l1, 0, j * NT);
     for (int32_t i = 0; i < MB; ++i) {
-      TEXTRACT(l0a, a_l1, i, 0);
+      TEXTRACT(l0a, a_l1, i * MT, 0);
       TMATMUL(acc, l0a, l0b);
       TSTORE(gm_tile(i, j), acc);
     }
   }
 }
 ```
+
+> **`TEXTRACT`'s last two arguments are ELEMENT offsets, not tile indices.** This snippet
+> previously passed the loop counters `i` and `j` directly, which extracts from element row
+> `i` instead of element row `i * MT` -- **silently wrong**, with no error. Two independent
+> campaign runs reported it. The implementation is unambiguous: `a2a3/TExtract.hpp` computes
+> `indexRow * srcColNum * sizeof(SrcType) >> SHIFT_BLOCK_BYTE`, i.e. it scales `indexRow` by
+> the source row width, and asserts 16-element alignment. Multiply by the tile extent.
 
 **Iterate N-MAJOR, and do not assume it is a wash.** Measured on a 14-shape on-device
 sweep: N-major (`2x8`) beat M-major (`8x2`) by **1.38x at IDENTICAL byte counts** --
