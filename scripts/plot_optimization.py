@@ -215,9 +215,6 @@ def plot(doc, out_png):
         warn.append("? = attempt produced no measurement (build or validation aborted)")
     ax.set_xlabel("optimization attempt  (budget %d)" % budget)
     ax.set_ylabel("latency ratio  ours / vendor   (lower is better)")
-    ax.set_title("%s -- optimization campaign  [%s]" % (stage, arch),
-                 fontsize=12.5, pad=30, loc="left")
-
     stop = doc.get("stop_reason", "unspecified")
     sub = "stop: %s" % stop
     if stop == "hardware_limit":
@@ -225,6 +222,13 @@ def plot(doc, out_png):
     elif used < budget and arch == "mixed":
         warn.append("PROCESS FAILURE: a mixed stage must run all %d attempts" % budget)
     lines = textwrap.wrap(sub, 110)
+
+    # Title pad must clear the banner: the stop/gate text wraps to an arbitrary
+    # number of lines and the warning column sits at the same baseline, so a
+    # fixed pad lets a long gate_value collide with the title.
+    banner_lines = max(len(lines), len(warn), 1)
+    ax.set_title("%s -- optimization campaign  [%s]" % (stage, arch),
+                 fontsize=12.5, pad=16 + 11.5 * banner_lines, loc="left")
     ax.text(0.0, 1.012, "\n".join(lines), transform=ax.transAxes, ha="left",
             va="bottom", fontsize=8.5, color="#555", linespacing=1.4)
     if warn:

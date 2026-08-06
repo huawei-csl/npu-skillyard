@@ -2034,3 +2034,25 @@ Then apply the qualifiers that took this campaign several runs to learn:
 **Report the cached-path number alongside the aliased one.** If the kernel is at parity cached
 and fast aliased, say so -- that is the honest description of what was achieved, and it is a
 statement about the memory system rather than about the code.
+
+
+### ALIAS FIRST, THEN TUNE -- cached-path tuning decisions do NOT transfer
+
+A corollary of the L2-alias trigger, and it changes the *order* of the optimization campaign.
+
+`quantize` measured its shipped configuration on the **cached** path as indistinguishable from
+baseline (49.04 us vs 48.69 us -- nothing). The **same changes on the aliased path** were worth
+**1.078x** and **1.035x**. The tuning was invisible until the alias was in place.
+
+The mechanism is simple once stated: while the kernel is stalled on L2 miss-and-allocate, it is
+not limited by anything you are tuning, so every knob reads as noise. Remove that stall and the
+real bottleneck -- packing width, saturation path, tile shape -- becomes measurable.
+
+**Therefore: land the alias FIRST, then run the rest of the campaign on top of it.** A campaign
+that tunes on the cached path will conclude, correctly and uselessly, that none of its knobs
+matter.
+
+This is the same lesson as "probe in the final configuration; isolated readings do not
+compose", sharpened into an ordering rule. Two decisions in that run flipped on it: an
+output-alias read **1.002x** in isolation and **1.036-1.044x** in the final configuration, and
+a fast-saturation path read **1.4%** at pack=1 and **3.4%** at pack=2.
