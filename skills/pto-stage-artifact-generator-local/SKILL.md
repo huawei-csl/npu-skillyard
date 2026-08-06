@@ -690,3 +690,24 @@ thing to itself cannot see a fault that affects both sides equally.**
 | per-stage reference from the reformulation | errors in the reformulation |
 
 When a gate passes everywhere, ask what it shares with the thing it is checking.
+
+### A device health check must verify DATA CORRECTNESS, not throughput
+
+Devices on this host silently corrupt data **while still hitting full TFLOP/s** and while
+`npu-smi` reports `Health Status: OK`. A throughput probe therefore proves nothing about
+whether the numbers you just took are real.
+
+One campaign run reported "device healthy, 226 -> 266 TFLOP/s, band >= 220" before and after
+its timed runs. A correctness canary on the same device shortly afterwards found
+**2176 wrong elements**. The throughput check passed because throughput was never the
+failing property.
+
+**The check must compare a vendor-only computation element-by-element against a CPU reference
+and report the count of wrong elements. Zero is the only pass.** A matmul plus an elementwise
+chain is sufficient and takes seconds. Run it before AND after every timed run, and record
+both counts in the report.
+
+Corollary for the campaign: any case whose device is later found degraded must be
+**re-verified on a clean device** before its number is accepted, regardless of what its own
+health check said. `masked_softmax` was re-verified this way and reproduced to 0.07%; the
+result stood, but that was established rather than assumed.
