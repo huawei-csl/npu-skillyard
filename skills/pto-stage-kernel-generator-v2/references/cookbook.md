@@ -3746,3 +3746,114 @@ If a correctly-tiled fused form still shows amplification growing with `S`, then
 not achievable at useful block sizes on this part, and the honest conclusion is that attention
 is out of reach on A2/A3 -- which would itself be a publishable result. **Measure before
 concluding either way.**
+
+
+## COOK-§12.7 -- FLASH-ATTENTION, MEASURED. And §12.6's online-softmax prescription is WRONG for large D.
+
+`COOK-§12.6` was marked UNTESTED. It has now been built and measured, and the **hypothesis
+holds**: HBM traffic amplification went from the staged form's 1.94/2.88/4.76/8.53/**16.06x**
+to **1.00x at every S**. The vendor ratio went from 1.36/1.71/**2.28x** slower at
+S=512/1024/2048 to **1.03/1.06/1.08x** -- degrading curve replaced by a flat one, and **2.08x
+faster than the staged form** at S=2048 (574.3 vs 1194.9 us).
+
+### CORRECTION: do NOT assume online softmax. Derive Bk from the traffic algebra.
+
+§12.6 prescribed online-softmax rescaling as a constraint. **The arithmetic rules it out when D
+is large.** Count in *plane-equivalents* (1 plane = `S^2 * sizeof(T)` per head):
+
+```
+any Cube->Vec->Cube attention pays        4 planes      (no Acc->Vec; unavoidable)
+  + K/V re-reads across query blocks      2D / Bq
+  + online-rescale accumulator round trip 4D / Bk       <-- ONLY if Bk < S
+```
+
+Under the UB budget `Bq * Bk * 4 <= 120 KB`, the best *tiled* configuration (`Bq~122, Bk~245`)
+totals **8.19 plane-equivalents**. Setting **`Bk = S`** collapses the rescale term to `4D/S`
+and **deletes online softmax entirely**: `Bq=256, Bk=S` totals **5.25 -- 36% fewer bytes.**
+
+**Why:** with `D=128`, the per-key-block accumulator round trip `4D/Bk` dominates any small
+`Bk`. Online softmax exists to bound *memory* when the row does not fit; here the row does fit,
+and paying its rescale traffic is strictly worse.
+
+**So the rule is: derive `Bk` from the traffic algebra above, not from the flash-attention
+literature.** Online softmax is the right answer when `4D/Bk < ` the cost of keeping the row
+live -- i.e. small `D` or very large `S`. State which regime you are in and show the arithmetic.
+
+`Bq=256` was chosen because **L0C holds exactly two fp32 `[128,128]` accumulators** -- pick `Bq`
+from the accumulator capacity, `Bk` from the traffic algebra.
+
+### The residency must be MEASURED, three independent ways
+
+The 1.00x amplification is a *model*. It was corroborated by measurement, and so should yours:
+
+1. **A rate above the HBM ceiling cannot be HBM.** GM-request rate reached **3054 GB/s** at
+   S=2048 against a measured **1250 GB/s** HBM ceiling -- 2.44x over. (L2 measured 5341 GB/s,
+   knee at 192 MB.)
+2. **A `spread` control** -- one scratch slot per work item, so instructions and bytes are
+   identical and only the *footprint* changes. Penalty **1.006 / 1.159 / 1.321x** at
+   S=512/1024/2048, appearing exactly where the footprint crosses L2.
+3. **L2-bypass alias on the scratch: 1.86x WORSE** (590.7 -> 1099.1 us).
+
+### THE ALIAS INVERTS HERE -- and this is the sharpest instance in the campaign
+
+On every prior memory-bound kernel the L2-bypass alias was the *largest single win*
+(1.39x-1.70x). **Here it is a 1.86x LOSS**, because the scratch plane is written and re-read
+almost immediately: its L2 residency **is the entire optimization**. Bypassing it sends the very
+traffic you worked to keep on chip straight to HBM.
+
+**Restated as a rule:** the alias helps when an L2 fill is *wasted*; it is catastrophic when the
+fill is *the mechanism*. Before aliasing any buffer, ask whether something reads it again soon
+-- including the same lane a few instructions later, not only another lane.
+
+### Other measured results from that build
+
+* **Correctness** 30/30 (5 sizes x 2 seeds x 3 block_dims), worst 5.515e-04 against 5e-3,
+  240 bitwise determinism runs, device health clean before and after.
+* **The online-vs-two-pass bound is ZERO** here, because `Bk=S` means both forms are exact
+  two-pass. Residual vs the composed chain is fp16 plane quantisation, bounded by
+  `2^-11 ~ 4.9e-4`, and **flat in S** (3.777 -> 3.872e-04 over a 16x range) -- itself evidence
+  the fused form is not accumulating error with size.
+* **Residual gap quantified rather than hand-waved:** 1.194x on the Cube from plane burst width,
+  recorded as an explicit optimizer target.
+
+
+## COOK-§12.8 -- TROWEXPAND silently loses its `vbrcb` fast path on a DYNAMIC shape
+
+`TRowExpand.hpp` reaches its vectorised `vbrcb` broadcast only through a branch guarded by
+
+```cpp
+constexpr int repeat = TileDataSrc::Numel / vbrcbElem;   // requires a STATIC Numel
+```
+
+`constexpr` means a **DYNAMIC** source tile cannot take it. The fallback is a **per-row scalar
+`V -> S -> V` sandwich**, which cost roughly **75% of one kernel's entire Vec floor** -- fixing
+it took that floor from **1861.8 us to 452.9 us**.
+
+**Two ways out**, both measured on that kernel:
+
+* **Make the source shape STATIC** where you can, so the `constexpr` branch is reachable.
+* **Use the binary `TROWEXPANDADD` / `TROWEXPANDMUL` family instead**, which does not take the
+  scalar path.
+
+**Diagnostic:** if a broadcast-heavy Vec stage is inexplicably slow and its profile shows
+scalar-pipe traffic, check whether the tile is DYNAMIC before looking anywhere else. Nothing
+warns you -- it compiles and it is correct, just enormously slower.
+
+## COOK-§12.9 -- TROWEXPANDEXPDIF does NOT fuse on a2a3
+
+Any guidance implying it is a fused subtract-and-exponentiate is **wrong on this architecture**.
+`a2a3/TRowExpandExpdif.hpp` is literally:
+
+```cpp
+TROWEXPANDSUB_IMPL(dst, src0, src1);
+pipe_barrier(PIPE_V);
+TEXP_IMPL(dst, dst);
+```
+
+It is a **convenience wrapper**, not a fused instruction: same two passes over the data, same
+barrier between them. Use it for readability if you like, but do **not** budget for it as a
+fusion, and do not choose a formulation on the assumption that it saves a pass.
+
+(Note it also performs `TEXP_IMPL(dst, dst)` **in place**. That is a single in-place op, which
+is safe -- but see `COOK-§6.21`: *chaining* two in-place ops on one tile silently returns
+0xFFFF.)
