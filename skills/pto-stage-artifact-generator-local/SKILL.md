@@ -944,3 +944,35 @@ control, host contention, and queue starvation. State it as a standing habit rat
 list of special cases: **any control that holds the suspect factor constant across both arms
 cannot see that factor.** Before trusting a control, name what it varies, and check that the
 thing you are worried about is actually one of those things.
+
+
+### CORRECTION: per-call `torch.empty` on INPUTS is what creates buffer-slot bias
+
+An earlier rule here said "per-call `torch.empty` on **both arms**", to stop one arm inheriting
+a warm allocation. Allocating fresh **inputs** per call is the part that backfires: the two arms
+land in different allocator slots, and slot position is worth 0.8-1.5% on its own.
+
+Measured on the same comparison, changing only the buffer discipline:
+
+| discipline | forward | swapped | null control | replicate spread |
+|---|---|---|---|---|
+| per-call `empty` on inputs (two slots) | 1.0583 | 1.0277 | **1.54%** | -- |
+| **shared input buffers** | **1.0340** | **1.0351** | **0.03%** | **0.20%** (3 reps) |
+
+With two slots the forward and swapped readings disagree by 3%, and the 1.54% null bias is
+>= 1/3 of the 4.3% effect, so the scaled gate **voids the row entirely**. With shared inputs
+the forward and swapped readings agree to 0.1% and the null collapses to 0.03%.
+
+**Rule: share the INPUT buffers between arms; allocate per-call only the OUTPUTS.** Inputs are
+read-only, so sharing them cannot let one arm contaminate the other's data -- while the outputs
+still get a fresh allocation so neither arm benefits from a warm destination.
+
+This is the **root cause** of the buffer-slot bias detected earlier via the arm-swap test. Keep
+the arm-swap test as the check; this is the fix.
+
+### One process per shape
+
+Sweeping five shapes in a single process produced an **aicore timeout `507014`** -- roughly
+1300 unsynchronized tasks with per-call 100 MB allocations outran the runtime. It is not a
+kernel bug and it wastes a whole sweep. **Launch one process per shape**, and let the harness
+loop over processes rather than over shapes inside one process.

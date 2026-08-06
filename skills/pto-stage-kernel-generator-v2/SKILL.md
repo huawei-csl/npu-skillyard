@@ -1993,3 +1993,44 @@ See **`examples.md`** for:
 - Annotated failure patterns with explanations (EX-§1)
 - Full Vec-only example kernel (EX-§2)
 - Full Cube+Vec pipeline example kernel (EX-§3)
+
+
+## STRONG-FORM TRIGGER: every operand read exactly once -> TRY THE L2 ALIAS FIRST
+
+`PLAT-§L2Bypass` was written around a streamed weight in a grouped matmul and is hard to reach
+from a plain Vec kernel. That is a reachability defect, because across this campaign the L2
+alias has been **the single largest optimization on nearly every memory-bound kernel**:
+
+| case | alias effect |
+|---|---|
+| `rms_norm_backward` | **1.697x** |
+| `gemma_rms_norm` | 1.473x fp32 / 1.518x fp16 |
+| `deep_norm` | 1.472x |
+| `rotary_mul` | 1.451x |
+| `dynamic_quant` | 1.389x |
+
+In several of these the alias is **the entire result**. `rms_norm_backward` on the cached path
+measures 228.3 us against the vendor's 226.0 -- **1.010x SLOWER** -- and ships at 1.648x
+FASTER purely from the alias. `dynamic_quant` is 0.9932 (parity) without it.
+
+**So make it the FIRST thing you try, not something you discover.** Trigger:
+
+> **If a GM operand is read exactly once per kernel invocation and never re-read by another
+> lane, probe the L2 alias on it before any other optimization.**
+
+Then apply the qualifiers that took this campaign several runs to learn:
+
+* **"Read once" means CACHE LINES, not elements** (`PLAT-SS-LineReuse`). A row narrower than
+  the line shares it with a neighbour read on the next iteration -- aliasing there measured
+  **1.35x SLOWER**. Check the access granule against the 128 B line.
+* **Only ACROSS-lane reuse needs L2.** Within-lane reuse is served by L1/UB, so a small hot
+  table can still be a good alias candidate (measured +2.5%).
+* **Writes can go either way** -- +3.4% in one case, a loss in another. Probe both directions.
+* **Probe in the FINAL configuration; isolated readings do not compose.** One case measured a
+  tensor 1.018x faster alone and 1.015x slower on top of the winning alias.
+* **Always carry an alias-off control** built from the same binary via a runtime flag, and
+  verify the output is **bit-identical**.
+
+**Report the cached-path number alongside the aliased one.** If the kernel is at parity cached
+and fast aliased, say so -- that is the honest description of what was achieved, and it is a
+statement about the memory system rather than about the code.
