@@ -3290,3 +3290,36 @@ the math.
 `trips > 0` and the drain conditional on `trips > 1`, so that the number of `set_flag`s and
 `wait_flag`s balances by construction at every trip count. Then test at trip counts 0, 1, 2 --
 tail shapes are exactly where those counts occur, and a mid-range shape will never reach them.
+
+
+## COOK-§6.12 -- Do NOT fuse the normalization affine when `rstd` can be large
+
+The natural fusion for a normalize-then-affine epilogue is
+
+```
+y = x * scale + (bias - mean * scale)        // scale = gamma * rstd
+```
+
+one FMA instead of a subtract, a multiply and an add. It is a **precision trap**.
+
+When the variance is near zero, `rstd -> 1/sqrt(eps)`, which for `eps = 1e-5` is ~316. The
+folded constant `bias - mean*scale` is then a difference of two large terms and **loses
+`bias`'s low bits entirely**. Measured on `group_norm_swish`'s smallest source case (`[3,3]`,
+which is *exactly* where variance degenerates):
+
+| form | rel err |
+|---|---|
+| fused `x*scale + (bias - mean*scale)` | **1.03e-05** (vendor: 3.2e-08) |
+| unfused `(x - mean) * scale + bias` | **5.44e-08** -- **189x better** |
+
+Use the unfused form. The extra Vec op is far cheaper than the accuracy, and on that run it
+cost nothing measurable.
+
+**The general shape of this bug:** algebraically identical rearrangements are not numerically
+identical, and the rearrangement that saves an instruction is usually the one that folds a
+small term into a large one. Suspect it wherever a normalizing factor can blow up --
+`1/sqrt(var + eps)`, `1/(x + eps)`, a softmax denominator near zero.
+
+**And note where it was caught:** the *smallest* source case, not the production shape. A
+degenerate small shape is where a near-zero variance actually occurs; at production scale the
+same kernel looked fine.

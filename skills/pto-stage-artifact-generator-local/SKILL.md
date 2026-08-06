@@ -834,3 +834,33 @@ Hold it for the timed command only, never across a whole phase, or the other pip
 This is a hard interlock, not a heuristic: it makes the contention *impossible* rather than
 merely *detectable*. Keep the absolute anchor as well -- the lock only covers pipelines that
 cooperate, and it cannot see an unrelated process on the host.
+
+
+### Different errors are separated by different SHAPES -- one shape cannot cover the suite
+
+`gemma_rms_norm` showed the source's own *distribution* can be unable to discriminate a
+semantic error. `group_norm_swish` showed the same for *shapes*, in both directions at once:
+
+| defect | separated by | NOT separated by |
+|---|---|---|
+| contiguous vs strided channel->group mapping | an added `G != C` case (**5.80e-03**) | **every source shape** -- all three use `G == C` |
+| biased vs unbiased variance | the *small* Tier-1 case `[24,35,76]` (**6.5e-03**) | the **production** shape (9.86e-06, *under* tolerance) |
+
+Read those two rows together. **The source's own shapes could not catch the first defect, and
+the production shape could not catch the second.** A suite built only from the source would
+ship a wrong group mapping; a suite built only at the production size -- the thing the
+coverage gate insists on -- would ship a wrong variance.
+
+**So the coverage gate is a floor, not a design.** "Validated at the production shape" is
+necessary and nowhere near sufficient. Build the case list by asking, per plausible defect,
+*which shape makes this defect visible*:
+
+* **Degenerate small shapes** expose accumulation-order and biased/unbiased errors that
+  average away at scale.
+* **Shapes that break an incidental coincidence in the source** (here `G == C`) expose
+  indexing and mapping errors the source structurally cannot reach. Look for any dimension
+  the source happens to hold equal, unit, or power-of-two, and add a case that breaks it.
+* **The production shape** catches tiling, tail and capacity errors the small cases miss.
+
+State in the report **which case separates which defect**. A pass table that does not say
+what each case is *for* cannot be audited, and cannot tell you what it failed to test.
