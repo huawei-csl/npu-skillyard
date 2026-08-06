@@ -864,3 +864,61 @@ necessary and nowhere near sufficient. Build the case list by asking, per plausi
 
 State in the report **which case separates which defect**. A pass table that does not say
 what each case is *for* cannot be audited, and cannot tell you what it failed to test.
+
+
+### Queue starvation: the event window can time HOST latency, not the kernel
+
+`torch.npu.Event(enable_timing=True).record()` costs **28-46 us of HOST time per call**
+(measured directly; event *creation* is cheap at ~2 us, `record()` is not). Enqueueing a
+timed call therefore costs tens of microseconds of host work on top of the launch itself.
+
+**If device work per call is smaller than host enqueue per call, the stream DRAINS**, and the
+event window measures how fast the host could feed the queue rather than how fast the kernel
+ran. The mandated 256 MiB flush is only ~156-230 us of device work, which does not always
+cover the gap.
+
+The failure is not subtle. One run measured the **same kernel** at **12.25 us** paired against
+itself and **26.53 us** paired against the vendor, same shape, same process -- and its
+headline inverted from "1.003x SLOWER" to "1.011x FASTER" on the *unchanged* binary once
+fixed.
+
+**A null control cannot detect this.** Both arms of a null control are the same kernel, so
+they starve identically and the ratio stays 1.00. This is the third distinct instance of the
+same structural blind spot: *a check that compares a thing to itself cannot see a fault
+affecting both sides equally.*
+
+**Block-level ABBA does not fix it either** -- switching from per-call to 25-call-block
+pairing left the bias intact, which is what ruled out kernel-type switching and pointed at the
+queue.
+
+#### The detector: paired ratio vs ratio-of-medians must AGREE
+
+You already compute both. **Their divergence is the starvation signature.** Measured directly
+by varying only the ballast, everything else identical:
+
+| flush ballast | paired ratio | ratio-of-medians | divergence | verdict |
+|---|---|---|---|---|
+| 1x (documented protocol) | 0.8946 | 0.9309 | **3.9%** | 1.118x slower |
+| 4x | 0.9441 | 0.9420 | **0.2%** | 1.059x slower |
+
+The reported ratio moved **5.5%** and the divergence collapsed. Use this:
+
+* divergence **< 1%** -> the queue stayed fed; the row is sound on this axis.
+* divergence **1-1.5%** -> borderline; add ballast and confirm the ratio is stable.
+* divergence **> 1.5%** -> **treat as starved.** Add flush ballast until the two converge,
+  then re-measure. Do not report the row until they agree.
+
+#### Required harness properties
+
+1. **Pool the events.** Allocate them once, not a fresh pair per timed call.
+2. **Enqueue ballast** -- extra flushes -- so the device queue can never empty. Size it so
+   `device_work_per_call > host_enqueue_per_call`, and **assert it** rather than hoping.
+3. **Enqueue the whole loop, sync once at the end.** Per-call `synchronize()` guarantees the
+   queue drains on every iteration and maximises the defect.
+4. **Report the divergence** on every row alongside the ratio, so a reader can audit it.
+
+**Small kernels are where this bites.** The distortion scales with how small the device work
+is relative to host enqueue, so sub-50 us rows are the exposed ones -- the same rows that are
+already near the dispatch floor. When a fast kernel is compared against a slower vendor op,
+the *faster* arm starves proportionally more, which **understates your own speedup**. Both
+runs that hit this found the fix moved the result in their favour.
