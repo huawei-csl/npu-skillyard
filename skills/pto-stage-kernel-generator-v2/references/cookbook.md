@@ -3582,3 +3582,106 @@ advisory sim stage is unavailable for this family. Go straight to the real-NPU g
   enumerate every dependency it was covering.
 * **Library defect:** `TShiftCheck` (`TBitwiseSOp.hpp`) asserts `dstValidRow == srcValidCol` --
   comparing a row extent against a column extent. Wrong dimension.
+
+
+## COOK-§12 -- FUSION RECIPES: what actually worked, and why
+
+Four cases in the campaign shipped a fused kernel that beat their own validated chain. These
+are the mechanisms, described so they can be re-derived -- **not** kernel source. Do not copy
+another case's implementation; the provenance boundary still applies. What follows is *why*
+each fusion paid, which is the transferable part.
+
+### §12.1 Fold the epilogue into the accumulator (Cube -> Vec seam, small intermediate)
+
+`grouped_matmul`: measured **1.198x / 1.222x / 1.236x** over its own FFTS chain at three
+shapes (560.54 vs 671.42 us, 27.00 vs 32.99, 95.31 vs 117.85; null control valid on every
+point).
+
+**Mechanism:** the chain wrote an `[M,N]` matmul result to GM, then a second kernel read it
+back only to add a bias. Folding the bias into the Cube accumulator (`TMATMUL_BIAS`) **deletes
+the entire `[M,N]` GM round trip**.
+
+**When it applies:** the second stage is an *elementwise epilogue* on the first stage's output
+-- bias, scale, activation, quantize. The intermediate is the same size as the output, so the
+round trip is pure waste. **This is the highest-yield, lowest-risk fusion in the suite** and it
+generalizes to almost every `matmul -> pointwise` pair.
+
+**Check first:** does the Cube instruction already accept the epilogue operand
+(`TMATMUL_BIAS`, scale/quant operands)? If yes, the fusion is a parameter change, not a rewrite.
+
+### §12.2 Keep the working unit resident across both stages (Vec -> Vec seam)
+
+`group_norm_silu`: **1.47x** over its own composed 2-stage chain.
+
+**Mechanism:** the chain read `x` twice -- once for the statistics pass, once for the affine
+pass. The fused form holds each `(n, g)` group **resident in UB** across both passes, so `x` is
+read **once**, and prefetches the next group into the slots the epilogue has already consumed.
+
+**When it applies:** two Vec stages over the same data where the first produces a small
+reduction the second consumes. The prize is exactly the eliminated re-read, so it is bounded by
+`input_bytes` -- predictable in advance from the seam analysis.
+
+**Note the second half is what makes it pay:** residency alone serialises the two passes;
+**prefetching into consumed slots** is what recovers the overlap. `deep_norm` and
+`add_layer_norm` reached the same structure for two-pass variance -- pass B re-reads from UB, at
+**zero extra GM traffic**, which is why two-pass costs only 3.5% there instead of doubling
+traffic.
+
+### §12.3 Fusion that does NOT pay -- and how to tell in advance
+
+Fusion is not free. `group_norm_swish` spent **four attempts** splitting its fused per-group
+loop with an on-device `SYNCALL<Mix>` barrier to fix a measured 1.41x lane-quantisation loss.
+**All four regressed** (1.47x / 1.37x / 1.25x / 1.27x slower), and a `-DSTOP_AFTER` bisect
+priced the barrier itself at only ~1.9 us. The loss was the **rescheduling**: the fused loop
+already ran both passes over the same group back-to-back, and splitting threw that locality away.
+
+**So: fusing and un-fusing are the same decision seen from two sides.** Before either, price the
+locality you would gain or lose, not just the traffic.
+
+### §12.4 The case fusion CANNOT fix by stitching -- attention
+
+When the intermediate is **asymptotically larger** than the inputs, no amount of seam-level
+fusion helps, because the problem is the *shape of the intermediate*, not the boundary.
+
+`attention_sdpa` and `flash_attention_grad` materialise `[B,N,S,S]` against `[B,N,S,D]` inputs.
+Amplification reaches **16-17x** and doubles with every doubling of S. Both cases spent 15
+attempts and hit **99.5% of their measured bandwidth ceilings** while still losing.
+
+**The vendor runs on the same A2 part and pays the same `Acc -> Vec` restriction.** Its measured
+HBM traffic (8.2 / 16.5 / 33.0 / 66.0 MB at S=128/256/512/1024) equals **exactly** its eight
+`[B,N,S,D]` tensors (8.4 / 16.8 / 33.6 / 67.1 MB). Its S x S tiles cycle through GM *addresses*
+and stay **L2-resident** -- they never reach HBM.
+
+**So the fix is a tiling and algorithm change, not a seam change:**
+
+1. **Tile the S x S intermediate so the live working set stays well inside L2 (192 MB on A2).**
+   The GM round trip remains; it becomes an L2 hit instead of an HBM stream. Measured in-campaign:
+   an L2-resident stage hit **1160 GB/s, above the HBM streaming ceiling**, while the chain as a
+   whole managed 730.
+2. **Online-softmax rescaling**, so a query block never needs the full key row live. Without it
+   the row-max and row-sum force the whole `S` extent to be resident, which is what forces the
+   full-plane materialisation in the first place.
+
+This is flash-attention proper and it **is** expressible on A2/A3. It is not reachable by
+composing validated stages, because it restructures the algorithm *across* the seam rather than
+gluing at it. Treat it as a named template invoked when the seam analysis reports higher-order
+growth -- not as something the general composer will discover.
+
+### §12.5 L2 RESIDENCY IS A TILING CONSTRAINT, not a property you discover
+
+Make it explicit when choosing the tile:
+
+```
+live_working_set = sum(bytes of every intermediate live at the same time)
+require: live_working_set < L2_BYTES (192 MB on A2), with margin for the operands
+```
+
+`flash_attention_grad` crossed it silently between S=512 and S=1024 -- one `S x S` plane goes
+16 MB -> 64 MB, so one stage's write went 64 -> 256 MB (spills) and another's read went
+48 -> 192 MB (exactly at the limit). Bandwidth fell **16.3%** (842 -> 705 GB/s) and the measured
+time went **super-quadratic (S^2.14)**, which O(S^2) traffic at constant bandwidth cannot
+produce.
+
+**A super-quadratic scaling exponent is the signature of a capacity cliff.** Compute the local
+exponent per sweep step; if it exceeds the traffic model's order, look for a working set
+crossing L2 before looking anywhere else.

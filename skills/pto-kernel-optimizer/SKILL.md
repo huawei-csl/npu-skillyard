@@ -452,3 +452,37 @@ own cost can exceed it. Before spending attempts:
 
 Report such a finding explicitly: "X costs 1.41x, N attempts to recover it regressed, the
 mechanism is Y" is a stronger result than silence about a known gap.
+
+
+## BEFORE SPENDING ANY ATTEMPTS: check whether you are optimizing the wrong thing
+
+The optimizer tunes a kernel. It cannot fix a **decomposition**. Two cases in the campaign spent
+their full 15-attempt budgets, reached **99.5% of their measured bandwidth ceilings**, and still
+lost to the vendor by 1.09x-3.35x -- because the gap was the dataflow, not the code.
+
+**Run this check first, from the stage plan's seam analysis:**
+
+1. **Compute the traffic amplification** -- our total GM bytes divided by the fused lower bound
+   (the bytes a single fused kernel would have to move: inputs + outputs, nothing else).
+2. **Compute how it grows across the sweep.** If amplification is roughly constant, tuning can
+   win. If it **grows with the sweep dimension**, the intermediate is asymptotically larger than
+   the inputs and **no tuning will close it** -- measured 3.43x -> 17.00x across S=128->1024 on
+   `flash_attention_grad`.
+3. **Compute the local scaling exponent per sweep step**: `log2(t[i]/t[i-1])` over
+   `log2(S[i]/S[i-1])`. If it **exceeds the traffic model's order**, a working set has crossed a
+   capacity boundary -- look for L2 (192 MB on A2) before optimizing anything.
+
+**If the amplification grows: stop and report it.** Say the kernel is at N% of its achievable
+ceiling and that the remaining gap is `<amplification>x` of traffic inherent to the
+decomposition. That is a complete, useful result. Burning 15 attempts to confirm it is not.
+
+**Report the ceiling you are at AND the ceiling you cannot reach.** "730 of a measured 734 GB/s
+ceiling (99.5%), moving 17x the vendor's bytes" tells a reader exactly where the work is. "1.09x
+slower" does not.
+
+### Corollary: an ablation that removes all the work must change the time
+
+If a variant with the arithmetic removed measures the same as the full kernel, you have not
+found a hardware limit -- **you have found a harness fault**. One run concluded "hardware limit"
+from nine variants agreeing to 0.5%, one of which did **no work at all**; its driver was
+draining the stream per window and inflating everything 2-5x. A real 1.127x was still available.

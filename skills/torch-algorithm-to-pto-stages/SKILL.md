@@ -167,6 +167,63 @@ Practical rule:
 5. **Use npu-coding MCP** — for each stage, verify which PTO instruction families apply
 6. **Produce `stage_plan.json`**
 
+## SEAM ANALYSIS -- do this for every boundary, and record it
+
+A stage boundary is not free. Every seam pays a **GM round trip** of the intermediate, because
+on A2/A3 the only legal tile-to-tile moves are `Mat -> Left|Right|Bias|Scaling`, `Vec -> Vec`
+and `Acc -> Mat` (`a2a3/TMov.hpp:200-204`). There is **no `Acc -> Vec`**, so a Cube result
+reaching Vec *must* transit GM.
+
+That cost is usually negligible and occasionally fatal. **Which one it is, is computable before
+any kernel exists**, so compute it:
+
+For each seam, record in the stage plan:
+
+```json
+"seams": [{
+  "from": "qk_scores", "to": "softmax_rows",
+  "engines": "cube->vec",
+  "intermediate_bytes": 67108864,
+  "input_bytes": 8388608,
+  "amplification": 8.0,
+  "l2_bytes": 201326592,
+  "l2_resident": true,
+  "growth": "O(S^2) vs inputs O(S*D)"
+}]
+```
+
+**Read it like this:**
+
+| condition | meaning | action |
+|---|---|---|
+| `intermediate_bytes` <= `input_bytes` | the seam is nearly free | **compose** -- this is the normal case |
+| intermediate grows at the **same order** as inputs | fixed overhead, bounded | compose; fusion is a constant-factor prize |
+| intermediate grows at a **HIGHER order** than inputs | **amplification is unbounded in the sweep dim** | **fusion is mandatory**, not an optimization |
+| `intermediate_bytes` > L2 (192 MB on A2) | the round trip streams to HBM | re-tile so the live set fits, or fuse |
+
+**The asymptotic row is the one that matters.** Measured on `flash_attention_grad`, where the
+intermediate is `[B,N,S,S]` and the inputs are `[B,N,S,D]`:
+
+| S | ours MB | vendor MB | amplification |
+|---|---|---|---|
+| 128 | 28.3 | 8.2 | 3.43x |
+| 512 | 305.1 | 33.0 | 9.25x |
+| 1024 | 1122.2 | 66.0 | **17.00x** |
+
+The amplification **doubles every time S doubles**, because ours is O(S^2) and the fused
+alternative is O(S*D). No per-stage optimization can close that -- both attention cases spent
+their full 15-attempt budgets and reached 99.5% of their measured bandwidth ceilings while
+still losing, because they were solving the wrong problem.
+
+**So: run the seam analysis in Phase 1 and let it gate the plan.** If a seam shows
+higher-order growth, say so in the plan and flag the case as *fusion-required* before Phase 3
+generates a single artifact. That converts 15 wasted attempts into an up-front decision.
+
+**A seam being expensive does not mean the decomposition is wrong** -- it means the composed
+form is a correctness scaffold, not the deliverable. Validate the stages independently (that is
+the whole value of decomposing), then fuse, then check the fused kernel against the composed one
+bit-for-bit.
+
 ## Stage Plan Schema
 
 ```json
