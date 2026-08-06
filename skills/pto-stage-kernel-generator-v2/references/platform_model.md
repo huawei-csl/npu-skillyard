@@ -327,7 +327,23 @@ over-simple form of this rule:**
   sign flips exactly at L2 capacity, where the intermediate stops fitting. **Benchmark the
   alias in the composed chain, never only standalone**; the standalone number has the
   opposite sign in the regime that matters.
-* **The alias is for READS. A never-re-read WRITE is not a candidate.** On
+* **The alias is for READS -- but a WRITE alias can go EITHER WAY. Measure it.**
+
+  > **CORRECTION.** This bullet used to end "a never-re-read WRITE is not a candidate",
+  > generalized from one loss. `deep_norm` measured the opposite: aliasing the `y` **write**
+  > (100 MB, contiguous, never re-read) was **1.034x FASTER**, replicated on two independent
+  > runs (1.0342 / 1.0355), null control valid on both. Meanwhile the *same run* found
+  > aliasing `gamma`/`beta` -- small, heavily re-read -- was **1.663x SLOWER**.
+  >
+  > So the sign of a write alias is NOT predictable from "never re-read". What decides it is
+  > whether that write's L2 fill is **evicting something valuable**. In `deep_norm` the `y`
+  > stream was displacing the `x`/`gx` read streams, so bypassing it helped; in
+  > `moe_token_permute` there was nothing worth protecting, so the bypass only cost.
+  > **Probe each write tensor in both directions and keep the measured winner.** Do not
+  > infer the sign from reuse count alone -- reuse predicts whether the *tensor* benefits,
+  > not whether *the rest of the working set* does.
+
+  The original evidence, still valid as one data point: on
   `moe_token_permute`, aliasing the 128 MiB output -- written once, never re-read, the
   textbook "no reuse" tensor -- was a **LOSS**, while aliasing the read-side `tokens` was
   worth **1.225x** (alias-off control, reproduced 1.23-1.54x at all 16 contract points).

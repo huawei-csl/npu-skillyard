@@ -3260,3 +3260,26 @@ in this cookbook.
 
 If you must duplicate rather than remove, make the duplicate observable (write to a distinct
 live destination) and point any duplicated load at data the kernel will not touch again.
+
+
+## COOK-§6.11 -- Double-buffer trip-count hazards: the failure is a HANG, not a wrong answer
+
+`COOK-§6.7`'s requirement that a double-buffered loop be "exact for every trip count,
+including 0 and 1" is load-bearing, and `deep_norm` hit both failure modes while building one:
+
+1. **Unguarded prologue, trip count 0.** The prologue issues its bootstrap `set_flag` and the
+   loop body -- which would have consumed it -- never runs. **Deadlock.**
+2. **Skipping the slot-1 drain at trip count 1.** This was the *first attempted fix* for (1),
+   and it is also wrong: the bootstrap token is issued and never waited on. It **leaks**, and
+   the symptom is an **aicore timeout `507014`** -- the kernel never returns.
+
+**Both failures present as a HANG or a runtime error, never as a wrong number.** That is worth
+internalizing: a wrong answer gets caught by the fp64 gate, but a leaked or unmatched event
+token stalls the pipe and the gate never runs at all. If a kernel that validated at one shape
+**hangs** at another, look at the trip count first -- specifically 0 and 1 -- before suspecting
+the math.
+
+**Write the guard as an explicit count, not a `break`.** The prologue must be conditional on
+`trips > 0` and the drain conditional on `trips > 1`, so that the number of `set_flag`s and
+`wait_flag`s balances by construction at every trip count. Then test at trip counts 0, 1, 2 --
+tail shapes are exactly where those counts occur, and a mid-range shape will never reach them.
