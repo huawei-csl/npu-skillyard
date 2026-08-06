@@ -815,3 +815,22 @@ Judge the null control **relative to the claimed effect**:
 This pairs with the replication rule above: a **sub-3% effect needs more** than a valid null
 control (independent replication), and a **multi-x effect needs less** (a sub-1% bias is noise
 against it). One fixed threshold serves neither.
+
+
+### Serialize timed runs across CONCURRENT pipelines with a file lock
+
+Generation can run several pipelines at once; **timed measurement cannot**. If two agents
+benchmark simultaneously they corrupt each other, unequally, and no per-run check catches it.
+
+Take a cross-process lock around every command whose **number you will report**:
+
+```bash
+flock <campaign_root>/.bench.lock -c '<the full timed command>'
+```
+
+Compiles, correctness validation and msprof sim do **not** need the lock -- they are not timed.
+Hold it for the timed command only, never across a whole phase, or the other pipelines starve.
+
+This is a hard interlock, not a heuristic: it makes the contention *impossible* rather than
+merely *detectable*. Keep the absolute anchor as well -- the lock only covers pipelines that
+cooperate, and it cannot see an unrelated process on the host.
