@@ -3498,3 +3498,44 @@ So a gather kernel cannot validate its indices cheaply after the fact: the posit
 silent corruption and the negative case kills the process. **Bound-check on the host, or accept
 the vendor's own policy and say so.** `GatherOOB::Undefined` matches the vendor bit-for-bit;
 claiming any stronger guarantee would be inventing one.
+
+
+## COOK-§6.21 -- CHAINED in-place ops silently return 0xFFFF (extends COOK-§6.13)
+
+`COOK-§6.13` says do not alias `dst` and `src` on an op that uses `dst` as scratch. There is a
+second, worse form: **chaining two in-place ops on the same tile.**
+
+Measured: an in-place `TANDS(t, t, ...)` chained onto an in-place `TSHRS(t, t, ...)` returns
+**0xFFFF on every lane**. No fault, no compile error, and **`pipe_barrier(PIPE_V)` does not
+help**. Giving each op a distinct destination tile is exact (0 / 2,097,152).
+
+The symptom is diagnostically nasty: it put **all N counts in bin 255** while the invariant
+`sum(pdf) == N` **still held**, so a total-preserving sanity check passes and only a
+per-bin comparison catches it.
+
+**Rule: give every op in a chain its own destination.** Ping-pong between two tiles rather than
+writing back into the source. The UB cost of one extra tile is far below the cost of a silent
+all-ones result.
+
+## COOK-§6.22 -- TCMPS is broken on ALL 16-bit integer sources too (same function as the int32 defect)
+
+The known "TCMPS silently ignores `CmpMode` on int32" defect and this one live in the **same
+function**, `a2a3/TCmps.hpp::GenCmpCall`:
+
+```cpp
+if constexpr (std::is_same<TIN, int32_t>::value) {
+    vcmpvs_eq(...);                                  // int32: ALWAYS eq -- CmpMode ignored
+} else if (sizeof(TIN) == 4) {
+    vcmp_dispatch(...);                              // fp32: correct
+} else {
+    half scalar;
+    if constexpr (uint16_t || int16_t) {
+        scalar = *reinterpret_cast<half *>(&src1);   // 16-bit int: BITS REINTERPRETED AS half
+```
+
+For `int16_t` / `uint16_t` the scalar operand's **bits are reinterpreted as `half`** and a
+**floating-point** comparison is performed. Small integers become fp16 **subnormals**, so any
+denormal-flush behaviour collapses them silently.
+
+**Do not use `TCMPS` for integer comparison on this architecture at any width.** fp32 is the
+only source type it handles correctly.

@@ -1049,3 +1049,33 @@ attempt 12:
 
 Also confirmed by the same run: `TCVT` int16->fp32 is **correct** (256/256) -- a failure first
 blamed on it was the caller's.
+
+
+## PLAT-SS-NoScan -- there is NO prefix sum and NO vectorised scatter-add, and that closes an algorithm class
+
+Verified by grep over the pinned pto-isa, not inferred:
+
+* `cumsum|prefix_sum|inclusive_scan|exclusive_scan` over `include/` -> **0 files**.
+* `bit_offset|bitOffset|BitPack` over `a2a3/` -> **0 files**.
+* Tile-tile `TSHR`/`TSHL` are **scalar loops** (`TShr.hpp`), so a *per-element variable* shift
+  gets no SIMD at all.
+* `TCMPS` packs exactly **1 bit per element**, never *k* bits.
+* **No popcount.**
+* **No vectorised scatter-add at any memory level.** `TScatter` (UB) is a scalar loop that
+  *overwrites*; `MScatter`'s `ScatterAtomicOp::Add` -- although genuinely backed by
+  `set_atomic_add()` -- is **also a scalar loop**, one scalar GM store per element.
+
+**What this forecloses.** Variable-length output placement needs an exclusive prefix sum
+followed by a variable-bit-offset write. Neither primitive exists, so **entropy coding
+(Huffman/ANS/rANS) is not expressible on this ISA** in any vectorised form. The usual escape --
+radix-partition instead of scanning -- needs **stream compaction**, which is the *same missing
+prefix sum*. And a histogram costs **Theta(N * bins)** rather than Theta(N), because the
+scatter-add is scalar.
+
+**This is a capability boundary, not a skill gap.** Before designing any kernel whose output
+*position* is data-dependent -- compaction, sorting, run-length or entropy coding, sparse
+assembly -- check for these primitives first and stop early if they are absent.
+
+**The vendor pays the same tax**, which is the strongest evidence the boundary is real rather
+than ours: `aclnnHansEncode` sustains **13.8 GB/s, under 1% of HBM peak**. A hand-written
+vendor kernel does not run at 1% of peak because it is badly written.
