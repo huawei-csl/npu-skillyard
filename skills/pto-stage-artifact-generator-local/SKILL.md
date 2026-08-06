@@ -1012,3 +1012,38 @@ fabricated headroom of zero.
 access pattern, with the arithmetic removed. That is the only floor that measures *your* data
 path. `clone()`, `copy_()` and vendor ops are cross-checks to report alongside it, not gates
 to stop on.
+
+
+### The starvation guard must count FLUSH BALLAST as device work
+
+A harness comparing `host_enqueue_per_call` against **the timed arm alone** will cry starvation
+on a perfectly healthy measurement. The flush ballast **is** device work sitting in the same
+queue, and it is usually the larger term.
+
+Compute the guard as:
+
+```
+device_work_per_call = timed_kernel_us + (ballast_count * flush_us)
+assert device_work_per_call > host_enqueue_per_call
+```
+
+Measured on a healthy run: kernel 110 us + flush 185 us x2 = **481 us of device work** against
+**250 us of host enqueue** -- comfortably fed. Comparing 110 against 250 would have declared it
+starved and sent the run chasing a non-existent defect.
+
+Record `host_enqueue_us_per_call`, `flush_us`, `device_work_per_call_us` and the
+`divergence_verdict` **on every row** so the guard itself can be audited. And confirm the guard
+empirically: sweep the ballast (1/2/4/8) and check the result moves less than ~1% -- if it does
+not move, you were never starved.
+
+### Check determinism on EVERY output, not just the primary one
+
+A race was found in which the primary output `y` was **bit-identical** to the baseline across
+runs while the secondary output `x` returned **8 distinct results from 8 identical back-to-back
+launches**. Every accuracy metric was blind to it, and a determinism check on `y` alone would
+have been too.
+
+**Run the bitwise determinism comparison over all outputs the kernel writes** -- including
+in-out tensors, and including outputs the reference test does not check. A multi-output kernel
+gives a race more places to hide, and the one you are watching is not necessarily the one that
+moves.

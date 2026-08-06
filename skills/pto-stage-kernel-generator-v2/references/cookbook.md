@@ -3419,3 +3419,54 @@ Emit `set_flag(PIPE_V, PIPE_MTE2)` / `wait_flag(PIPE_V, PIPE_MTE2)` around any b
 across sequential helper calls, and check the **loop back edge** too -- in the run that found
 this, a second kernel had the identical hazard latent on its row-loop back edge, where the
 next iteration's `TLOAD` races the current iteration's reduction.
+
+
+## COOK-§6.12 CORRECTED -- the affine-fusion trap is driven by `mean*rstd`, is BOUNDED, and is NOT caught by the smallest case
+
+`COOK-§6.12` as first written was wrong in three ways. All three corrections are measured, from
+one binary with a runtime flag:
+
+**(1) The driver is `mean*rstd`, not `rstd`.** The original text blamed `rstd -> 1/sqrt(eps)`.
+A case with **exactly** `rstd ~ 316` but `mean ~ 2` shows a penalty of only **1.22x**. The trap
+needs a large **mean**, not merely a large `rstd`.
+
+**(2) The smallest case does NOT catch it.** The original text claimed it was "caught by the
+smallest source case". At `M=3, N=8` the **fused form is 0.75x -- i.e. BETTER**. The case that
+separates it is a large-mean one (`M=64, N=8192`, mean/std ~ 1e7).
+
+**(3) The magnitude is 35.7x, not 189x** (unfused 2.64e-03 vs fused 9.43e-02 at worst).
+
+### And the part that actually matters: this trap is BOUNDED, single-pass variance is NOT
+
+Perturbing `x` by one fp32 ulp propagates to `y` as `mean*rstd*gamma*2^-24/|y|` -- which is
+**algebraically the same expression** as the fused-bias error. So **the fused penalty can never
+exceed the conditioning floor by an order of magnitude.** Measured: the fused form sits **at**
+the floor (1.03e-01) while the unfused form is **39x below** it.
+
+Contrast with single-pass variance, which is **unbounded**: at mean/std ~ 1.4e4 it produces
+**NaN**, and 35/128 rows have negative variance.
+
+**So do not treat these two as equally severe.** Both are worth fixing, but:
+
+| trap | severity | symptom |
+|---|---|---|
+| single-pass `E[x^2]-mean^2` | **unbounded** | NaN, negative variances, 4533% error |
+| fused affine | **bounded by conditioning** | sits at the floor instead of 39x below it |
+
+Fusing the affine costs you accuracy *headroom*, not correctness. Using single-pass variance
+costs you the answer. Unfuse the affine anyway -- it is one Vec op and all the arithmetic in
+that kernel together cost 2.1% -- but spend your validation effort on the variance form.
+
+**The variance trap remains confirmed and is the dangerous one:** the pinned test's own
+`uniform(0,100)` gives mean/std of only 2.45, where the broken single-pass form scores
+1.99e-07 and **PASSES**. Only a constructed large-mean case separates them.
+
+## COOK-§6.18 -- A "flat" TROWSUM over a wide row is SLOWER than a chunked one
+
+Replacing a chunked reduction with a single flat `TROWSUM` over the full row measured
+**1.196x SLOWER**. Reason: `FillTmp`/`TmpProc` issue **one pairwise `vadd` per repeat with a
+`pipe_barrier(PIPE_V)` between each** -- for a 8192-element fp32 row that is ~64 serialized
+barrier-separated vadds, versus ~7 wide ones when you reduce in chunks and combine.
+
+Reduce in chunks sized to the repeat width and combine the partials yourself. A wider single
+call is not a cheaper call here; the barrier chain dominates.
