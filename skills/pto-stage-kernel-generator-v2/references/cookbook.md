@@ -3470,3 +3470,31 @@ barrier-separated vadds, versus ~7 wide ones when you reduce in chunks and combi
 
 Reduce in chunks sized to the repeat width and combine the partials yourself. A wider single
 call is not a cheaper call here; the barrier chain dominates.
+
+
+## COOK-§6.19 -- MGATHER row-mode omits a sync guard the element mode emits
+
+**Library defect.** `MGatherRowImpl` does **not** emit the `PIPE_MTE2 -> PIPE_S` guard that
+`MGatherElemImpl` does. Its scalar index reads therefore **race the index `TLOAD`**.
+
+Emit the guard yourself around row-mode gathers -- do not assume the two modes of the same
+instruction family have the same internal synchronization.
+
+**Also: `MGATHER`'s `<Coalesce, GatherOOB>` overloads are `#ifdef PTO_NPU_ARCH_A5`-gated** in
+`pto_instr.hpp`, while the MCP's `get_cpp_intrinsic` advertises them **unconditionally**. On A2
+they do not exist. Another instance of `PLAT-§MCPIdentity`: the headers win.
+
+## COOK-§6.20 -- Gather out-of-range is UNDEFINED; a NEGATIVE index is a HARD FAULT
+
+Probed against the vendor on A2:
+
+* **Positive out-of-range: no clamp, no wrap, no error.** At `H=8`, index 8 returned
+  `[9.18e-41, nan, nan, 2.75e-40]`; index 100 returned floats from a neighbouring allocation;
+  index 100000 returned zeros -- **all without raising anything.** It reads whatever is there.
+* **Negative index: a hard device fault** -- `507035` vector-core exception that **poisons the
+  whole process**, not just the launch.
+
+So a gather kernel cannot validate its indices cheaply after the fact: the positive case is
+silent corruption and the negative case kills the process. **Bound-check on the host, or accept
+the vendor's own policy and say so.** `GatherOOB::Undefined` matches the vendor bit-for-bit;
+claiming any stronger guarantee would be inventing one.

@@ -1241,3 +1241,46 @@ optimization driver drained the stream once per window, inflating cheap kernels 
 
 **If removing all the work does not change the time, your harness is measuring itself.** Check
 that before writing "hardware_limit" as a stop reason.
+
+
+### THE DIVERGENCE DETECTOR IS NOT SUFFICIENT -- add an ABSOLUTE plausibility check
+
+The paired-vs-ratio-of-medians divergence detector catches **unequal** starvation. It is blind
+when **both arms starve together**, and then it certifies a wrong answer:
+
+| ballast | ours | vendor | reported ratio | divergence | verdict given |
+|---|---|---|---|---|---|
+| 0 | 69.51 us | 172.03 us | **2.485x** | 0.42% | **"sound"** |
+| adequate | 250.0 us | 312.73 us | **1.250x** | -- | correct |
+
+**A 2x error, flagged sound.** The detector is a *consistency* check between two statistics of
+the same run, so a fault that shifts both statistics equally is invisible to it -- the same
+structural blind spot as the null control, one level up.
+
+**Two additional checks, both cheap, both required:**
+
+1. **ABSOLUTE PHYSICAL PLAUSIBILITY.** Convert every timed row to GB/s (or FLOP/s) and compare
+   against the machine's known ceiling. The starved row above implies **3862 GB/s for a 256 MiB
+   HBM round-trip** -- roughly 3x the device's peak, i.e. impossible. **Any row implying more
+   than the measured device ceiling is invalid, whatever its divergence says.** This is the only
+   check in the whole protocol anchored to something outside the measurement.
+2. **BALLAST-PLATEAU CONVERGENCE.** Sweep ballast (0, 1, 2, 4, 8) and require the ratio to reach
+   a plateau. Report the plateau value and the sweep. A ratio still moving with ballast is not
+   converged, regardless of divergence.
+
+### Paired interleaving is ALSO invalid across a CACHE-STATE change
+
+A second precondition, distinct from the concurrent-engine case. Measure the **base arm's own
+median** in both pairings. If it moves, the pairing is contaminating it:
+
+> The base arm measured **246.6 us** against one partner and **284.1 us** against another --
+> **15% movement in the arm that did not change.** That turned a real 1.02x *slowdown* into an
+> apparent 1.13x *speedup*.
+
+Cause: the partner leaves the cache in a different state, and a gather's cost depends on
+residency. **When arm B changes arm A's own time, fall back to alone-measurement** with
+wall-clock cross-validation, exactly as for the concurrent-engine case.
+
+**Rule of thumb now covering all three:** before trusting a paired ratio, confirm (a) the arms
+serialize, (b) each arm's own median is stable across partners, and (c) the resulting rate is
+physically possible.
