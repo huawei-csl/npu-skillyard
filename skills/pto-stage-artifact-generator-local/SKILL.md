@@ -1047,3 +1047,68 @@ have been too.
 in-out tensors, and including outputs the reference test does not check. A multi-output kernel
 gives a race more places to hide, and the one you are watching is not necessarily the one that
 moves.
+
+
+### POISON EVERY OUTPUT BUFFER BEFORE EVERY LAUNCH
+
+A kernel that computed **160 of its 288 work items** -- 55% of the output never written --
+reported **"OK" and "1.941x FASTER"**.
+
+`torch.empty` handed it a **recycled allocator block that still held the previous kernel's
+correct output**. The validation compared the untouched two-thirds against a reference that
+matched, because a *correct earlier kernel* had left the right answer there.
+
+**This is the most dangerous class of false pass in the whole harness**, because it gets
+*faster* as it gets *more wrong*: the fewer work items a kernel computes, the quicker it
+finishes and the more of the stale-but-correct buffer survives.
+
+**Required, before every launch of every timed or validated kernel:**
+
+```python
+out.fill_(float("nan"))     # or a recognisable sentinel for integer dtypes
+```
+
+Any element the kernel does not write then shows up as NaN and fails immediately. The cost is
+one fill per launch, which the flush already dwarfs.
+
+**Note this interacts with the buffer-discipline rule above.** Per-call `torch.empty` on
+outputs is correct for avoiding slot bias -- but a fresh `empty` is exactly what hands you a
+recycled block. **Do both: allocate outputs per call, AND poison them.** Neither alone is
+sufficient.
+
+Two separate defects in one run were caught only by poisoning, including an optimization
+attempt that "measured as fast as the winner and was numerically wrong". Without it, that
+attempt would have shipped.
+
+
+### CLARIFICATION: "pool the events" means ONE PAIR PER REP, preallocated -- never one pair reused
+
+Two findings collided here and the resolution matters, because getting it wrong silently
+destroys either the timing or the statistics:
+
+* Creating `torch.npu.Event(enable_timing=True)` **inside** the timed loop costs host time
+  (`record()` is 28-46 us) and can starve the device queue.
+* **Reusing the SAME event pair across reps is worse.** Measured directly: 120 reps through one
+  reused pair returned **min == median == max -- all 120 readings bit-identical**. You did not
+  take 120 samples; you took **one**, and copied it. A bootstrap CI over that has zero variance
+  and reports spurious confidence.
+
+**The correct form is: preallocate ONE event pair PER REP before the loop, record into pair `i`
+on rep `i`, and use each pair exactly once.**
+
+Measured against a 434.81 us wall-clock ground truth:
+
+| scheme | median | independent samples |
+|---|---|---|
+| fresh `Event()` per call (host cost) | 432.63 us | yes |
+| **one pair per rep, preallocated** | **432.87 us** | **yes** |
+| one pair reused for all reps | 434.64 us | **NO -- 1 sample repeated** |
+
+Preallocation matches fresh events to 0.05% while keeping the host cost outside the loop.
+
+**Also count implausible readings.** One run reported an `elapsed_time` of 0.16 us for a kernel
+whose real duration was 1205 us. That specific drop did **not** reproduce here on a torch-op
+workload, so it is recorded as **unconfirmed** rather than as a rule -- but the guard is free,
+so make it mandatory: after each measurement, count readings below ~half the expected duration
+and **report the count**. A null control cannot see a dropped timestamp, because both arms drop
+at the same rate.

@@ -2056,3 +2056,39 @@ This is the same lesson as "probe in the final configuration; isolated readings 
 compose", sharpened into an ordering rule. Two decisions in that run flipped on it: an
 output-alias read **1.002x** in isolation and **1.036-1.044x** in the final configuration, and
 a fast-saturation path read **1.4%** at pack=1 and **3.4%** at pack=2.
+
+
+### A kernel must DERIVE its work count on-device, never take it from the host
+
+Extension of **C18**. A host-computed `total_work` with a hard-coded tile count silently
+disagreed with the kernel's actual geometry the moment a compile-time knob changed: every
+`NB=1` variant computed **160 of 288 work items** and reported success.
+
+**The invariant C18 asks for cannot survive a compile-time geometry knob if the count is
+supplied from outside.** Whenever the work count is derivable from the shapes and the tiling
+constants, the kernel must compute it itself. Export it (`kernel_ntile()`) so the harness can
+*assert* agreement rather than *supply* the value.
+
+Pair it with output poisoning on the harness side -- the two together turn this from a silent
+wrong answer into an immediate failure.
+
+### Macro-blocking is DTYPE-DEPENDENT: it is net-negative for fp32 Cube
+
+`COOK-§8.7B`'s macro-blocking is worth **3.2x** on the fp16 kernel it was written from. On an
+**fp32** Cube kernel it is **net-negative**: fp32 doubles every L0 tile, so a 2-tile
+macro-block starves the double-buffering that actually pays. Measured: `NB=2` gives 159.36 us;
+`NB=1`, with the freed L0 spent on an extra buffer, gives 156.59 us and then buys a further
+**1.060x**.
+
+**On A2, L0 capacity is the binding constraint, and fp32 halves how many tiles fit.** Re-derive
+the blocking factor from the *actual* tile footprint in the kernel's dtype rather than
+inheriting a factor tuned at fp16.
+
+### Padding to alignment can beat saving the arithmetic
+
+Removing a **12.3% arithmetic overhead** from padding (1026 -> 1152 columns) made the kernel
+**1.43-1.96x SLOWER**. The padded shape keeps every tile on its aligned fast path; the
+"efficient" unpadded shape pays a ragged-tail penalty far larger than the MACs it saves.
+
+**Do not remove padding on an arithmetic-count argument alone -- measure it.** Charge the
+padding overhead honestly to your own numbers (this run did), but expect removing it to lose.
