@@ -219,6 +219,25 @@ still losing, because they were solving the wrong problem.
 higher-order growth, say so in the plan and flag the case as *fusion-required* before Phase 3
 generates a single artifact. That converts 15 wasted attempts into an up-front decision.
 
+### What the seam analysis DOES and DOES NOT predict -- checked against 13 cases
+
+Retro-tested against every multi-stage case in the campaign:
+
+| seam growth | cases | outcome |
+|---|---|---|
+| **HIGHER order** than inputs | `attention_sdpa`, `flash_attention_grad` | **both LOSE and DEGRADE with size** (1.16->2.28x, 1.09->3.35x) |
+| **SMALLER** than inputs | `cross_entropy_loss`, `rms_norm_backward`, `moe_token_permute`, `top_k_top_p`, `group_norm_silu`, `hans_compress` | **all compose cleanly** -- 5 wins (1.19x-5.69x), 1 blocked on unrelated ISA grounds |
+| **SAME order** | `ffn`, `grouped_matmul`, `grouped_matmul_swiglu_quant`, `kv_rmsnorm_rope_cache` | bounded: parity to 1.51x slower, **not degrading** |
+
+**It predicts "can per-stage tuning close this gap?" -- not "will we win?".** Only the
+higher-order row is a structural verdict. The same-order losses are ordinary Cube-efficiency
+gaps against hand-tuned vendor matmuls, and they may well be closable; the rule says nothing
+about them either way. Do not use it to excuse a loss.
+
+**The signature to trust is DEGRADATION WITH THE SWEEP DIMENSION**, not the loss itself. A
+constant-factor loss is an optimization problem. A loss whose ratio grows with the sweep is a
+decomposition problem, and no attempt budget will fix it.
+
 **A seam being expensive does not mean the decomposition is wrong** -- it means the composed
 form is a correctness scaffold, not the deliverable. Validate the stages independently (that is
 the whole value of decomposing), then fuse, then check the fused kernel against the composed one

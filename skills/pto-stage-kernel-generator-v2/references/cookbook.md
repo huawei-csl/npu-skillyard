@@ -3685,3 +3685,64 @@ produce.
 **A super-quadratic scaling exponent is the signature of a capacity cliff.** Compute the local
 exponent per sweep step; if it exceeds the traffic model's order, look for a working set
 crossing L2 before looking anywhere else.
+
+
+## COOK-§12.6 -- FLASH-ATTENTION TEMPLATE (UNTESTED -- structure and constraints only)
+
+**Status: this template has NOT been built or measured.** It is derived from the measured
+failure of the staged form and from the vendor's measured traffic profile. Treat every number
+below as a *target to verify*, not a result. If you build it, the first deliverable is whether
+these constraints can actually be met.
+
+Invoke this when the seam analysis reports **higher-order growth** on a `Cube -> Vec -> Cube`
+chain -- the staged form cannot be fixed by tuning (both attention cases proved that at 99.5%
+of their bandwidth ceilings).
+
+### The target, from the vendor's measured profile
+
+The vendor's HBM traffic equals **exactly** its `[B,N,S,D]` tensors -- its `S x S` tiles cycle
+through GM addresses and stay **L2-resident**. So the goal is not to eliminate the GM round trip
+(impossible: no `Acc -> Vec` on A2/A3) but to make it **hit L2 every time**.
+
+### Structure
+
+Loop over **query blocks** `Bq`; inside, loop over **key blocks** `Bk`. Per `(Bq, Bk)` tile:
+
+1. **Cube**: `S_tile = Q_blk @ K_blk^T` -> `[Bq, Bk]`, land it in GM.
+2. **Vec**: read `S_tile`, apply the **online softmax update** -- running max `m`, running sum
+   `l`, and rescale the accumulator by `exp(m_old - m_new)`.
+3. **Cube**: `O_acc += P_tile @ V_blk`.
+
+Only `m`, `l` and the `[Bq, D]` accumulator persist across the `Bk` loop. **The full `[S,S]`
+plane is never materialised** -- that is the whole point.
+
+### The constraints that make it work, in priority order
+
+1. **`Bq * Bk * sizeof(T) * (live tiles)` must sit well inside L2 (192 MB on A2)** -- with
+   margin for `Q`, `K`, `V` blocks and the accumulator. This is the binding constraint and the
+   one the staged form violates.
+2. **The accumulator `[Bq, D]` must stay in UB** across the entire `Bk` loop. If it spills, the
+   rescaling turns into GM traffic and the whole benefit is gone.
+3. **`m` and `l` are per-row scalars read on the Vec side** -- so every access needs the
+   `PIPE_V -> PIPE_S` then `PIPE_S -> PIPE_V` flag pair (`C19`). This is the single most likely
+   source of a silent wrong answer here.
+4. **The `Bk` loop is a double-buffered pipeline** with a loop-carried dependency on the
+   accumulator -- so `COOK-§6.17`'s `V -> MTE2` back-edge guard applies, and trip counts 0/1/2
+   must be exact (`COOK-§6.11`). Both failure modes hang rather than mis-compute.
+
+### How to validate it
+
+* **Against the composed chain, bit-for-bit** at a small shape where both fit. The staged form
+  is already validated, so it is the reference -- this is the payoff for having built it.
+* **Online softmax is not bit-identical to two-pass softmax** (different summation order), so
+  expect a small, *bounded* difference and state the bound. Compare both against CPU-fp64
+  rather than against each other.
+* **Sweep `S` and check the amplification is now flat.** That is the whole claim. If it still
+  grows, the tiling is wrong and the template has not been achieved.
+
+### What would falsify the approach
+
+If a correctly-tiled fused form still shows amplification growing with `S`, then L2 residency is
+not achievable at useful block sizes on this part, and the honest conclusion is that attention
+is out of reach on A2/A3 -- which would itself be a publishable result. **Measure before
+concluding either way.**
