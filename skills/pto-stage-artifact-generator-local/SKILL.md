@@ -660,3 +660,33 @@ read 68.02 us interleaved against 34.86 us alone while its within-arm null contr
 you already have.** When this was fixed mid-run, the earlier 200-rep rows were re-checked and
 agreed to -0.11% / +0.84% / +1.11% / +0.10% -- so the defect was real but had not moved those
 numbers, which is worth establishing rather than assuming in either direction.
+
+
+### A per-stage reference derived from the REFORMULATION cannot check the reformulation
+
+`top_k_top_p` reformulated a sort-and-select into a lexicographic threshold on
+`(value, index)` -- a large algorithmic win. **All four stages passed their own specs while
+the end-to-end gate failed 12/20 runs.**
+
+The cause was an exact fp32 tie straddling the top-p cut (`d[189] == d[190]`): in fp64 both
+methods agree the cut is at rank 190, but a pure value threshold also admits the tied twin.
+The per-stage references had been transcribed from **the same reformulation**, so they shared
+its blind spot precisely where it was wrong.
+
+**Rule: the end-to-end reference must be an INDEPENDENT statement of the original algorithm** --
+transcribed from the source definition, not derived from the decomposition you invented. Per-
+stage references check that a stage implements its spec; only an independent end-to-end
+reference checks that the specs add up to the algorithm.
+
+This is the fifth instance of one failure mode in this project: **a check that compares a
+thing to itself cannot see a fault that affects both sides equally.**
+
+| check | blind to |
+|---|---|
+| within-arm null control | cross-arm interference |
+| single-run validation | intermittent corruption |
+| determinism check | inter-item races (reproduces identically) |
+| a sweep that fixes `block_dim` | bugs that need >1 item per lane |
+| per-stage reference from the reformulation | errors in the reformulation |
+
+When a gate passes everywhere, ask what it shares with the thing it is checking.

@@ -907,3 +907,26 @@ A generator looking for "gather elements by index" finds a summary that matches 
 a contract that belongs to a distributed collective. **Check that the `cpp_intrinsic` header
 and signature on an MCP page match the operation you think you are reading about** -- here the
 header is `include/pto/comm/pto_comm_inst.hpp`, which gives it away immediately.
+
+
+## PLAT-§LoadTail: `TLOAD` REPLICATES the first element past the valid extent
+
+`TLOAD` writes `ceil(n/8)*8` floats, not `n` -- the slots between the valid extent and the
+8-element boundary are written, clobbering anything pre-placed there. **What lands in them is
+a replica of the loaded span's FIRST element** (46-config probe), not the next row's data as
+first reported.
+
+That distinction decides whether it hurts you, and it explains why two workers reported
+contradictory symptoms of the same defect:
+
+* **benign for a max reduction** -- a replica of an in-span element cannot exceed the max;
+* **corrupting for count or sum** -- the replica is counted, and a count-based cutoff is then
+  off by the number of pad slots.
+
+Either zero the pad explicitly after the load, or size the valid extent to a multiple of 8.
+
+## PLAT-§LaneRounding: `TCMPS` writes 64-rounded, `TSELS` writes exactly `validCol`
+
+`TCMPS` writes its mask rounded up to 64 lanes; `TSELS` writes exactly `validCol`. Splitting a
+tile mid-width between the two therefore corrupts the tail of the earlier partition unless the
+split is **64-aligned**. Align mid-tile splits to 64, or place the `TCMPS` partition last.
