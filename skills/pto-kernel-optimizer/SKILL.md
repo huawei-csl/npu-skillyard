@@ -421,3 +421,34 @@ Worked case: `nsa_select_attention` measured **18.6x**. Ours was 534 GB/s -- 64%
 30x below its own capability, from a fixed ~2.7 ms floor flat across BS1=1..16. The same
 operator **overtakes us at BS1=16**. A bare "18.6x" would have been indefensible; the GB/s
 pair is both defensible and more informative.
+
+
+## A measured inefficiency need not be RECOVERABLE -- price the fix, not just the loss
+
+`group_norm_swish` measured a real, specific inefficiency at its production shape: 64 groups
+quantising onto 48 lanes cost **1.41x** (0.716 vs 0.507 us/group at N=6). The number was
+solid and the diagnosis was correct.
+
+**Four attempts to recover it all regressed.** A `-DSTOP_AFTER_<phase>` bisect then priced
+the actual barrier at only **~1.9 us** -- so the barrier was never the problem. The loss came
+from *rescheduling*: the fused per-group loop already runs both passes over the same group
+back-to-back, and every split that "fixed" the lane quantisation destroyed that locality for
+more than it recovered.
+
+**The lesson: locating a loss does not mean you can collect it.** A quantisation, imbalance
+or occupancy gap you can *measure* is an upper bound on what a fix could win, and the fix's
+own cost can exceed it. Before spending attempts:
+
+1. **Price the fix separately from the loss.** Bisect with `-DSTOP_AFTER_<stage>` to bound
+   what the restructuring itself costs. If the mechanism you would remove is 1.9 us and the
+   loss is 40%, the loss is not where you think it is.
+2. **Ask what the current structure is buying.** A shape that looks wasteful in one dimension
+   is often paying for locality, reuse or pipelining in another. Splitting to fix the visible
+   axis silently gives that up.
+3. **Cap the attempts.** Two consecutive regressions on the same hypothesis means the model
+   is wrong, not that the implementation needs another pass. Record the inefficiency as
+   *measured but unrecovered* and move on -- that is a legitimate, reportable outcome, and
+   far more useful than four regressions and no explanation.
+
+Report such a finding explicitly: "X costs 1.41x, N attempts to recover it regressed, the
+mechanism is Y" is a stronger result than silence about a known gap.
