@@ -711,3 +711,15 @@ Corollary for the campaign: any case whose device is later found degraded must b
 **re-verified on a clean device** before its number is accepted, regardless of what its own
 health check said. `masked_softmax` was re-verified this way and reproduced to 0.07%; the
 result stood, but that was established rather than assumed.
+
+
+### Launch on torch's stream, not `NULL`
+
+Passing `stream=NULL` to a ctypes `call_kernel` puts the kernel on a **different runtime
+stream** from torch's. `.cpu()` then synchronises only torch's stream and reads the output
+buffer **mid-flight**, producing size-dependent, nondeterministic NaNs that look exactly like
+a kernel bug and will send a repair loop chasing the kernel.
+
+**Always pass `torch.npu.current_stream().npu_stream`.** Generated harnesses must do this by
+construction, and a harness that produces nondeterministic output should have its stream
+argument checked before the kernel is suspected.

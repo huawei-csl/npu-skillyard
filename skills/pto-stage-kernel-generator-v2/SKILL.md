@@ -788,11 +788,43 @@ math. When the stage processes one fixed-size matrix per work item, prefer deriv
 the count from the explicit dim arg (`chunk_size`) over re-deriving it from a
 `total_work` whose unit is ambiguous.
 
-**C19. Never call GetValue after Vec PTO ops — data is stale.**
-Vec pipeline operations (`TMUL`, `TADD`, `TMULS`, `TSUB`, `TEXP`, `TSEL`, `TROWSUM`,
-`TCOLSUM`) write results to pipeline registers, NOT to the tile buffer. `GetValue()`
-reads from the tile buffer, returning the PRE-OP value. `pipe_barrier(PIPE_V)`
-synchronizes execution order but does NOT flush registers to the buffer.
+**C19 (CORRECTED). `GetValue` after a Vec op needs a `V->S` / `S->V` FLAG SANDWICH,
+not a GM round-trip.** The stale-read symptom is real; the "results live in pipeline
+registers, not the tile buffer" explanation is **wrong**, and the GM round-trip this
+rule used to prescribe **is itself broken**. Probed, 4096 rows x 5 runs, scalar
+readback compared against the same tile DMA'd out:
+
+| sync used | wrong |
+|---|---|
+| none | 4096 / 4096 |
+| `pipe_barrier(PIPE_V)` | 4096 / 4096 |
+| `V->S` flag only (half the sandwich) | **latent race** -- 0, 14, 18, 0 across four builds differing only in UNRELATED code |
+| **the old C19 GM round-trip, synced `MTE2->V`** | **4048 / 4096 -- the prescribed fix is WRONG** |
+| GM round-trip synced `MTE2->S` | 0 / 4096 |
+| **`V->S`; `GetValue`; `S->V`** | **0 / 4096** |
+
+**The scalar unit is a pipe.** It needs a flag like any other cross-pipe dependency, and
+**both halves are load-bearing** -- the second orders the scalar result against the Vec op
+that consumes it. The pinned library does exactly this in
+`pto/npu/a2a3/TRowExpand.hpp:38-43`:
+
+```cpp
+set_flag(PIPE_V, PIPE_S, ev);  wait_flag(PIPE_V, PIPE_S, ev);
+T tempValue = (T)(*(srcPtr + i * srcStride));      // the scalar read
+set_flag(PIPE_S, PIPE_V, ev);  wait_flag(PIPE_S, PIPE_V, ev);
+vector_dup(...);                                    // the Vec op consuming it
+```
+
+A generator that followed C19 literally got a kernel that was **wrong AND paid two extra
+DMAs**. Using the sandwich instead removed a full H-wide `TROWEXPAND` pass per row.
+
+This is the same shape as the C27 correction: the symptom was reported accurately and the
+mechanism was invented. **Note the half-sandwich row** -- one flag makes it a latent race
+that moves with unrelated codegen, which is exactly how such a bug survives review.
+
+The original (incorrect) rationale, retained so the failure mode is recognisable: Vec ops
+were believed to write to pipeline registers rather than the tile buffer, with
+`pipe_barrier(PIPE_V)` ordering execution but not flushing.
 
 ```cpp
 // WRONG: GetValue after TMUL returns pre-TMUL data

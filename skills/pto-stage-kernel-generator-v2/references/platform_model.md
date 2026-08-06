@@ -753,7 +753,12 @@ radix-select path and had to fall back to a merge sort.
 **3-arg** form (with a scratch tile) is the exact `vsqrt` + `vdiv` path.
 
 Measured in an fp32 RMSNorm: the 2-arg form gives **1.194e-03** relative error against a
-CPU-fp64 reference -- **119x over a 1e-05 tolerance** -- and it was **not faster**. It is a
+CPU-fp64 reference -- **119x over a 1e-05 tolerance** -- and it was **not faster**.
+
+**Widened over dynamic range (PROBED):** across 6 decades the 2-arg form reaches
+**3.20e-03** max relative error against the 3-arg form's **1.46e-07** -- a factor of
+**21879**. The two are distinct code paths in source (`TUnaryOp.hpp:275` `vrsqrt` vs
+`:317` `vsqrt`+`vdiv`), and on a small `[1,8]` reduction tile the 3-arg form is **free**. It is a
 silent accuracy bug in exactly the normalization kernels that reach for it. The MCP page
 documents neither overload's precision.
 
