@@ -3584,14 +3584,14 @@ advisory sim stage is unavailable for this family. Go straight to the real-NPU g
   comparing a row extent against a column extent. Wrong dimension.
 
 
-## COOK-§12 -- FUSION RECIPES: what actually worked, and why
+## COOK-§21 -- FUSION RECIPES: what actually worked, and why
 
 Four cases in the campaign shipped a fused kernel that beat their own validated chain. These
 are the mechanisms, described so they can be re-derived -- **not** kernel source. Do not copy
 another case's implementation; the provenance boundary still applies. What follows is *why*
 each fusion paid, which is the transferable part.
 
-### §12.1 Fold the epilogue into the accumulator (Cube -> Vec seam, small intermediate)
+### §21.1 Fold the epilogue into the accumulator (Cube -> Vec seam, small intermediate)
 
 `grouped_matmul`: measured **1.198x / 1.222x / 1.236x** over its own FFTS chain at three
 shapes (560.54 vs 671.42 us, 27.00 vs 32.99, 95.31 vs 117.85; null control valid on every
@@ -3609,7 +3609,7 @@ generalizes to almost every `matmul -> pointwise` pair.
 **Check first:** does the Cube instruction already accept the epilogue operand
 (`TMATMUL_BIAS`, scale/quant operands)? If yes, the fusion is a parameter change, not a rewrite.
 
-### §12.2 Keep the working unit resident across both stages (Vec -> Vec seam)
+### §21.2 Keep the working unit resident across both stages (Vec -> Vec seam)
 
 `group_norm_silu`: **1.47x** over its own composed 2-stage chain.
 
@@ -3627,7 +3627,7 @@ reduction the second consumes. The prize is exactly the eliminated re-read, so i
 **zero extra GM traffic**, which is why two-pass costs only 3.5% there instead of doubling
 traffic.
 
-### §12.3 Fusion that does NOT pay -- and how to tell in advance
+### §21.3 Fusion that does NOT pay -- and how to tell in advance
 
 Fusion is not free. `group_norm_swish` spent **four attempts** splitting its fused per-group
 loop with an on-device `SYNCALL<Mix>` barrier to fix a measured 1.41x lane-quantisation loss.
@@ -3638,7 +3638,7 @@ already ran both passes over the same group back-to-back, and splitting threw th
 **So: fusing and un-fusing are the same decision seen from two sides.** Before either, price the
 locality you would gain or lose, not just the traffic.
 
-### §12.4 The case fusion CANNOT fix by stitching -- attention
+### §21.4 The case fusion CANNOT fix by stitching -- attention
 
 When the intermediate is **asymptotically larger** than the inputs, no amount of seam-level
 fusion helps, because the problem is the *shape of the intermediate*, not the boundary.
@@ -3667,7 +3667,7 @@ composing validated stages, because it restructures the algorithm *across* the s
 gluing at it. Treat it as a named template invoked when the seam analysis reports higher-order
 growth -- not as something the general composer will discover.
 
-### §12.5 L2 RESIDENCY IS A TILING CONSTRAINT, not a property you discover
+### §21.5 L2 RESIDENCY IS A TILING CONSTRAINT, not a property you discover
 
 Make it explicit when choosing the tile:
 
@@ -3687,70 +3687,68 @@ exponent per sweep step; if it exceeds the traffic model's order, look for a wor
 crossing L2 before looking anywhere else.
 
 
-## COOK-§12.6 -- FLASH-ATTENTION TEMPLATE (UNTESTED -- structure and constraints only)
+## COOK-§21.6 -- FLASH-ATTENTION FUSION: the VALIDATED structure
 
-**Status: this template has NOT been built or measured.** It is derived from the measured
-failure of the staged form and from the vendor's measured traffic profile. Treat every number
-below as a *target to verify*, not a result. If you build it, the first deliverable is whether
-these constraints can actually be met.
+**Status: BUILT AND MEASURED, forward and backward.** An earlier version of this section was
+marked UNTESTED and prescribed **online softmax**. That prescription was **wrong for large D**
+and has been removed -- see **§21.6.1** for the traffic algebra that replaces it.
 
-Invoke this when the seam analysis reports **higher-order growth** on a `Cube -> Vec -> Cube`
-chain -- the staged form cannot be fixed by tuning (both attention cases proved that at 99.5%
-of their bandwidth ceilings).
+**Invoke this when the seam analysis reports higher-order growth on a `Cube -> Vec -> Cube`
+chain.** The staged form cannot be fixed by tuning: both attention cases spent their full
+15-attempt budgets and reached **99.5% of their measured bandwidth ceilings while still losing.**
 
-### The target, from the vendor's measured profile
+### The goal
 
-The vendor's HBM traffic equals **exactly** its `[B,N,S,D]` tensors -- its `S x S` tiles cycle
-through GM addresses and stay **L2-resident**. So the goal is not to eliminate the GM round trip
-(impossible: no `Acc -> Vec` on A2/A3) but to make it **hit L2 every time**.
+Not to eliminate the GM round trip -- that is impossible, `a2a3/TMov.hpp:200-204` permits only
+`Mat->Left|Right|Bias|Scaling`, `Vec->Vec` and `Acc->Mat`, so there is **no `Acc->Vec`**. The
+goal is to make that round trip **hit L2 every time**. The vendor demonstrably does exactly
+this: its measured HBM traffic equals **exactly** its `[B,N,S,D]` tensors, so its `S x S` tiles
+cycle through GM addresses and never reach DRAM.
 
 ### Structure
 
-Loop over **query blocks** `Bq`; inside, loop over **key blocks** `Bk`. Per `(Bq, Bk)` tile:
+Loop over query blocks `Bq`; inside, loop over key blocks `Bk`. Per `(Bq,Bk)` tile:
 
-1. **Cube**: `S_tile = Q_blk @ K_blk^T` -> `[Bq, Bk]`, land it in GM.
-2. **Vec**: read `S_tile`, apply the **online softmax update** -- running max `m`, running sum
-   `l`, and rescale the accumulator by `exp(m_old - m_new)`.
+1. **Cube**: `S_tile = Q_blk @ K_blk^T`, landed in GM.
+2. **Vec**: read `S_tile`, apply the softmax step.
 3. **Cube**: `O_acc += P_tile @ V_blk`.
 
-Only `m`, `l` and the `[Bq, D]` accumulator persist across the `Bk` loop. **The full `[S,S]`
-plane is never materialised** -- that is the whole point.
+Only the running statistics and the `[Bq,D]` accumulator persist across the inner loop. **The
+full `[S,S]` plane is never materialised** -- that is the entire point.
 
-### The constraints that make it work, in priority order
+### The four constraints, ordered by how likely each is to sink the build
 
-1. **`Bq * Bk * sizeof(T) * (live tiles)` must sit well inside L2 (192 MB on A2)** -- with
-   margin for `Q`, `K`, `V` blocks and the accumulator. This is the binding constraint and the
-   one the staged form violates.
-2. **The accumulator `[Bq, D]` must stay in UB** across the entire `Bk` loop. If it spills, the
-   rescaling turns into GM traffic and the whole benefit is gone.
-3. **`m` and `l` are per-row scalars read on the Vec side** -- so every access needs the
-   `PIPE_V -> PIPE_S` then `PIPE_S -> PIPE_V` flag pair (`C19`). This is the single most likely
-   source of a silent wrong answer here.
-4. **The `Bk` loop is a double-buffered pipeline** with a loop-carried dependency on the
-   accumulator -- so `COOK-§6.17`'s `V -> MTE2` back-edge guard applies, and trip counts 0/1/2
-   must be exact (`COOK-§6.11`). Both failure modes hang rather than mis-compute.
+1. **The live working set must sit WELL INSIDE L2 (192 MB on A2)**, with margin for operands and
+   accumulator. This is the binding constraint and the one the staged form violates. **Derive
+   the block sizes from this arithmetic and show it.** Measured: forward 156 MB live, backward
+   130 MB live, against a staged equivalent of 536 MB.
+2. **The `[Bq,D]` accumulator must stay in UB** across the whole inner loop. If it spills, the
+   rescaling becomes GM traffic and the benefit is gone.
+3. **Per-row scalars read on the Vec side need a `PIPE_V->PIPE_S` then `PIPE_S->PIPE_V` flag
+   pair** (`C19`). `pipe_barrier(PIPE_V)` alone is wrong AND non-deterministic. This is the most
+   likely source of a silent wrong answer.
+4. **The inner loop is a double-buffered pipeline with a loop-carried accumulator dependency** --
+   `COOK-§6.17`'s `V->MTE2` back-edge guard applies, and trip counts 0/1/2 must be exact
+   (`COOK-§6.11`). **Both failure modes HANG rather than mis-compute**, so if it hangs, look
+   here before the math.
+
+### Pick `Bq` from capacity, `Bk` from the traffic algebra
+
+`Bq` is set by accumulator capacity -- measured, **L0C holds exactly two fp32 `[128,128]`
+accumulators**, giving `Bq=256` (forward) and `Bq=Bk=128` (backward, where
+`2*Bk*D*4 <= 128 KB` binds).
 
 ### How to validate it
 
-* **Against the composed chain, bit-for-bit** at a small shape where both fit. The staged form
-  is already validated, so it is the reference -- this is the payoff for having built it.
-* **Online softmax is not bit-identical to two-pass softmax** (different summation order), so
-  expect a small, *bounded* difference and state the bound. Compare both against CPU-fp64
-  rather than against each other.
-* **Sweep `S` and check the amplification is now flat.** That is the whole claim. If it still
-  grows, the tiling is wrong and the template has not been achieved.
+* **Against the composed chain**, which is already validated -- that is the payoff for having
+  built the staged form first.
+* **Sweep `S` and check the amplification is FLAT.** That is the claim. If it still grows, the
+  tiling is wrong.
+* **Measure the residency, do not model it** -- three ways, see §21.6.1.
 
-### What would falsify the approach
+## COOK-§21.6.1 -- FLASH-ATTENTION, MEASURED: the traffic algebra, and why NOT online softmax
 
-If a correctly-tiled fused form still shows amplification growing with `S`, then L2 residency is
-not achievable at useful block sizes on this part, and the honest conclusion is that attention
-is out of reach on A2/A3 -- which would itself be a publishable result. **Measure before
-concluding either way.**
-
-
-## COOK-§12.7 -- FLASH-ATTENTION, MEASURED. And §12.6's online-softmax prescription is WRONG for large D.
-
-`COOK-§12.6` was marked UNTESTED. It has now been built and measured, and the **hypothesis
+The template in **§21.6** was originally marked UNTESTED. It has now been built and measured, and the **hypothesis
 holds**: HBM traffic amplification went from the staged form's 1.94/2.88/4.76/8.53/**16.06x**
 to **1.00x at every S**. The vendor ratio went from 1.36/1.71/**2.28x** slower at
 S=512/1024/2048 to **1.03/1.06/1.08x** -- degrading curve replaced by a flat one, and **2.08x
@@ -3758,7 +3756,7 @@ faster than the staged form** at S=2048 (574.3 vs 1194.9 us).
 
 ### CORRECTION: do NOT assume online softmax. Derive Bk from the traffic algebra.
 
-§12.6 prescribed online-softmax rescaling as a constraint. **The arithmetic rules it out when D
+That earlier version prescribed online-softmax rescaling as a constraint. **The arithmetic rules it out when D
 is large.** Count in *plane-equivalents* (1 plane = `S^2 * sizeof(T)` per head):
 
 ```
@@ -3817,7 +3815,7 @@ fill is *the mechanism*. Before aliasing any buffer, ask whether something reads
   recorded as an explicit optimizer target.
 
 
-## COOK-§12.8 -- TROWEXPAND silently loses its `vbrcb` fast path on a DYNAMIC shape
+## COOK-§21.7 -- TROWEXPAND silently loses its `vbrcb` fast path on a DYNAMIC shape
 
 `TRowExpand.hpp` reaches its vectorised `vbrcb` broadcast only through a branch guarded by
 
@@ -3839,7 +3837,7 @@ it took that floor from **1861.8 us to 452.9 us**.
 scalar-pipe traffic, check whether the tile is DYNAMIC before looking anywhere else. Nothing
 warns you -- it compiles and it is correct, just enormously slower.
 
-## COOK-§12.9 -- TROWEXPANDEXPDIF does NOT fuse on a2a3
+## COOK-§21.8 -- TROWEXPANDEXPDIF does NOT fuse on a2a3
 
 Any guidance implying it is a fused subtract-and-exponentiate is **wrong on this architecture**.
 `a2a3/TRowExpandExpdif.hpp` is literally:
@@ -3859,7 +3857,7 @@ is safe -- but see `COOK-§6.21`: *chaining* two in-place ops on one tile silent
 0xFFFF.)
 
 
-## COOK-§12.10 -- FUSED BACKWARD, MEASURED. And the price of bitwise determinism, quantified.
+## COOK-§21.9 -- FUSED BACKWARD, MEASURED. And the price of bitwise determinism, quantified.
 
 The backward pass was fused under the same pre-registered criterion as the forward. **Confirmed:
 HBM amplification is flat.**
@@ -3932,7 +3930,7 @@ accurate than the chain it replaces*. Fusion is not purely a speed trade here.
 the 192 MiB L2**. The staged form's *single* fp32 plane is 134 MB and it materialises six.
 
 **No online softmax** -- the saved statistics make the rescale term identically zero, so
-`COOK-§12.7`'s `4D/Bk` is absent entirely.
+the `4D/Bk` term is absent entirely.
 
 **L2-bypass alias: 2.03x LOSS** -- inverting even harder than the forward's 1.86x. Residency
 measured, not modelled: GM-request rate **3103 GB/s** against this device's measured **1188 GB/s**
