@@ -1079,3 +1079,27 @@ assembly -- check for these primitives first and stop early if they are absent.
 **The vendor pays the same tax**, which is the strongest evidence the boundary is real rather
 than ours: `aclnnHansEncode` sustains **13.8 GB/s, under 1% of HBM peak**. A hand-written
 vendor kernel does not run at 1% of peak because it is badly written.
+
+
+## PLAT-SS-IssueTables -- the per-cycle issue tables do NOT rank optimization candidates
+
+`PLAT-§Bandwidth`'s per-cycle issue costs are useful for *understanding* a pipe, and misleading
+for *choosing what to optimize*. Measured on the fused backward:
+
+* `L0C -> GM = ceil(bytes/32)` predicted **389 us of a 585 us kernel**. Halving that traffic
+  moved the total by **0.1%**.
+* The same over-prediction appeared for MTE1.
+
+**Two optimization attempts were spent discovering this.** The issue table gives an *issue-slot*
+cost, which is only the wall-clock cost when that pipe is the binding one and nothing overlaps
+it. In a well-pipelined kernel it usually is neither.
+
+**Rule: rank candidates by a MEASURED ablation, never by an issue-cost model.** Build the variant
+with the work removed and time it. The model tells you what a pipe costs to issue; only the
+ablation tells you what removing it buys.
+
+**This is `COOK-§8.6P #11` in its sharpest measured form:** in the same run, a change that
+improved the Vec core by a *genuine, measured 1.14x* made the whole kernel **1.4% slower** -- the
+Vec was never binding, and the restructuring cost more elsewhere than the 1.14x it bought.
+**Improving a non-binding engine can be net-negative.** Establish which engine binds -- by
+ablation -- before optimizing anything.

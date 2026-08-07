@@ -3857,3 +3857,84 @@ fusion, and do not choose a formulation on the assumption that it saves a pass.
 (Note it also performs `TEXP_IMPL(dst, dst)` **in place**. That is a single in-place op, which
 is safe -- but see `COOK-§6.21`: *chaining* two in-place ops on one tile silently returns
 0xFFFF.)
+
+
+## COOK-§12.10 -- FUSED BACKWARD, MEASURED. And the price of bitwise determinism, quantified.
+
+The backward pass was fused under the same pre-registered criterion as the forward. **Confirmed:
+HBM amplification is flat.**
+
+| S | staged ampl | **fused ampl** | staged vs vendor | **fused vs vendor** | fused vs chain |
+|---|---|---|---|---|---|
+| 128 | 3.43x | **1.00-2.10x** | 1.09x slower | **1.24x FASTER** | 1.27x |
+| 256 | 5.37x | **1.00-2.10x** | 1.33x slower | **1.008 (parity)** | 1.32x |
+| 512 | 9.25x | **1.00-2.10x** | 1.85x slower | 1.198x slower | 1.57x |
+| 1024 | **17.00x** | **1.00-2.10x** | **3.35x slower** | **1.379x slower** | **2.41x** |
+
+The band is honest: `lo` assumes the per-core scratch stays L2-resident, `hi` charges a **full
+write-back of all 72 MiB of it**. **Both ends are constant in S** -- that is the result. Zero
+repairs; the kernel was correct first build.
+
+### The residual is FLOPs, not bytes -- and it is the price of determinism
+
+| S=1024 | fused | vendor |
+|---|---|---|
+| Cube FLOPs | 60.13 G | 42.95 G (**1.400x**) |
+| sustained | **92.07 TFLOP/s** | 90.70 TFLOP/s |
+
+**Our Cube runs slightly FASTER than the vendor's**, and `1.400 x (90.70/92.07) = 1.379` --
+**exactly** the measured latency ratio. The gap is fully accounted for: it is 1.4x the FLOPs and
+nothing else.
+
+**Where the 1.4x comes from.** The backward has **two accumulation axes** -- `dQ` accumulates
+over key blocks, `dK`/`dV` over query blocks -- and a single loop nest can only be outer over
+one. Priced:
+
+| strategy | GM plane-equiv | Cube `S^2 D` | extra live footprint | bitwise deterministic |
+|---|---|---|---|---|
+| **(1) two passes -- SHIPPED** | **25.7** | **14** | none | **YES** |
+| (2) one pass + atomics on dQ | 16.1 | 10.5 | none | **NO** |
+| (3) one pass + dQ partials + reduction | 17.1 | 10.5 | **67 MB at S=1024, linear in S** | yes |
+
+(2) saves only 6% over (3) and destroys determinism -- dominated on arithmetic alone. (3) is
+genuinely competitive on bytes (34% fewer) but its partial buffer spends **the very L2 budget the
+whole design is protecting**, and it grows with S. (1) has **zero accumulator traffic**, because
+setting the inner extent to the full opposite axis makes each output a single K-sliced L0C
+contraction.
+
+**So bitwise determinism costs 1.4x the Cube FLOPs here, which is ~1.33x latency once the kernel
+is FLOP-bound.** State that trade explicitly rather than silently taking either side.
+
+### Why the latency ratio still drifts while amplification is flat
+
+Fused latency ratio grows as `S^0.26`; staged grew as `S^0.54`. The fused drift is **not**
+traffic -- amplification is constant. It is that the kernel is not yet FLOP-bound at small S
+(18.2 TFLOP/s at S=128 vs 92.07 at S=1024), so the 1.4x FLOP premium only fully appears once the
+Cube saturates. **The ratio therefore ASYMPTOTES at ~1.4 rather than growing without bound** --
+which is the qualitative difference from the staged form, whose amplification grows linearly in S
+forever.
+
+### Fusion IMPROVED accuracy
+
+| | dq | dk | dv |
+|---|---|---|---|
+| **fused** | **2.978e-04** | **2.957e-04** | 2.942e-04 |
+| vendor | 2.960e-04 | 2.940e-04 | 2.942e-04 |
+| staged chain | 3.63e-04 | 3.60e-04 | 2.942e-04 |
+
+Fusing **deleted an fp16 materialisation**, so the fused form is at vendor parity and *more
+accurate than the chain it replaces*. Fusion is not purely a speed trade here.
+
+### Block sizes, and the alias inverts harder
+
+`L0C` forces `2 * Bk * D * 4 <= 128 KB` -> **`Bk = Bq = 128`**, inner extent full. Live scratch
+`block_dim * 2 * 1536 * S` = **72 MiB** at S=1024; +34 operands +24 outputs = **130 MiB inside
+the 192 MiB L2**. The staged form's *single* fp32 plane is 134 MB and it materialises six.
+
+**No online softmax** -- the saved statistics make the rescale term identically zero, so
+`COOK-§12.7`'s `4D/Bk` is absent entirely.
+
+**L2-bypass alias: 2.03x LOSS** -- inverting even harder than the forward's 1.86x. Residency
+measured, not modelled: GM-request rate **3103 GB/s** against this device's measured **1188 GB/s**
+HBM ceiling (2.6x over), and a footprint-only control showing **0.998 / 1.042 / 1.401x** at
+72/144/288 MiB, breaking exactly at the independently measured 192-256 MB knee.
