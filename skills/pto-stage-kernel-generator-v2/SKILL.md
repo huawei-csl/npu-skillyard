@@ -2120,3 +2120,41 @@ Probed 8/8, including across the internal group boundaries of a two-stage reduct
 load-bearing whenever a selection must be order-preserving: it is what makes a two-level top-k
 provably match a flat one. It is not documented anywhere -- verify it again if the pto-isa pin
 moves.
+
+
+### SHAPE CONTRACT: kernels are DYNAMIC, but an out-of-contract shape must FAIL LOUDLY
+
+Generated kernels take the problem dimensions as **runtime arguments** -- one `.so` serves the
+whole sweep (measured: a single `reshape_and_cache` binary covers T=14 to T=65536, a 4680x
+range). Do not specialize a binary per shape.
+
+But dimensions fall into **three tiers**, and the tier must be recorded in the contract:
+
+| tier | example | why |
+|---|---|---|
+| **free** | rows, tokens, batch, sequence count | swept at runtime, no constraint |
+| **constrained** | `S % 128 == 0`, `N % 512 == 0`, `K*N % 64 == 0`, `HD % 16 == 0` | MTE burst granularity, or a tile multiple |
+| **equal to a tile constant** | `D == 128` | Cube L1/L0 fractal tiles are **template parameters** (`Tile<..., Rows_, Cols_, ...>`), so the tile SHAPE is compile-time even though its *valid extent* can be DYNAMIC |
+| **capped** | `N <= 24576` | the reduction row must fit one UB tile |
+
+**The defect to avoid:** most generated kernels guard with a bare early return --
+
+```cpp
+if (dimS <= 0 || dimD != kTile || (dimS % kTile) != 0) return;   // SILENT
+```
+
+-- and their host wrapper returns `void`. **An out-of-contract shape therefore produces a
+silent no-op**, and the output buffer keeps whatever was in it. Combined with a recycled
+allocator block (see the harness rule on output poisoning) that is precisely the false-pass
+that once reported *"OK, 1.941x FASTER"* for a kernel computing 55% of its work.
+
+**Required:**
+
+1. **The host wrapper returns `int`**, not `void`, with a distinct negative code per violated
+   constraint. `dynamic_quant` does this (`-1`/`-2`) and is the pattern to copy.
+2. **The harness checks the return code** and fails the case, rather than proceeding to compare
+   an untouched buffer.
+3. **Every constraint is recorded in the contract as a locked/amended dim** with its reason --
+   never silently rounded or substituted.
+4. **Validate at least one out-of-contract shape** and assert the kernel *rejects* it. A guard
+   nothing tests is a guard you do not have.
