@@ -544,3 +544,38 @@ ceiling *for the best available layout*. The newer runs reported "46-80% of the 
 ceiling" and gated as load-bound -- correct, and it hid the fact that a different layout has a
 higher ceiling. **Report both ceilings, and if the gap between them is large, that gap is your
 next attempt.**
+
+
+### A layout's DEPLOYABILITY is part of its score, not just its bandwidth
+
+Two layouts that deliver the same bandwidth are **not** equally valuable. What a layout is
+*parameterized by* decides whether the caller's prepared tensors survive your next tuning pass:
+
+| layout parameterized by | stability | example |
+|---|---|---|
+| **hardware constants** | **stable forever** | a fractal/NZ layout keyed to the 16-element fractal and the 32 B burst granule |
+| **contract dims** | **stable** while the contract holds | blocking by `E`, `K`, `N` |
+| **a TUNING parameter** | **fragile** -- retuning invalidates every prepared tensor | `[E, N/nt, K, nt]` keyed to *your chosen tile width* `nt` |
+
+This is exactly why the vendor's `FRACTAL_NZ` is a better *deliverable* than a tile-width-keyed
+repack of identical cost: `npu_format_cast` is keyed to the hardware fractal, so it survives any
+retuning the vendor does internally. A layout keyed to `nt` means **a caller who stored weights
+must re-prepare them whenever the optimizer moves `nt`**.
+
+**Rules, in preference order:**
+
+1. **Prefer a layout parameterized by hardware constants or contract dims.** If a
+   hardware-keyed layout reaches within a few percent of a tuning-keyed one, **ship the
+   hardware-keyed one** -- the small bandwidth loss buys a stable ABI.
+2. **If you ship a tuning-keyed layout, FREEZE the parameter into the contract.** Promote it
+   from a free tuning knob to an ABI constant: record it in `tensor_layouts.coupled_to`, state
+   that later attempts may not retune it without a version bump, and `static_assert` the kernel
+   against it so a mismatch is a compile error rather than silent corruption.
+3. **Never leave a tuning-keyed layout implicit.** A caller who cannot see what the layout is
+   keyed to cannot know when their stored tensors went stale. That is a silent-wrong-answer
+   generator, and it is worse than a slower kernel.
+
+**Report it in the ladder.** When a layout attempt wins, state its parameterization alongside
+its bandwidth -- "1.41x, keyed to `nt=256` (tuning-coupled, frozen as ABI)" is a materially
+different result from "1.38x, keyed to the hardware fractal (stable)", and the second may be the
+better ship.
