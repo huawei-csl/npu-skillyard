@@ -579,3 +579,47 @@ must re-prepare them whenever the optimizer moves `nt`**.
 its bandwidth -- "1.41x, keyed to `nt=256` (tuning-coupled, frozen as ABI)" is a materially
 different result from "1.38x, keyed to the hardware fractal (stable)", and the second may be the
 better ship.
+
+
+### Refinement: a tuning-keyed layout is FREE when the tensor is an INTERNAL intermediate
+
+The deployability rule penalises layouts keyed to a tuning parameter because retuning invalidates
+tensors the **caller** prepared. That reasoning does not apply when the caller never sees the
+tensor.
+
+**An internal intermediate -- allocated, written and consumed entirely inside your own kernel or
+chain -- has ZERO deployability cost, whatever it is keyed to.** Retuning simply regenerates it.
+So the preference order applies to **caller-visible operands only**; for internal buffers, pick
+the fastest layout and freeze it with a `static_assert` for correctness, not for ABI stability.
+
+Measured example: a chain shipped its internal `[N/128, M, 128]` intermediate keyed to a tuning
+knob (`NTB=128`), correctly recorded as `coupled_to` and `static_assert`ed -- while both
+caller-visible weights stayed in the reference layout with `drop_in: true`. That is the right
+outcome, and a rule that penalised the intermediate's coupling would have been wrong.
+
+
+### WHEN the layout axis pays -- a measured discriminator
+
+Layout is not always worth an attempt. Two cases from the same campaign, both matmul-family, both
+optimized under the same rules, with opposite outcomes:
+
+| | grouped int8 (layout worth **2.2x**) | fp16 FFN (layout worth **nothing**) |
+|---|---|---|
+| weight share of chain traffic | **470 MB = 98%** | **3.28 MB = 1.8%** |
+| working set vs L2 (192 MB) | **470 MB -- EXCEEDS** | **97.6 MB -- fits** |
+| weight reuse | ~21 tokens/expert | **M = 8192** |
+| contraction axis | the slow (strided) axis | already the fast axis |
+
+**The layout axis pays when the operand's stream (a) DOMINATES the traffic and (b) EXCEEDS L2.**
+If the working set is L2-resident, repacking raises no ceiling -- the operand is already being
+served from cache, and a better layout only reorders hits. If the operand is a small fraction of
+traffic, even a large relative improvement moves nothing end-to-end.
+
+**Ruled out as explanations by the same pair:** dtype and operand count. The FFN's two weights
+behaved **differently from each other** (one packing was null, the other an 18% regression), which
+neither dtype nor count can account for -- so do not reach for those.
+
+**Practical gate, before spending an attempt on layout:** compute the candidate operand's share of
+total traffic and the live working set against L2. Under a few percent of traffic, or comfortably
+inside L2, spend the attempt elsewhere and record why. This is the same shape as the seam
+analysis: a cheap up-front calculation that tells you whether an axis can possibly pay.

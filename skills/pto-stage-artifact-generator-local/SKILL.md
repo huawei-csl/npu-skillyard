@@ -1326,3 +1326,17 @@ The output alias is a small *loss* alone and a clear *gain* on top of the input 
 
 Combined with the alias-first ordering rule: **land the input alias, then re-probe every other
 tensor in that configuration**, including ones already rejected in isolation.
+
+
+### POISON OUTSIDE THE TIMED REGION -- it is not free, and it taxes ONE arm
+
+The output-poisoning rule is correct and must stay, but *where* the fill happens matters. Poisoning
+a **5.24 MB** output costs **315 us**. If that fill sits inside the timed window it is charged to
+**your arm only** (the vendor arm has no poison step), and the result is a fabricated slowdown:
+one case reported **2.079x** instead of its true **1.162x** until the fill was moved before the
+start event.
+
+**Required:** poison the output, *then* record the start event. Never inside the measured span.
+The same applies to any per-call setup that exists only on one arm -- a fill, a cache flush, an
+allocation. **Ask of every step in the timed region: does the other arm pay this too?** If not,
+it belongs outside.

@@ -2194,3 +2194,32 @@ would have measured 0.283x and abandoned an axis that is worth **1.5x** once the
 **Reporting requirement:** every alias measurement must state **the burst length it was run at**.
 An alias number without a burst length is not reproducible and, as above, is not even
 sign-stable.
+
+
+## CORRECTION: the alias sign tracks SCHEDULE REDUNDANCY, not burst length
+
+An earlier rule here claimed the L2-bypass alias' sign depends on the **burst length** it is
+measured at. A controlled follow-up shows **burst length and redundancy were confounded** in that
+finding, and redundancy is the real variable:
+
+**Burst held constant is not the discriminator.** At a fixed schedule redundancy of 2.0x, a
+**128x change in burst length** (256 B -> 32,768 B) moved the alias by **0.6%** and **never
+flipped its sign** (1.0222x vs 1.0286x).
+
+**Redundancy is.** Across operands in one kernel:
+
+| operand | schedule redundancy | alias effect |
+|---|---|---|
+| `a` (intermediate) | 2.0x | **1.064x — win** |
+| `x` | 5.0x | 0.944x |
+| `W1` | 32x | 0.884x |
+| `W2` | **64x** | **0.655x — heavy loss** |
+
+**The rule: the alias pays when the schedule re-reads an operand FEW times, and costs when it
+re-reads it MANY times.** That is the same principle as `PLAT-SS-LineReuse` (a bypassed fill is
+wasted only if nothing reads it again) — now with a measured knob. A useful crossover from
+another case: the alias regressed at 2.56x reuse and only helped once reuse fell below ~1.9x.
+
+**So: report SCHEDULE REDUNDANCY with every alias measurement** (burst length remains worth
+recording, but it is not what decides the sign). And probe the alias **per operand** -- in the
+kernel above the correct answer was to alias exactly one of four.
