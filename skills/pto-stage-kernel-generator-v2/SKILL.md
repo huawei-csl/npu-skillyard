@@ -2158,3 +2158,34 @@ that once reported *"OK, 1.941x FASTER"* for a kernel computing 55% of its work.
    never silently rounded or substituted.
 4. **Validate at least one out-of-contract shape** and assert the kernel *rejects* it. A guard
    nothing tests is a guard you do not have.
+
+
+## CORRECTION to "ALIAS FIRST, THEN TUNE": it is LAYOUT FIRST, THEN ALIAS
+
+The alias-first ordering rule was derived from a fused attention kernel with **contiguous**
+scratch. It is **wrong for a strided operand**, and the failure is a sign flip, not a magnitude
+error:
+
+| operand layout | burst | L2 alias effect |
+|---|---|---|
+| native ND (strided) | 128 B | **0.916x — a REGRESSION** |
+| native ND (strided) | 256 B | **1.313x — a win** |
+| repacked (contiguous) | -- | **1.410x — the best** |
+
+Same alias, same kernel, same data: **the sign of an alias result depends on the burst length it
+was measured at.** An alias probed on a badly-laid-out operand can send you away from the alias
+*and* leave the layout unfixed.
+
+**Corrected ordering:**
+
+1. **LAYOUT first** -- fix the operand's memory layout (see the optimizer skill's layout axis).
+2. **ALIAS second** -- re-probe the cache-bypass alias *on the fixed layout*.
+3. **TUNE third** -- tile widths, macro-blocking, block_dim, buffering.
+
+**They are not independent knobs -- the effects are SUPERADDITIVE.** Measured on the same case:
+layout alone **1.111x**, alias alone **1.313x**, both together **1.652x**. Probing either in
+isolation understates it and can invert its sign.
+
+**Reporting requirement:** every alias measurement must state **the burst length it was run at**.
+An alias number without a burst length is not reproducible and, as above, is not even
+sign-stable.
