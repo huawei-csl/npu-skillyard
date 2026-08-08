@@ -167,6 +167,57 @@ Practical rule:
 5. **Use npu-coding MCP** — for each stage, verify which PTO instruction families apply
 6. **Produce `stage_plan.json`**
 
+## TENSOR LAYOUT IS PART OF THE CONTRACT -- and it determines DROP-IN status
+
+A contract that fixes shape, dtype and tolerance still does **not** say what the caller must
+hand you. Two kernels with identical shapes and dtypes can require **different memory layouts**,
+and a kernel whose required layout differs from the reference's is **not a drop-in replacement**
+however identical its signature looks.
+
+This is not hypothetical. A generated `grouped_matmul_swiglu_quant` kernel reached its best
+result by consuming a **repacked** weight `[E, N/nt, K, nt]`; the vendor operator requires
+`FRACTAL_NZ` and **errors outright** on a plain `ND` weight. Same shapes, same dtypes, three
+mutually incompatible layouts.
+
+**Record a `tensor_layouts` block in the contract, one entry per input and output:**
+
+```json
+"tensor_layouts": {
+  "weight": {
+    "reference_layout": "ND [E,K,N]",
+    "kernel_layout":    "PACKED [E,N/nt,K,nt]",
+    "drop_in":          false,
+    "transform":        "host-side repack, 1.641 ms, one-time",
+    "amortizable":      true,
+    "amortizes_over":   "read-only, persists across invocations (model weight)",
+    "coupled_to":       ["nt=256"],
+    "tier":             1
+  }
+}
+```
+
+**The fields that matter, and why:**
+
+* **`reference_layout`** -- what the source algorithm / vendor operator expects. Establish it in
+  Phase 0 like any other Tier-1 fact; if the vendor requires a cast, **probe whether it is
+  mandatory or merely optimal** (that one errors on `ND` was found by probe, not by reading docs).
+* **`kernel_layout`** -- what the kernel you shipped actually consumes. Unknown until the
+  optimizer's layout axis resolves, so Phase 0 records the reference and Phase 7 fills this in.
+* **`drop_in`** -- literally `kernel_layout == reference_layout`. **A `false` here is a
+  first-class deliverable fact and must reach the report and the README**, not be discovered by
+  a user whose weights silently produce garbage.
+* **`transform` / `amortizable` / `amortizes_over`** -- who pays, how much, and over what. A
+  transform on a read-only operand that persists across calls amortizes to nothing; the same
+  transform on a per-call activation does not, and usually kills the idea.
+* **`coupled_to`** -- **the field people forget.** If the layout is a function of a tuning
+  parameter, retuning that parameter **invalidates every stored tensor** the caller prepared.
+  A layout coupled to a tile width is materially worse to deploy than a stable framework format
+  reachable through a public API, even at identical transform cost. Say so.
+
+**Rule: if `drop_in` is false, the benchmark must ALSO report the drop-in number** -- the same
+kernel consuming the reference layout -- so a reader who cannot repack sees what they would get.
+Reporting only the repacked number silently changes the interface and calls it a speedup.
+
 ## SEAM ANALYSIS -- do this for every boundary, and record it
 
 A stage boundary is not free. Every seam pays a **GM round trip** of the intermediate, because
