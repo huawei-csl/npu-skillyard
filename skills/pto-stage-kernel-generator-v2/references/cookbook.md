@@ -2205,6 +2205,14 @@ TMOV(bt, b_l1);                            // half -> float, IN HARDWARE
 TMATMUL_BIAS(acc, l0a, l0b, bt);
 ```
 
+> **BUILD CAVEAT (pto-isa `109c9f72`, `-DMEMORY_BASE`).** The `TASSIGN(bt, ...)` leg above does
+> **not compile** under `-DMEMORY_BASE`: `Tile<Bias>::TileDType` is a plain pointer, so
+> `__cce_get_tile_ptr()` degrades it and the library emits an `unsigned long*` ->
+> `__biasbuf__ float*` cast that bisheng rejects. Workaround that builds: construct the bias
+> pointer from an **integer address** rather than going through `TASSIGN`. The rest of the
+> recipe (the `Mat` -> `TMOV` -> `Bias` conversion route) is unaffected and still correct --
+> only the address-assignment leg needs the change. Re-check when the pin moves.
+
 **Why this matters more than it looks.** The hardware conversion is what keeps an
 fp16-bias GEMM `cube_only`. Without it the obvious readings are "the bias must
 already be fp32" -- forcing a Vec pre-pass, an FFTS handshake and a GM workspace --

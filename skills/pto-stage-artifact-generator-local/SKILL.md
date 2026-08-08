@@ -1033,8 +1033,24 @@ starved and sent the run chasing a non-existent defect.
 
 Record `host_enqueue_us_per_call`, `flush_us`, `device_work_per_call_us` and the
 `divergence_verdict` **on every row** so the guard itself can be audited. And confirm the guard
-empirically: sweep the ballast (1/2/4/8) and check the result moves less than ~1% -- if it does
-not move, you were never starved.
+empirically: sweep the ballast (**including 0**) and check the result moves less than ~1%.
+
+**Sweep from 0, and gate the sweep on the ABSOLUTE anchor -- the divergence verdict cannot see
+this failure.** A grouped-matmul run measured its production row at **1.304x FASTER at
+ballast=0**, then a stable **1.306x SLOWER from ballast>=1** onward: a sign inversion, not a
+drift. Throughout, the divergence detector reported "sound". It could not do otherwise --
+insufficient ballast starves *both* arms, so the paired and ratio-of-medians statistics stayed
+consistent with each other while both were wrong. Only the **absolute plausibility check**
+caught it: the vendor arm read 104.1 us against its own independently measured 83.8 us anchor,
+which is not a number that arm can produce.
+
+This is the third independent instance of the same failure shape in this codebase, so treat it
+as structural: **a check that compares a measurement to itself cannot detect a fault that moves
+both sides equally.** Self-consistency (divergence, null control, arm swap) is necessary and
+insufficient; at least one check must compare against an *externally anchored absolute* -- a
+per-arm timing anchor, or achieved bandwidth against the measured hardware ceiling. If a ballast
+sweep changes the SIGN of a result, do not average or pick a plateau: the low-ballast points are
+invalid, and you only know which end is invalid from the anchor.
 
 ### Check determinism on EVERY output, not just the primary one
 

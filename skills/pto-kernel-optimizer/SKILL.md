@@ -619,6 +619,23 @@ traffic, even a large relative improvement moves nothing end-to-end.
 behaved **differently from each other** (one packing was null, the other an 18% regression), which
 neither dtype nor count can account for -- so do not reach for those.
 
+**Confirmed a second time WITHIN a single kernel, which is the stronger form.** A later fp16
+grouped matmul measured its own layout win at two operating points with everything else held
+fixed -- same binary, same dtype, same operand count, same generator version:
+
+| weight share of essential traffic | layout win |
+|---|---|
+| 3.6% | **1.098x** |
+| 87.3% | **1.404x** |
+
+Same monotone relationship, with every cross-case confound eliminated by construction. Prefer
+this design when testing any future axis: **vary the suspected variable inside one kernel** rather
+than comparing two kernels that differ in a dozen ways. The cross-case pair told us *that* the
+axis was conditional; only the within-case sweep told us *what* the condition is.
+
+That case also shows the payoff is worth the gate: the axis moved it from **1.131x slower to
+1.614x faster** than the vendor.
+
 **Practical gate, before spending an attempt on layout:** compute the candidate operand's share of
 total traffic and the live working set against L2. Under a few percent of traffic, or comfortably
 inside L2, spend the attempt elsewhere and record why. This is the same shape as the seam

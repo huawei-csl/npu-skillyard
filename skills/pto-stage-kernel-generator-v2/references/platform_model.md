@@ -1116,14 +1116,34 @@ true on the **cached** path and **false on the L2-bypass path**, where size matt
 | 32 KB | ~900 GB/s | **1469 GB/s** |
 
 **1.43x from descriptor size alone, visible only with the alias on.** Scope the flat table to the
-cached path, and when probing the bypass, sweep the descriptor size rather than assuming
-flatness -- the best bypass configuration is not the best cached one.
+cached path, and when probing the bypass, **sweep the descriptor size rather than assuming
+flatness**.
 
-## PLAT-SS-NZIdentity -- int8 FRACTAL_NZ IS packed ND, byte for byte
+> **SCOPE CORRECTION.** This rule used to end "the best bypass configuration is not the best
+> cached one." That is **not general** -- a later grouped-matmul case found KL=256 optimal on
+> *both* paths, because **L1 double-buffer capacity bound before the descriptor did** (isolating
+> control, DB off: 582.9 vs 478.8 us). The durable part is the *sweep*, not a guaranteed
+> divergence: descriptor size is a free variable on the bypass path where it is pinned on the
+> cached path, but another resource can still bind first and make the two optima coincide.
+> Sweep and measure; do not predict divergence.
 
-Probed by device-to-device `aclrtMemcpy` on three shapes: an int8 weight in
-**`FRACTAL_NZ` (acl format 29)** is **byte-identical** to a packed ND tensor
-`[E, N/32, K, 32]`.
+## PLAT-SS-NZIdentity -- FRACTAL_NZ IS packed ND, byte for byte (C0 is dtype-dependent)
+
+Probed by device-to-device `aclrtMemcpy`: a weight in **`FRACTAL_NZ` (acl format 29)** is
+**byte-identical** to a packed ND tensor
+
+```
+[E, N/C0, K, C0]      with   C0 = 32 bytes / sizeof(dtype)
+```
+
+so **C0 = 32 for int8, 16 for fp16/bf16, 8 for fp32**. Confirmed on raw device bytes for int8
+(3/3 shapes) and fp16 (3/3 shapes).
+
+> **CORRECTION.** This rule previously stated the packed form as `[E, N/32, K, 32]` flat, derived
+> from int8 probes only. That is **wrong for every dtype but int8** -- an fp16 weight is
+> `[E, N/16, K, 16]`. The error was generalising a measured constant (32) instead of the quantity
+> it actually measures (a 32-**byte** C0 lane). When a probe yields a number, record the
+> *dimensional* quantity it came from, or the rule silently overfits to the dtype you probed.
 
 **The probe method matters more than the result.** A `.cpu()` copy **silently converts NZ back to
 ND** and hides the difference entirely — you must read the raw device bytes to see the true
