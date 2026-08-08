@@ -1103,3 +1103,33 @@ improved the Vec core by a *genuine, measured 1.14x* made the whole kernel **1.4
 Vec was never binding, and the restructuring cost more elsewhere than the 1.14x it bought.
 **Improving a non-binding engine can be net-negative.** Establish which engine binds -- by
 ablation -- before optimizing anything.
+
+
+## PLAT-SS-BypassCeiling -- the flat descriptor-size table is CACHED-ONLY
+
+`PLAT-§ReadCeiling` records descriptor sizes 8/16/32/64 KB as **flat at 897-919 GB/s**. That is
+true on the **cached** path and **false on the L2-bypass path**, where size matters a lot:
+
+| descriptor | cached | bypass |
+|---|---|---|
+| 8 KB | ~900 GB/s | **1029 GB/s** |
+| 32 KB | ~900 GB/s | **1469 GB/s** |
+
+**1.43x from descriptor size alone, visible only with the alias on.** Scope the flat table to the
+cached path, and when probing the bypass, sweep the descriptor size rather than assuming
+flatness -- the best bypass configuration is not the best cached one.
+
+## PLAT-SS-NZIdentity -- int8 FRACTAL_NZ IS packed ND, byte for byte
+
+Probed by device-to-device `aclrtMemcpy` on three shapes: an int8 weight in
+**`FRACTAL_NZ` (acl format 29)** is **byte-identical** to a packed ND tensor
+`[E, N/32, K, 32]`.
+
+**The probe method matters more than the result.** A `.cpu()` copy **silently converts NZ back to
+ND** and hides the difference entirely — you must read the raw device bytes to see the true
+storage. Any claim about on-device layout made through a host copy is unfounded.
+
+Consequence: a hand-rolled "packed" repack and the framework's public `npu_format_cast(w, 29)`
+can produce **the same bytes** — in which case prefer the framework call. It is keyed to hardware
+constants, needs no repack routine shipped alongside, and matches what vendor operators already
+require.

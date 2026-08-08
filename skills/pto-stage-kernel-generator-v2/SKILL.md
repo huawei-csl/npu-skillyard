@@ -2168,6 +2168,7 @@ error:
 
 | operand layout | burst | L2 alias effect |
 |---|---|---|
+| native ND, 32 B bursts | 32 B | **0.283x — a 3.5x REGRESSION** |
 | native ND (strided) | 128 B | **0.916x — a REGRESSION** |
 | native ND (strided) | 256 B | **1.313x — a win** |
 | repacked (contiguous) | -- | **1.410x — the best** |
@@ -2185,6 +2186,10 @@ was measured at.** An alias probed on a badly-laid-out operand can send you away
 **They are not independent knobs -- the effects are SUPERADDITIVE.** Measured on the same case:
 layout alone **1.111x**, alias alone **1.313x**, both together **1.652x**. Probing either in
 isolation understates it and can invert its sign.
+
+**The regression is larger than first recorded.** A later probe measured **0.283x at 32-byte
+bursts** -- a 3.5x loss, not the 0.916x first reported. Probing the alias before fixing the layout
+would have measured 0.283x and abandoned an axis that is worth **1.5x** once the burst is right.
 
 **Reporting requirement:** every alias measurement must state **the burst length it was run at**.
 An alias number without a burst length is not reproducible and, as above, is not even
