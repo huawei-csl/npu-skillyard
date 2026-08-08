@@ -486,3 +486,61 @@ If a variant with the arithmetic removed measures the same as the full kernel, y
 found a hardware limit -- **you have found a harness fault**. One run concluded "hardware limit"
 from nine variants agreeing to 0.5%, one of which did **no work at all**; its driver was
 draining the stream per window and inflating everything 2-5x. A real 1.127x was still available.
+
+
+## DATA LAYOUT IS AN OPTIMIZATION AXIS -- and the current search misses it entirely
+
+Measured failure. Two independent runs of the same int8 grouped-matmul case, at a plugin version
+~50 releases newer than the best-known result, both landed **~2.6x short of it** -- reliably, with
+only ~12% spread between them. Auditing all **31 optimization attempts across the two runs: ZERO
+changed the data layout of the streamed operand.** Every attempt tuned *how to traverse a fixed
+layout* -- tile width (`kNT` 128/192/256/512/1024), macro-blocking (MB=2, MB=4), row-tile count,
+block_dim, core distribution, barrier scoping, L2 alias, double-buffering.
+
+The earlier, faster run had shipped a **pre-packed weight** (`[E, N/NT, K, NT]`, contiguous,
+1128 GB/s). The newer runs shipped the **native strided ND** weight (`[E, K, N]`, 424-735 GB/s)
+and then optimized *within* it -- correctly, thoroughly, and to a genuine hardware gate. They
+were solving the wrong problem well.
+
+**The exploration is insufficient, not the rules.** Both newer runs validated bit-exactly,
+seam-analysed correctly, and reported honestly. They simply never asked whether the operand
+should be laid out differently.
+
+### The rule
+
+> **If an operand is READ-ONLY and PERSISTS ACROSS INVOCATIONS, its memory layout is a FREE
+> VARIABLE. A one-time host-side repack amortizes to zero, so the layout belongs in the search
+> space alongside the tiling.**
+
+Model weights are the canonical case: loaded once, used for millions of inferences. This is
+exactly why the vendor ships weights in a fractal/NZ format rather than plain ND -- and why a
+vendor rate measured on that format is **not** a ceiling a plain-ND kernel can reach (see
+`PLAT-§ReadCeiling`: quote the ~920 GB/s ND `TLOAD` ceiling for an ND kernel, not the vendor's
+1236 GB/s NZ rate).
+
+### Where to spend the attempt
+
+**Before tuning the traversal, ask this once and record the answer:**
+
+1. **Which operand dominates the traffic?** (Here: the weight stream at 470 MB, vs an 8.4 MB
+   intermediate -- 98% of the bytes.)
+2. **Is it read-only and reused across calls?** If yes -> **layout is in scope.**
+3. **What does its access pattern actually look like under the chosen tiling?** Strided reads of
+   `kNT` bytes at stride `N` are the tell: a "widen `kNT` for longer bursts" attempt is a
+   *workaround for a layout problem*. If you find yourself widening a tile purely to lengthen a
+   burst, the burst is short because the layout is wrong.
+4. **Price the repack honestly.** State it as a one-time host cost and say what it amortizes
+   over. If the operand is *not* reused across calls, the repack must be paid per call and
+   usually does not pay -- say so and move on.
+
+**Budget at least one attempt to a layout variant whenever (1) and (2) hold.** An attempt that
+tests a packed/fractal layout and loses is a real result; never testing it is a blind spot, and
+in the measured case that blind spot cost 2.6x.
+
+### Diagnostic that would have caught it
+
+Achieved bandwidth as a fraction of the ceiling *for the layout you chose*, reported next to the
+ceiling *for the best available layout*. The newer runs reported "46-80% of the 920 GB/s ND
+ceiling" and gated as load-bound -- correct, and it hid the fact that a different layout has a
+higher ceiling. **Report both ceilings, and if the gap between them is large, that gap is your
+next attempt.**
