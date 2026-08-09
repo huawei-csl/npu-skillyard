@@ -1208,6 +1208,30 @@ way, having read 1.04x in *our* favour at K=16.
 the comparison is unresolved. Do not quote the largest K as though it were the answer, and do not
 quote the K that flatters you. If K=16 and K=256 disagree in *direction*, you do not have a result.
 
+### A cached `data_ptr()` is a LIFETIME OBLIGATION -- anchor the tensors
+
+A harness that pre-computes `ctypes` pointers outside the per-call closure takes on a lifetime
+obligation Python will not enforce. If a tensor is referenced by nothing after the builder returns,
+the allocator frees it and the cached `data_ptr()` dangles.
+
+**Why this is worse than an ordinary use-after-free:** it surfaces as a *hardware* error that
+points at the kernel, not at the harness. A dangling **output** buffer corrupts memory without
+changing runtime, so timing looks fine. A dangling **input** that feeds address arithmetic is
+lethal: one kernel does a scalar GM read of a block index and multiplies it into an address, so a
+recycled buffer holding float bits (~1e9) produced ~3e15 -- **past 48 bits**, reported as
+`507057 GM address exceeds 48 bits` and blamed on the kernel for a full debugging session.
+
+It is also **capricious**, which sends you chasing the wrong variable: left alone the freed block
+still holds the zeros you wrote and everything passes; `zero_`/`empty` come from a different pool
+and still pass; only when `randn`/`matmul`/a vendor op reuses that block does it fault. We
+initially blamed the L2-bypass alias and the K-batching loop -- both refuted, since the fault
+reproduces at K=1 with a sync after every call and with the alias off.
+
+**Rule: every tensor whose `data_ptr()` you cache must be reachable from the returned spec for as
+long as the closure lives.** Anchor them explicitly; do not rely on another closure happening to
+capture them. An audit of one campaign found **25 of 28 case adapters keeping their tensors alive
+purely by accident.**
+
 ### Ballast 0 is INVALID as a sweep endpoint
 
 A zero-work probe reads **102 us at ballast 0** against **1.3 us at ballast >= 1**: with no
