@@ -178,7 +178,8 @@ Follow the template in `references/benchmark_patterns.md`:
 3. Define `benchmark_kernel()` that:
    - Allocates NPU tensors at the contract's PRODUCTION sweep sizes (not toy dims)
    - Runs warmup iterations, then synchronizes once
-   - Measures device-side latency with `torch.npu.Event` pairs (one per iter), flushing
+   - Measures device-side latency with `torch.npu.Event` pairs (one per rep, **K>=16 calls
+     bracketed per window and divided by K**), flushing
      a 256 MiB int8 L2 scratch (`.zero_()`) before each timed call, then `synchronize()`
      ONCE and reads `elapsed_time` (ms -> ns). A `--timer wallclock` per-iteration
      fallback is allowed but not the default.
@@ -216,7 +217,7 @@ Before returning the JSON output, verify:
 - [ ] Every tensor passed to `call_kernel` is forced `.contiguous()` immediately before `.data_ptr()` (guards against non-contiguous views from inv/solve/transpose/permute/broadcast/slice)
 - [ ] ValidationScript has DEFAULT_CASES with ≥6 BT values (from StageSpec, not hard-coded)
 - [ ] ValidationScript uses the fp64 Frobenius rel-error gate (ftol=2e-3) with an fp64-built reference (rule 15)
-- [ ] BenchmarkScript uses `torch.npu.Event` device timing (default) with a per-iteration 256 MiB L2 flush; `--timer wallclock` is an optional fallback, not the default
+- [ ] BenchmarkScript uses `torch.npu.Event` device timing (default) with a 256 MiB L2 flush and **K>=16 calls per event window (K reported on every row)**; `--timer wallclock` is an optional fallback, not the default
 - [ ] BenchmarkScript reports all 6 statistics (mean, min, max, median, p95, stddev) in ns
 - [ ] BenchmarkScript benchmarks at the contract production sweep and supports `--l-seg-list`
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
@@ -321,7 +322,10 @@ Before returning the JSON output, verify:
 
 ### Benchmark Rules
 
-18. Default to `torch.npu.Event` device timing: record one start/end pair per iteration,
+18. Default to `torch.npu.Event` device timing: preallocate one start/end pair per rep and
+    **bracket K>=16 back-to-back calls per window, dividing by K** (a 1-call window charges each
+    arm its own enqueue latency, which differs 10-12 us vs 50-57 us between a ctypes launch and a
+    torch_npu op -- see "BATCH K CALLS PER EVENT WINDOW"),
     `.zero_()` a 256 MiB int8 L2 scratch before each timed call, `synchronize()` once at
     the end, read `elapsed_time` (ms) and convert to ns. `--timer wallclock` (per-iteration
     `perf_counter`) is an explicit fallback, not the default. Never report a single batch
@@ -1121,6 +1125,60 @@ Measured against a 434.81 us wall-clock ground truth:
 | one pair reused for all reps | 434.64 us | **NO -- 1 sample repeated** |
 
 Preallocation matches fresh events to 0.05% while keeping the host cost outside the loop.
+
+### BATCH K CALLS PER EVENT WINDOW -- one call per window charges each arm its OWN enqueue cost
+
+**This is the single most damaging measurement fault found in this campaign. It silently
+invalidated four recorded results and required a campaign-wide re-measurement.**
+
+A window that brackets exactly one call measures *host enqueue latency + device work*, not device
+work. That charge is **per-arm**, and arms rarely enqueue at the same cost: a raw `ctypes` kernel
+launch enqueues in **10-12 us**, while a `torch_npu` operator call enqueues in **50-57 us**. The
+difference is charged straight into the ratio.
+
+**The correct form: record `start`, issue K back-to-back calls, record `end`, divide by K.** Use
+**K >= 16** whenever per-call device time is under ~500 us. Batching amortizes the enqueue (and
+the flush overhead) by 1/K and lets launches pipeline, which is what production actually does.
+
+Measured on `group_norm_silu`, changing **only** K, same buffers and ballast:
+
+| K (calls per window) | ours | vendor | verdict |
+|---|---|---|---|
+| **1** (old protocol) | 167.4 | 181.6 | **1.09x FASTER** |
+| **16** (correct) | 168.1 | 130.7 | **1.28x SLOWER** |
+
+Our arm is flat across K; the **vendor arm collapses from 142.4 us at K=1 to 83.1 us at K=4**, and
+is flat thereafter, converging on its 83.4 us wall-clock anchor. The entire "win" was the vendor
+paying its own enqueue inside our timing window.
+
+**The sign is arm-dependent, so you cannot correct for it after the fact.** On
+`group_norm_silu` the bias favoured us; on `ffn` the per-call flush charged **our** arm +13.9%
+against its anchor versus the vendor's +4.9% -- the opposite direction. A K=1 result is not
+"slightly optimistic", it is untrustworthy in an unknown direction.
+
+**Both existing detectors are blind to it, by construction:**
+* the **null control** is an arm-against-itself ratio, so an identical per-arm charge cancels
+  exactly -- it read 0.9995-1.0000 on rows that were wrong by 40%;
+* the **paired-vs-ratio-of-medians divergence** detector read "sound" (0.04%) throughout.
+
+Only two things catch it: an **absolute per-arm anchor**, and the **achieved-bandwidth
+plausibility check**. On the case above, the vendor's true 125.6 us for 141.6 MB is
+**1128 GB/s = 99.3% of the 1136 GB/s ceiling** -- it is physically near-optimal and cannot be
+materially slower, while the campaign harness reported that same arm at 782 GB/s (69%). *A
+memory-bound vendor kernel reported far below a ceiling it can demonstrably reach is a
+measurement bug, not a slow kernel.*
+
+**Report K on every row**, and sweep it (1/4/16/32) at least once per case to show the reading has
+converged. If the ratio moves with K, only the converged high-K end is meaningful.
+
+### Ballast 0 is INVALID as a sweep endpoint
+
+A zero-work probe reads **102 us at ballast 0** against **1.3 us at ballast >= 1**: with no
+ballast the device queue drains and the window measures pure host latency. Sweep ballast from
+**1** (1/2/4/8). Ballast 0 may be recorded as a *diagnostic* -- a large gap between 0 and 1 is
+itself evidence of starvation -- but must never be averaged in or used as a data point. This
+sharpens the earlier "sweep including 0" guidance: include it to *see* starvation, never to
+*measure* through it.
 
 **Also count implausible readings.** One run reported an `elapsed_time` of 0.16 us for a kernel
 whose real duration was 1205 us. That specific drop did **not** reproduce here on a torch-op
