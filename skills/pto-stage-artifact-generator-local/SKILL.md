@@ -1171,6 +1171,43 @@ measurement bug, not a slow kernel.*
 **Report K on every row**, and sweep it (1/4/16/32) at least once per case to show the reading has
 converged. If the ratio moves with K, only the converged high-K end is meaningful.
 
+### An anchor must be a DIFFERENT METHOD, not the same method at a different moment
+
+A campaign result recorded a clean-looking absolute anchor (83.84 us at the start, 83.52 us at the
+end, 0.38% drift) and was still wrong by 1.6x. The anchor's metadata said
+`timer: "torch.npu.Event, one pooled pair per rep"` -- **the same K=1 event timing as the
+measurement it was supposed to check.** It re-measured the biased quantity at two moments and
+correctly found it repeatable. Repeatability is not validity.
+
+**An anchor only anchors if it fails differently from the thing it checks.** The same instrument at
+a different time is a stability check, not an anchor. Record the anchor's *method* beside its
+value; if that method matches the measurement's, it is not evidence.
+
+**Wall-clock anchoring has its own blind spot: it fails when enqueue exceeds device time.** Where
+the host cannot keep the device fed, the wall clock is floored at the *host* rate and reports the
+enqueue cost however fast the kernel is. Several vendor arms here are `HOST-BOUND` in exactly that
+way (enqueue 74-79 us against 39-46 us of device work), so their wall clock could not have caught
+the error either. **Flag any arm whose enqueue exceeds its device time as HOST-BOUND and do not
+use its wall clock as an anchor.**
+
+What still works when both anchors are compromised:
+1. **The K sweep itself** -- push K until the ratio stops moving. A ratio that moves with K is not
+   a measurement of the kernel.
+2. **Achieved rate against the hardware ceiling** -- method-independent and physical. Batching
+   moved one vendor arm from **40% to 74% of the 295 TFLOP/s cube peak**; that signature (a vendor
+   arm implausibly far below a ceiling it demonstrably reaches) identified every instance.
+
+### K CAN BE TOO LARGE -- report the sweep, not a single K
+
+Very large K introduces a *second* artifact: under sustained back-to-back load our own arm degraded
+from **228 to 197 TFLOP/s** (thermal/power/cache), biasing the ratio the other way. One case never
+converged at all -- 1.056 / 1.117 / 1.150 / 1.165 at K = 32 / 64 / 128 / 256, drifting the whole
+way, having read 1.04x in *our* favour at K=16.
+
+**A non-converging K sweep is a NULL RESULT, not a measurement.** Report the sweep and state that
+the comparison is unresolved. Do not quote the largest K as though it were the answer, and do not
+quote the K that flatters you. If K=16 and K=256 disagree in *direction*, you do not have a result.
+
 ### Ballast 0 is INVALID as a sweep endpoint
 
 A zero-work probe reads **102 us at ballast 0** against **1.3 us at ballast >= 1**: with no

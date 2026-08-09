@@ -633,8 +633,22 @@ this design when testing any future axis: **vary the suspected variable inside o
 than comparing two kernels that differ in a dozen ways. The cross-case pair told us *that* the
 axis was conditional; only the within-case sweep told us *what* the condition is.
 
-That case also shows the payoff is worth the gate: the axis moved it from **1.131x slower to
-1.614x faster** than the vendor.
+> **CORRECTION -- the vendor-facing half of this claim was a measurement artifact.** This rule
+> previously ended: "the axis moved it from 1.131x slower to 1.614x faster than the vendor." A
+> corrected re-measurement (K>=16 calls per event window) **flips that**: the same kernel reads
+> 1.04x faster at K=16 and 1.22x SLOWER at K=256, never converging, so *no* vendor-facing claim is
+> established for this case. The old 1.614x is reproduced almost exactly by K=1 (1.621x), which
+> identifies it as the enqueue artifact.
+>
+> **What survives, and why it survives, is the part this rule actually needs.** The layout win is
+> measured **ours-vs-ours** -- packed-NZ against our own ND, same kernel, same launch path -- at
+> **1.08x on the primary shape and 1.22x on MoE**. An ours-vs-ours comparison is *structurally
+> immune* to the enqueue bias, because both arms pay an identical host cost that cancels in the
+> ratio. So the optimizer's internal decisions were sound even while the vendor comparison was not.
+>
+> **General lesson for every rule in this file:** an optimization axis should be justified by an
+> ours-vs-ours A/B, never by a vendor delta. Vendor comparisons belong in the final report, not in
+> the search loop -- they carry a bias that an internal A/B does not.
 
 **Practical gate, before spending an attempt on layout:** compute the candidate operand's share of
 total traffic and the live working set against L2. Under a few percent of traffic, or comfortably
