@@ -1208,6 +1208,54 @@ way, having read 1.04x in *our* favour at K=16.
 the comparison is unresolved. Do not quote the largest K as though it were the answer, and do not
 quote the K that flatters you. If K=16 and K=256 disagree in *direction*, you do not have a result.
 
+### THE L2 FLUSH IS A TREATMENT, NOT A CONTROL -- and ours sat on a knee
+
+**The 256 MiB `zero_()` L2 flush this harness uses everywhere is not neutral between arms.** It
+was adopted to put both arms in a cold cache, i.e. as a *control*. It is in fact an independent
+variable with a large, asymmetric effect, and the campaign's chosen size sits just past the worst
+point of it.
+
+What actually controls the result is **how many DIRTY bytes the preceding work leaves in LLC**,
+not how much data is evicted. Measured on a grouped matmul at fixed total eviction, sweeping only
+the dirty fraction:
+
+| dirty bytes | vendor arm | our arm |
+|---|---|---|
+| 0 -- 128 MiB | 46.1 -> 47.0 us (flat) | 47.9 -- 49.5 us (flat) |
+| 144 / 160 / 176 / 192 / 224 MiB | 50.4 / 56.0 / 67.5 / 77.9 / **81.4 us** | **flat throughout** |
+
+The vendor arm degrades **77%**; ours moves **3%**. The knee coincides with the independently
+probed LLC capacity (128-192 MiB). Three controls isolate it: a **read-only** evictor of the same
+1 GB produces *no* penalty (so it is dirtiness, not eviction), a 3 ms drain spacer changes nothing
+(so it is not queue drain), and private per-slot weight copies change it by <3% (so it is not
+sharing).
+
+**Consequence: the same kernel pair reports either winner depending on the flush size.** Across
+four defensible cache states one case read 1.11x slower / 1.13x faster / 1.04x slower / 1.66x
+faster. **A 128 MiB flush would have named the opposite winner from a 256 MiB flush.** Our arm
+varied 22% across all states; the vendor's varied **124%**.
+
+**Rules:**
+1. **Sweep the flush size** (0 / 64 / 128 / 256 MiB) at least once per case and report the ratio at
+   each. If the ratio moves with flush size, the flush is an independent variable for that case and
+   **no single number is reportable** -- report the range and the mechanism.
+2. **Distinguish read-eviction from write-dirtying.** They are not the same treatment. If you want
+   a cold cache without the dirty-writeback penalty, evict by *reading* a large buffer.
+3. **Never describe the flush as a control** in a report. Call it what it is: a cache-state
+   treatment that both arms receive and respond to differently.
+4. A kernel that **bypasses L2** is insensitive to this; one that streams through L2 is not. So the
+   asymmetry is largest exactly where one arm uses a bypass alias and the other does not -- i.e.
+   precisely the cases whose wins we attribute to the alias.
+
+### WHEN BOTH ARMS ARE HOST-BOUND, USE THE DEVICE PROFILER
+
+Neither event timing (charges enqueue, see above) nor wall clock (floored at the host rate for a
+HOST-BOUND arm) is admissible when the vendor's issue cost exceeds its device time -- 73.9 us issue
+against 36-81 us of device work in the case above. **Use `torch_npu.profiler` and read on-device
+kernel duration from `kernel_details.csv`.** It touches neither host enqueue nor the wall clock and
+is the only valid instrument in that regime. It is the method of last resort and it resolved a case
+that two host-timer methods could not.
+
 ### A cached `data_ptr()` is a LIFETIME OBLIGATION -- anchor the tensors
 
 A harness that pre-computes `ctypes` pointers outside the per-call closure takes on a lifetime
