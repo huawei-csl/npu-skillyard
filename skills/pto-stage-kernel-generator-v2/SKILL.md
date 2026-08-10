@@ -406,6 +406,46 @@ On A2/A3, Cube-side `wait_flag_dev` for V→C reduces over both Vec subblocks;
 if `vid != 0` returns early, Cube cannot safely wait on that V→C flag.
 Use `pipe_barrier(PIPE_ALL)` only for intra-core sync, never cross-core. → COOK-§8, §8.6
 
+### C33b: A VECTOR-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH -- it costs 2.88 us per call
+
+**Every kernel this generator has produced launches as `MIX_AIC`** (CANN
+`KERNEL_TYPE_MIX_AIC_1_2`, profiler `Accelerator Core = MIX_AIC`, `Mix Block Num = 2 x Block
+Num`) -- **including pure-vector elementwise ops where the Cube engine does no work at all.** The
+vendor ships `AI_VECTOR_CORE` for exactly those ops.
+
+A MIX launch carries a **flat 2.88 us of device-side dead time per call**, on top of the kernel's
+reported `Duration`. Measured as a crossed 2x2, with durations fully overlapping between groups so
+it is not a kernel-size effect:
+
+| launch mode | path | n | gap median |
+|---|---|---|---|
+| MIX | ours (`ctypes`) | 14 | **2.880 us** |
+| MIX | vendor (ACL) | 3 | **3.009 us** |
+| single-engine | ours (control build) | 5 | **0.010 us** |
+| single-engine | vendor (ACL) | 5 | **0.079 us** |
+
+The toll is a property of MIX mode, not of our code or our submission path -- the vendor pays it
+too on its MIX kernels. **The defect is paying it on work that needs one engine.** It is 288x the
+single-engine gap, and it is **not reducible by any runtime knob**: `TASK_QUEUE_ENABLE`, K, queue
+run-ahead, `block_dim` and submission API all move it by <=1.6%.
+
+**Why this dominates small shapes.** It is flat, so it is invisible at production scale and
+decisive below ~10 us of device work. On three cases whose device duration is ~2.3-2.4 us, the toll
+more than doubles delivered time: `gelu`, `dynamic_quant` and `reshape_and_cache` all read as wins
+on `Duration` and as **losses on delivered period** (2.05x, 1.29x and 1.25x slower respectively).
+
+**Do NOT try to fix this with a compile flag.** Rebuilding the *unmodified* source with
+`--cce-aicore-arch=dav-c220-vec` does produce `AI_CORE` with a 0.010 us gap -- and **computes the
+wrong answer** (about half the output NaN), because the work partitioning assumes the mix geometry
+(`lanes = 2 x block_dim`, both AIV sub-blocks as workers). **The fix belongs in generation:** when a
+stage uses no Cube instruction, emit a single-engine kernel *and* partition the work for one engine,
+rather than emitting mix geometry and changing the arch flag underneath it.
+
+**Rule:** decide the launch mode from the stage's archetype. If the StageSpec contains no Cube
+operation (`TMATMUL*`, `TMOV` to/from `Acc`), the stage is vector-only and must be generated,
+partitioned and built single-engine. Reserve MIX for genuine Cube+Vector work, where the ~3.0 us is
+a floor the vendor pays as well.
+
 **For an ALL-CORE barrier, use the library `SYNCALL<Mix>` -- do NOT hand-roll.**
 `aicore exception 507015` (invisible to the simulator -- C25) is most often a
 hand-rolled cross-core barrier gone wrong: a non-deterministic race that passes a
