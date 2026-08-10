@@ -79,6 +79,44 @@ advantage is almost always a leaner slope.
   for. Those lead to opposite decisions about whether to keep hunting for UB room.
   A control is cheap: same source file, one compile-time switch.
 
+### SHIP A block_dim SCHEDULE, NOT A block_dim CONSTANT
+
+**`block_dim` is a RUNTIME ARGUMENT, not a property of the compiled kernel.** Tuning it once at the
+contract's production point and shipping that constant is the single largest avoidable defect this
+campaign found in the generated artifact, and it is invisible at the shape you tuned on.
+
+Measured cost: **0.10-0.17 us of device time per launched block.** At `block_dim=24` that is ~2.4 us
+of pure launch overhead -- 1.1% of one kernel's 212 us production runtime, and approximately the
+ENTIRE runtime at the smallest shape in its own contract sweep. Re-tuning the single integer at the
+small shape, same `.so`, **output bitwise-identical** (33 configs gated, max relative difference
+exactly 0):
+
+| case | smallest shape | shipped `block_dim` | best `block_dim` | effect |
+|---|---|---|---|---|
+| `gelu` | N=40,000 | 24 | **8** | 1.49x slower -> 1.04x FASTER |
+| `reshape_and_cache` | T=14 | 24 | **2** | 1.43x slower -> 1.77x FASTER |
+| `rope` | S=128 | 48 | **10** | 1.09x slower -> 1.43x FASTER |
+| `rotary_mul` | S=128 | 24 | **4** | 1.31x -> **2.53x** FASTER |
+| `dynamic_quant` | N=64 | 24 | **1** | 1.16x -> **1.66x** FASTER |
+
+**No single constant works.** The optimum moves monotonically with problem size (measured for
+`gelu`: 4 -> 8 -> 20 -> 24 -> 24 -> 24 as N grows), and the best compromise value still costs ~1.4x
+somewhere in the contract's own sweep. A useful model for the large-shape side is
+`t(bd) = t(bd_max) * (bd_max/bd) * ceil(bd/bd_max)`, which predicted the measured curve to 3.1%.
+
+**Required:** emit a **per-shape `block_dim` selection** in the host wrapper, not a constant.
+Cheapest correct form is a host-side autotune over one integer at first call per shape, cached, and
+**gated on bitwise-identical output** against the shipped configuration -- the gate is what makes it
+free of correctness risk, since `block_dim` must not change results. A static table keyed on the
+contract's sweep points, with interpolation between them, is an acceptable substitute where a
+first-call probe is unacceptable.
+
+**Why this was missed, and the general rule:** the pipeline tuned `block_dim` at the same shape it
+reported, so the configuration was optimal exactly where it was scored and nowhere else. **Never
+tune a free runtime parameter only at the point you report.** Sweep it across the contract's whole
+benchmark range and ship a schedule; if you ship a constant, state the range over which it was
+validated.
+
 - **If reducing `block_dim` makes the kernel FASTER, you are footprint-bound, not
   compute-bound.** This is a one-command diagnostic and it is decisive, because using
   fewer cores should always cost time unless the cores were never the constraint. Sweep
