@@ -1523,3 +1523,57 @@ start event.
 The same applies to any per-call setup that exists only on one arm -- a fill, a cache flush, an
 allocation. **Ask of every step in the timed region: does the other arm pay this too?** If not,
 it belongs outside.
+
+---
+
+## INPUT CONDITIONING IS A COVERAGE AXIS, SEPARATE FROM SHAPE
+
+The coverage gate requires every shape in the contract sweep including the production size.
+It says nothing about **how the input data is conditioned**, and the default `randn` /
+`rand` generators are structurally blind to an entire class of numerical failure.
+
+Measured: a single-traversal second-moment reduction passed **all ten sweep cases at
+1.28e-07** against a 2e-5 tolerance, and is **6.15e-04 (31x over) at a DC offset of 100** and
+**NaN at 1e4**. Nothing about the shape sweep could have caught it.
+
+**Generate validation data from an input-conditioning clause, not only from `randn`.** For
+any stage that computes a variance, moment, norm, softmax, or any difference of large
+accumulations, include:
+
+* a **DC offset** sweep (`mean/sigma` around and past ~30, plus one extreme);
+* a **dynamic-range** case (values spanning several orders of magnitude);
+* a **near-cancellation** case if the algebra admits one;
+* the degenerate endpoints already required.
+
+Report these rows separately from the contract sweep so a reader can see both. If the
+contract carries no conditioning clause, generate these anyway and say you did -- an
+unstable kernel that passes is worse than one that fails.
+
+## HARNESS: WHAT YOU MEASURE IS OFTEN YOUR OWN LAUNCH PATH
+
+At small shapes both arms are host-bound and a wall-clock `npu.Event` window measures host
+dispatch, not the kernel. Whether an arm reads steady or starved is frequently a property of
+the harness rather than of the kernel. Measured, on one binary at one `block_dim`, changing
+ONLY the harness:
+
+| harness | per-call enqueue | gap / IQR |
+|---|---|---|
+| naive per-call `ctypes` marshalling | **33-42 us** | 7.910 / 2.141 -- starved |
+| `Stream` object hoisted, argument vector pre-converted | **6.7-7.0 us** | **0.070 / 0.240 -- steady** |
+
+`torch.npu.current_stream()` alone costs **17.85 us/call**. The lifetime obligation is on the
+`Stream` OBJECT, not on the call site: hoist it and reuse its handle -- do not re-fetch inside
+a timed loop, and do not marshal arguments per call.
+
+**Set `TASK_QUEUE_ENABLE=0`.** With it enabled, a raw `ctypes` launch loses ordering against
+torch ops on the same stream and produces run-to-run NaN that mimics a cross-core race (12 of
+28 cases on a kernel with no cross-core sync in it; 28/28 clean once disabled, with no kernel
+change). **Know that it is itself arm-asymmetric**: it slows the *vendor's* host path
+(77-78 us/call vs 61-64 at TQ=1) while leaving ours unaffected. It does not touch device
+period, so device-side comparisons are safe -- but any wall-clock vendor comparison run under
+it is biased in our favour at host-bound shapes, and no small-shape wall-clock speedup should
+be reported as a kernel result.
+
+Ballast: an oversized `.zero_()` is **still draining** when a short burst begins and inflates
+small-shape durations 1.5-2.5x inconsistently. Size it, and enqueue it AHEAD of the timed
+burst -- a host-bound arm cannot be rescued by averaging.

@@ -692,3 +692,102 @@ axis was conditional; only the within-case sweep told us *what* the condition is
 total traffic and the live working set against L2. Under a few percent of traffic, or comfortably
 inside L2, spend the attempt elsewhere and record why. This is the same shape as the seam
 analysis: a cheap up-front calculation that tells you whether an axis can possibly pay.
+
+---
+
+## 3.6 NAME THE BINDING RESOURCE, WITH ITS NUMBER, BEFORE CHOOSING WHAT TO ATTACK
+
+The single highest-value first attempt available to you is a **one-resource / noop-floor
+probe**: rebuild the same source with the arithmetic deleted (traffic and sync identical),
+and again with the loads deleted. It costs one or two builds and it has repeatedly
+overturned the obvious story.
+
+Measured consequences of skipping it:
+
+* A campaign stopped at **"85% of HBM peak"**. The probe showed compute-only 26.30 us,
+  DMA-only 19.64 us, full kernel 27.29 us -- the DMA was ~100% hidden and the kernel was
+  **vector-bound, 39% above its real ceiling.** The 85% was a roofline for the NON-BINDING
+  resource and licensed a stop that had not been earned.
+* Another kernel's headroom was entirely in one cache state: an arithmetic-deleted probe
+  showed the production HBM-bound case was **already ON its floor** (81.04 vs 80.22 us), so
+  every attempt was correctly aimed at the L2-resident state instead, and the HBM arm came
+  out neutral by design rather than by failure.
+* A third declined to build two plausible structural rewrites because the probe showed the
+  memory path had **45% headroom** and neither change removed a vector op.
+
+**A roofline percentage is a valid stop gate ONLY for the resource measured to be binding.**
+Which resource binds must come from a probe -- never from the kernel's shape, its dtype, or
+how it "looks". Report the binding resource, its probe value, and your ratio against THAT
+ceiling.
+
+**A traffic ratio is a hypothesis, not a diagnosis.** "We move 1.5x the bytes the vendor
+does" says nothing until a probe shows those bytes are not already hidden. On one case that
+exact argument was refuted: deleting ALL of the load path saved **2.7%** and **0.8%** on the
+two stages, because the redundant read was >97% overlapped.
+
+## 3.7 EVERY ATTEMPT IS A PAIRED (PERFORMANCE, CORRECTNESS) OBSERVATION
+
+Run the numerical gate on **every measured attempt**, not only on the final binary. The
+optimiser's objective function actively rewards two specific bugs:
+
+* removing a `pipe_barrier(PIPE_V)` between dependent vector arithmetic -- **3-4% faster,
+  relative error up to 1.3e+20** (COOK-§6.26);
+* replacing a two-pass reduction with a single-traversal one -- **6.6% faster, 31x over
+  tolerance under a DC offset** (COOK-§22).
+
+Both are **faster AND wrong**, and both are shape- or distribution-dependent: they pass at
+some points of the sweep and fail at others. An attempt that improves time while failing
+tolerance is a **REVERT plus a reportable finding**, never a candidate.
+
+## 3.8 A PAIRED INTERLEAVED A/B IS INVALID WHEN THE ARMS SHARE A RESOURCE THE TREATMENT MODIFIES
+
+Interleaving defeats drift and you should keep using it. It has its own failure mode, and it
+produces a confidently wrong answer with every safeguard green.
+
+Measured: an interleaved A/B priced an L2-bypass alias at **1.0000, CI [1.0000, 1.0003]**,
+three shapes, valid null control. Measured **single-arm, one arm per process**, the same
+alias is a **1.15x REGRESSION**. The alias suppresses cache *allocation* but not *lookup*, so
+the alias-off arm was **populating the cache for the alias-on arm**. On a second case the
+contaminated reading had already SHIPPED and been defended as load-bearing before a
+single-arm re-measure inverted its sign.
+
+**Before trusting a paired A/B, name the resource the two arms share and ask whether the
+treatment changes it.** Cache residency, queue depth and DVFS all qualify. When they do,
+measure single-arm in separate processes, or from a cold state where there is nothing to
+leak. **If a paired and a single-arm reading disagree, the single-arm one wins.**
+
+**Free contamination detector:** treatments that are independent must COMPOSE. If A alone
+and B alone do not multiply to AB, the pairing is leaking. One case read
+`alias_x` 0.916, `alias_y` 1.001, `alias_xy` **0.636** -- physically impossible, since
+`alias_y` alone is a no-op. Single-arm gave 0.791 / 1.000 / 0.791. The non-composition was
+visible for free, with no re-measurement.
+
+## 3.9 CACHE-BYPASS ALIASES: measure LAST, in the FINAL configuration
+
+Across eleven measured cases the alias trigger mispredicted on every one where it was
+applied early. What survives is a discriminator and one number, not a recipe:
+
+* **The alias wins iff the live working set EXCEEDS the last-level cache**, and loses when
+  the set is resident. Measured crossover on schedule redundancy: **~1.9x**.
+* A capacity sweep on one kernel: flat **1.000x** from 100 to 176 MiB, **1.089x** at 192 MiB,
+  **2.55x** at 240 MiB. It is a **cliff at capacity, not a slope**.
+* **Any bottleneck-moving change invalidates a prior alias measurement, in either
+  direction.** The same operand at the same working set flipped 0.867x -> 1.026x purely from
+  software-pipelining the loop. So "alias first, then tune" is exactly backwards.
+* "Write-only operands should always bypass" is **falsified** (0.915x, replicated 3x).
+* Per-operand aliases do not compose: two that each helped (1.10x, 1.07x) were a **2.03x
+  regression** together.
+
+**Rule:** ship the alias as a runtime knob defaulted OFF, measure it as your LAST attempt in
+the final configuration, single-arm (§3.8), and record the cache state with every number. An
+alias figure quoted without its cache state is not reproducible.
+
+## 3.10 DECIDE KEEP/REVERT ON THE FULL CONTRACT SWEEP
+
+An attempt measured **1.008x at the production point and 0.952-0.965x** where the kernel's
+actual headroom was. A production-only view would have shipped it. Keep/revert is a decision
+about the contract, not about one shape.
+
+Corollary: effects under ~3% require interleaved replication (subject to §3.8) before they
+are believed. One campaign retracted a 1.006-1.008x "win" with a within-process CI clear of
+1.0 after replication put it at 1.000-1.004x against a 0.6-1.3% spread.

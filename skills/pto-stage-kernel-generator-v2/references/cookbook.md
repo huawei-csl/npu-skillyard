@@ -3944,3 +3944,116 @@ the `4D/Bk` term is absent entirely.
 measured, not modelled: GM-request rate **3103 GB/s** against this device's measured **1188 GB/s**
 HBM ceiling (2.6x over), and a footprint-only control showing **0.998 / 1.042 / 1.401x** at
 72/144/288 MiB, breaking exactly at the independently measured 192-256 MB knee.
+
+---
+
+## COOK-§6.25 -- TRSQRT: the ARITY selects the algorithm, and the 2-arg form is APPROXIMATE
+
+`pto-isa` declares two overloads and **neither a `PrecisionType` template argument nor any
+other flag selects between them -- the argument count does**:
+
+| form | algorithm | measured relative error |
+|---|---|---|
+| `TRSQRT(dst, src)` | approximate `vrsqrt` | **9.5e-04 .. 3.0e-03** |
+| `TRSQRT(dst, src, tmp)` | `vsqrt` + `vdiv` | **4.2e-08 .. 8.8e-08** |
+
+On an fp32 contract with a 1e-5..2e-5 tolerance the 2-argument form is **47x to 119x over**,
+and it fails silently -- no fault, no NaN, and it will pass a loose gate. Four independent
+runs hit this on different algorithms.
+
+**Rule:** use the 3-argument form. Use the 2-argument form only after MEASURING that the
+approximate error fits your contract's tolerance, and say so in the report. The approximate
+form has not been observed to be measurably faster on a reduction-shaped kernel (one tile op
+per row), so there is usually no trade to argue.
+
+Related: `TDIV` and `TEXP` **ignore** their `PrecisionType` template argument on a2a3 (one
+implementation each). Asking for precision through the template gets you nothing.
+
+## COOK-§6.26 -- `pipe_barrier(PIPE_V)`: what is load-bearing, and what is pure tax
+
+Intra-V RAW is **not interlocked** on this part. Removing a `pipe_barrier(PIPE_V)` between
+two dependent vector ARITHMETIC ops measures **3-4% FASTER** and is numerically wrong --
+observed at relative errors from 1.9e-01 up to **1.3e+20**.
+
+The performance signal and the correctness signal point in OPPOSITE directions here, and the
+faster arm is the broken one. A pure-performance A/B will ship it.
+
+But the barrier is not uniformly required:
+
+| barrier position | required? | measured |
+|---|---|---|
+| between two dependent vector arithmetic ops | **YES** | removing it: rel err 1.9e-01 .. 1.3e+20 |
+| ordering arithmetic ahead of a `set_flag` on the same pipe | **no** | removing it: worth ~1.02x |
+
+**The failure is SHAPE-DEPENDENT.** One kernel kept passing at its largest shape while being
+19% off at a small one. A validation set that only exercises the production shape will ship
+this bug -- which is a concrete reason the coverage gate demands the whole contract sweep.
+
+Related: the blanket `pipe_barrier(PIPE_ALL)` idiom carries a measured **~2x price** against
+per-edge flags on a vector-bound kernel. Prefer per-edge tokens once the dependency graph is
+known; keep `PIPE_ALL` for the cases you have not analysed.
+
+## COOK-§22 -- NUMERICALLY UNSTABLE REDUCTIONS: the shape sweep cannot see them
+
+A single-traversal second-moment reduction -- `var = E[x^2] - mean^2`, and the same family of
+"accumulate raw sums, subtract at the end" forms -- saves a traversal and measures **~6.6%
+faster**. It is also **catastrophically unstable when the mean is large relative to the
+standard deviation**, because it subtracts two large nearly-equal quantities.
+
+Measured against a 2e-5 fp32 contract:
+
+| input | single-traversal | two-pass |
+|---|---|---|
+| `randn` (what the contract generates) | 1.28e-07 -- **passes** | 1.28e-07 |
+| DC offset 100 (`mean/sigma ~ 100`) | **6.15e-04 -- 31x OVER** | 5.2e-08 |
+| DC offset 1e4 | **NaN** | at the fp32 conditioning floor |
+
+Crossover is around `mean/sigma ~ 30`.
+
+**The gate cannot catch this.** It passed EVERY shape in the contract sweep, including the
+production size, because the generated test data is `randn` and is structurally blind to
+cancellation. **Shape coverage and distribution coverage are different axes.**
+
+**Rules:**
+1. Use the **two-pass** form (mean first, then centred second moment) unless the contract
+   states an input-conditioning bound that licenses the fast form.
+2. When a stage computes a variance, moment, norm or any difference of large accumulations,
+   add a **DC-offset / dynamic-range stress case to your own validation** even when the
+   contract does not ask for one. It costs one extra test and it is the only thing that sees
+   this class of bug.
+3. A speedup that comes from removing a traversal of a reduction is a **suspect**, not a win,
+   until it has been run against ill-conditioned input.
+
+The cost of the safe form is real and should be stated rather than hidden: a 3-traversal
+two-pass kernel cannot reach a 2-traversal kernel's duration. Report it as a Pareto point
+with both coordinates measured, not as a deficit.
+
+## COOK-§23 -- DMA ISSUED WITH ZERO SLACK: the commonest first-order defect in a staged loop
+
+The tell is arithmetic, and it is worth checking before any other optimisation on a
+vector-bound stage. Decompose the stage with one-resource probes (build with the arithmetic
+deleted, then with the loads deleted). If the parts are **ADDITIVE** --
+
+    total ~= DMA_time + compute_time      (e.g. 54.87 ~= 24.15 + 30.72)
+
+-- then nothing is overlapping and the loads are exposed. A well-pipelined stage shows the
+smaller term almost entirely hidden (`total ~= max(DMA, compute)`).
+
+**The fix is slack, not more buffers.** A 2-slot double buffer whose refill targets the slot
+consumed in the SAME iteration still issues the load with no time to complete. Give the
+refill a full iteration of distance:
+
+* use a **3-slot ring** and refill the slot stored a **full iteration ago**;
+* issue refills **as early in the iteration as the dependencies allow** -- immediately after
+  the last consumer of that slot's data, not after an unrelated scalar readback or a
+  reduction tail that sits between them.
+
+Measured on independent kernels: 1.251x and 1.164x from those two changes alone; a separate
+kernel recovered 1.23-1.29x from the same class of change.
+
+**Two cautions, both measured:**
+* This is a *distance* optimisation and it can be overshot. Moving the refill all the way to
+  the loop top measured **0.806x** on one kernel by re-creating the very stall it removed.
+  Sweep the distance; do not assume more is better.
+* Do not reach for granularity or barrier-count first. On the two kernels where both were
+  tried, overlap/slack was worth 1.16-1.29x while barrier reduction was worth 1.03-1.07x.

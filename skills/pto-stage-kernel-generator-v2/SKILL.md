@@ -446,6 +446,43 @@ operation (`TMATMUL*`, `TMOV` to/from `Acc`), the stage is vector-only and must 
 partitioned and built single-engine. Reserve MIX for genuine Cube+Vector work, where the ~3.0 us is
 a floor the vendor pays as well.
 
+**THE PARTITION RULE, stated positively.** Measured with a direct geometry probe on this part:
+
+| arch flag | workers per block | `get_subblockid()` |
+|---|---|---|
+| `dav-c220-vec` (single-engine) | **1** | identically **0** |
+| `dav-c220` (mix) | 2 | 0 and 1 |
+
+So in a single-engine kernel, **partition on `get_block_idx()` / `get_block_num()` ALONE.**
+Do NOT write `lane = 2 * get_block_idx() + get_subblockid()`: under `-vec` only even lanes
+would ever exist, and **half the output is never written** -- that is the exact mechanism
+behind the "half the output NaN" result above. `COOK-§1.5`'s Vec preamble
+`if (get_subblockid() != 0) return;` is a harmless no-op under `-vec`, but do not let it lead
+you into mix-style lane arithmetic.
+
+The failure is **direction-dependent**, and neither direction is caught by validation:
+mix-geometry source built `-vec` is silently **WRONG**; single-engine source built for mix is
+silently **SLOW** (both sub-blocks redundantly compute the same lanes). Only a launch-mode
+check on the profiler's `Accelerator Core` column sees either.
+
+**How to EVIDENCE the fix as a number rather than assert it.** Build the *same source* with
+the mix flag at **half the `block_dim`**, so worker count and work partition are identical and
+only the launch mode differs; verify the two produce bitwise-identical output, then compare
+delivered device period. That control reproduced the toll at **2.72-3.03 us on eleven
+independent kernels**. Compare launch modes at equal WORKER COUNT, never at equal `block_dim`
+-- the latter conflates the launch mode with the partition and inflates the difference.
+
+**How much the redundant second AIV costs depends on what the stage is bound by:** ~1-2% on a
+compute-bound stage (the duplicated work is arithmetic the other sub-block was doing anyway),
+but **~2x on a traffic-bound stage**, because the redundant sub-block duplicates the `TLOAD`s
+and `TSTORE`s too. Measure it; do not quote either number.
+
+**A composed chain is legitimately HETEROGENEOUS** -- MIX on the Cube stages, single-engine on
+the vector ones. That is the correct outcome, not an inconsistency. Note that `SYNCALL<AIVOnly>`
+**deadlocks** in a `-vec` build (its FFTS barrier expects the mix participant count), and
+`SYNCALL<Mix>` reinstates the toll -- so a vector-only chain composes as stream-ordered
+launches, and the device-side seam then measures ~0.02-0.03 us, i.e. free.
+
 **For an ALL-CORE barrier, use the library `SYNCALL<Mix>` -- do NOT hand-roll.**
 `aicore exception 507015` (invisible to the simulator -- C25) is most often a
 hand-rolled cross-core barrier gone wrong: a non-deterministic race that passes a
@@ -1074,10 +1111,26 @@ source /usr/local/Ascend/cann/set_env.sh   # -> ASCEND_HOME_PATH (default: cann-
   kernel.cpp -o kernel.so
 ```
 
+**THE ARCH FLAG DEPENDS ON THE STAGE ARCHETYPE. Pick it with C33b, not from this recipe.**
+
+| stage archetype | flag | launches as |
+|---|---|---|
+| **vector-only** (no Cube op in the StageSpec) | `--cce-aicore-arch=dav-c220-vec` | `AI_CORE` |
+| genuine Cube+Vector | `--cce-aicore-arch=dav-c220` | `MIX_AIC` |
+
+Verified by `-dM`: `dav-c220` defines `__CCE_AICORE_ENABLE_MIX__` and compiles a CUBE pass;
+`dav-c220-vec` does not. **Using `dav-c220` on a vector-only stage costs a flat ~2.86 us of
+device-side dead time per call** (C33b), which is invisible at production scale and decisive
+below ~10 us of device work. Earlier versions of this rule hardcoded `dav-c220` and four
+independent runs had to override it.
+
+Changing the flag alone is NOT sufficient and NOT safe -- the work partitioning must match
+the geometry. See C33b for the partition rule.
+
 Key constraints:
 - Use the active CANN toolkit (default 9.0.0 via the `/usr/local/Ascend/cann` symlink); resolve `bisheng` and includes from `$ASCEND_HOME_PATH`, never a hardcoded version path
 - `-xcce` (CCE language mode, NOT `-x cce` with space)
-- `--cce-aicore-arch=dav-c220` — auto-defines `__CCE_AICORE__`, `__DAV_C220_VEC__`
+- `--cce-aicore-arch=dav-c220` or `dav-c220-vec` per the table above — both auto-define `__CCE_AICORE__` and `__DAV_C220_VEC__`; only `dav-c220` also defines `__CCE_AICORE_ENABLE_MIX__`
 - `-std=gnu++17` — C++17 with GNU extensions (NOT c++20, NOT c++17)
 - Do NOT add `-D__CPU_SIM` — CCE provides its own device runtime
 - Do NOT add `-nostdinc++` — CCE headers are self-contained
