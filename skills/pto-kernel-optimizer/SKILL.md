@@ -720,6 +720,53 @@ Which resource binds must come from a probe -- never from the kernel's shape, it
 how it "looks". Report the binding resource, its probe value, and your ratio against THAT
 ceiling.
 
+### CRITICAL: an engine-nulled floor bounds YOUR STRUCTURE, not the problem
+
+A noop-floor probe measures the floor of **the kernel you wrote**. It says nothing about
+what a *different* decomposition could reach, and it will happily license a stop far from
+the achievable time.
+
+Measured, same algorithm, same contract, same hardware, two independent generations:
+
+| | shipped | its own measured "floor" | stop reason it claimed |
+|---|---|---|---|
+| generation A | **74.92 us** | -- | budget |
+| generation B | 122.29 us | 115.78 us (Vec-only ablation) | **"hardware limit", 105.6% of floor** |
+
+Generation B stopped at a *correctly measured* 105.6% of its own Vec-only floor -- while a
+different structure for the same problem ran **1.63x faster than that floor**. The probe was
+not wrong; it was answering a narrower question than the one that mattered.
+
+**So before claiming a hardware-limit stop, sanity-check the floor against something
+structure-independent**: bytes that MUST move against the measured streaming ceiling, or the
+essential FLOP count against the engine's issue rate. If your "floor" is far above that
+bound, you are at the floor of a structure, not of the problem, and the remaining move is a
+**redesign, not a schedule change**.
+
+### THREE STOP REASONS. Report exactly one, and never upgrade a weaker one.
+
+| stop reason | condition | what it licenses |
+|---|---|---|
+| `budget_exhausted` | attempts spent, gates still open | more attempts would help; SAY SO |
+| `structure_limit` | at your own ablation floor, but that floor is far above the structure-independent bound | **a REDESIGN, not more attempts** |
+| `hardware_limit` | at the structure-independent bound (within ~10%) | genuinely done |
+
+`hardware_limit` is the ONLY one that means "done", and it requires the
+structure-independent bound -- not your own ablation floor. An engine-nulled ablation can
+only ever produce `structure_limit`.
+
+**When `structure_limit` fires, the report MUST carry:** your floor, the
+structure-independent bound, the ratio between them, and a named structural hypothesis for
+what would close it (a different decomposition, tiling, residency plan or traversal count).
+That hypothesis is the deliverable -- it is what lets a caller decide whether to spend a
+regeneration.
+
+**A schedule search cannot cross a structural floor.** Spending more attempts against
+`structure_limit` is the single commonest way to burn budget for nothing. Escalate instead:
+regenerate the stage with the structural hypothesis, then optimise the new structure. The
+attempt budget is per-structure, and a caller may always ask for more rounds -- but more
+rounds on the wrong structure buy nothing.
+
 **A traffic ratio is a hypothesis, not a diagnosis.** "We move 1.5x the bytes the vendor
 does" says nothing until a probe shows those bytes are not already hidden. On one case that
 exact argument was refuted: deleting ALL of the load path saved **2.7%** and **0.8%** on the

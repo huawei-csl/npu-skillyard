@@ -478,10 +478,21 @@ but **~2x on a traffic-bound stage**, because the redundant sub-block duplicates
 and `TSTORE`s too. Measure it; do not quote either number.
 
 **A composed chain is legitimately HETEROGENEOUS** -- MIX on the Cube stages, single-engine on
-the vector ones. That is the correct outcome, not an inconsistency. Note that `SYNCALL<AIVOnly>`
-**deadlocks** in a `-vec` build (its FFTS barrier expects the mix participant count), and
-`SYNCALL<Mix>` reinstates the toll -- so a vector-only chain composes as stream-ordered
-launches, and the device-side seam then measures ~0.02-0.03 us, i.e. free.
+the vector ones. That is the correct outcome, not an inconsistency.
+
+**`SYNCALL<AIVOnly>` DEADLOCKS, and the cause is NOT the participant count.** An earlier
+version of this rule attributed it to a `-vec` launch presenting half the AIV sub-blocks the
+FFTS barrier expects. That explanation is **falsified**: it deadlocks in a `dav-c220` (mix)
+build as well, and at `block_dim` 1, where any participant-count argument is trivial. The
+mechanism is unknown -- record it as an evidence gap, do not repeat the explanation.
+`SYNCALL<Mix>` is not a workaround either: it reinstates the toll on the vector stages.
+
+For a vector-only chain the options are stream-ordered launches (device-side seam measured
+at **~0.02-0.03 us**, effectively free) or the library's soft GM-counter barrier (measured
+**~15 us/seam** on one chain -- three orders of magnitude worse, so prefer stream ordering
+unless you need an in-kernel barrier). **Measure your seam and report it**; the two choices
+are not close, and picking the expensive one silently costs more than most optimisations
+recover.
 
 **For an ALL-CORE barrier, use the library `SYNCALL<Mix>` -- do NOT hand-roll.**
 `aicore exception 507015` (invisible to the simulator -- C25) is most often a
@@ -1099,8 +1110,14 @@ The kernel MUST compile with this exact recipe. Resolve all toolkit paths from
 `$ASCEND_HOME_PATH` (set by `set_env.sh`) — do NOT hardcode a CANN version path:
 ```bash
 source /usr/local/Ascend/cann/set_env.sh   # -> ASCEND_HOME_PATH (default: cann-9.0.0)
+
+# ARCH: pick per stage archetype -- see the table below. Vector-only stages MUST use
+# dav-c220-vec; using dav-c220 on them costs a flat ~2.86 us per call (C33b).
+ARCH=dav-c220-vec      # vector-only stage (no Cube op in the StageSpec)
+# ARCH=dav-c220        # genuine Cube+Vector stage
+
 "$ASCEND_HOME_PATH/bin/bisheng" -fPIC -shared -xcce -DMEMORY_BASE -O2 \
-  -std=gnu++17 --cce-aicore-arch=dav-c220 \
+  -std=gnu++17 --cce-aicore-arch=$ARCH \
   -Wno-macro-redefined -Wno-ignored-attributes \
   -I<kernel_dir> -I<example>/include \
   -I<pto_isa_root> -I<pto_isa_root>/include \
