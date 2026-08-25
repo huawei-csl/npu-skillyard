@@ -133,8 +133,15 @@ def plot(doc, out_png):
     ys = [a["ratio"] for a in att]
     kept = [bool(a.get("kept")) for a in att]
     # Default to correct/candidate so older JSONs keep plotting unchanged.
-    ok = [a.get("correct", True) is not False for a in att]
     diag = [a.get("kind", "candidate") == "diagnostic" for a in att]
+    # `kind` WINS over `correct`. A diagnostic is a probe -- an ablation, a noop
+    # launch, a deliberately-broken build used to price a resource -- and it is
+    # EXPECTED to produce wrong output. Letting `correct: false` mark it as a
+    # failed-validation cross drew ablation probes under a "validation failed"
+    # banner and made a clean campaign look broken (v0.93 `ffn`). Correctness is
+    # only meaningful for a candidate, i.e. something that could actually ship.
+    ok = [a.get("correct", True) is not False or diag[i]
+          for i, a in enumerate(att)]
 
     fig, ax = plt.subplots(figsize=(10.2, 5.6))
 

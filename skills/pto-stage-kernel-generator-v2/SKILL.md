@@ -180,7 +180,7 @@ IF reference_source / instruction_families contain a matrix contraction
   │        (no overlap, no resident state) and risks the cross-core coherency race
   │        (C6 / COOK-§8.6). Use an in-kernel handshake ONLY when state stays
   │        resident across an iteration loop.
-  │   NO  → cube_only          → COOK-§7, §8.7-§8.9, EX-§3
+  │   NO  → cube_only          → COOK-§7, §8.7-§8.9, EX-§3  ·  build -cube (C33c)
   │   Vec path (GEMV / outer-product / small loop-carried) → treat as vec_only
   │     below, with the recurrent-state layout rules of S9 + C28.
   │
@@ -405,6 +405,49 @@ iteration 0. Bootstrap free-slot signals before the first consumer wait.
 On A2/A3, Cube-side `wait_flag_dev` for V→C reduces over both Vec subblocks;
 if `vid != 0` returns early, Cube cannot safely wait on that V→C flag.
 Use `pipe_barrier(PIPE_ALL)` only for intra-core sync, never cross-core. → COOK-§8, §8.6
+
+### C33c: A CUBE-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH EITHER -- `dav-c220-cube` exists
+
+**C33b's mirror, and the generator has been leaving it on the table.** A stage whose StageSpec
+contains no Vec op is `cube_only`, and it must be built with `--cce-aicore-arch=dav-c220-cube`,
+not `dav-c220`.
+
+The comment "A2/A3 has no cube-only arch flag" that appeared in generated kernels is **false**.
+Probed directly with `bisheng -dM -E` on this toolchain (CANN 9.1.0):
+
+| `--cce-aicore-arch=` | macros defined |
+|---|---|
+| `dav-c220` | `__CCE_AICORE__` **`__CCE_AICORE_ENABLE_MIX__`** `__DAV_C220_CUBE__` `__DAV_C220_VEC__` `__DAV_CUBE__` `__DAV_VEC__` |
+| `dav-c220-vec` | `__CCE_AICORE__` `__DAV_C220_VEC__` `__DAV_VEC__` |
+| **`dav-c220-cube`** | `__CCE_AICORE__` **`__DAV_C220_CUBE__`** `__DAV_CUBE__` |
+
+`dav-c220-cube` is accepted and defines the Cube macro **alone**, without
+`__CCE_AICORE_ENABLE_MIX__`. It is the exact mirror of `dav-c220-vec`.
+
+**What it is worth.** A noop-launch probe on `attention_sdpa` priced the MIX launch at
+**4848.8 ns against 1172.5 ns** at `block_dim=16` -- roughly **4.08 us of pure launch overhead
+on a ~9.5 us kernel**, worth **1.90x** from a compile flag alone. `quant_matmul` measured
+1.04-1.19x from the same flag and validated **bit-identically** against its MIX build.
+
+**Why this is SAFER than C33b's vector case.** C33b carries a partition hazard: rebuilding
+unmodified vector source as `-vec` computes NaN on about half the output, because the work
+partitioning assumes mix geometry (`lanes = 2 x block_dim`, both AIV sub-blocks as workers), so
+the fix must happen at generation. **A Cube core has no sub-blocks**, so there is no equivalent
+lane-count change and a cube-only rebuild is layout-neutral. Validate it anyway -- expect
+bit-identical output, and treat any difference as a real defect rather than an expected
+consequence.
+
+**Unverified, and it bounds the rule.** The interaction of `dav-c220-cube` with `SYNCALL` and
+cross-core flags is NOT established. A chain that mixes a `-vec` stage and a `-cube` stage is
+heterogeneous-arch, and a single-launch FFTS kernel is one translation unit with ONE arch flag --
+so `ffts` composition and per-stage single-engine builds are mutually exclusive. Choose
+per-stage single-engine builds with `host-stream` composition unless you have measured otherwise;
+`attention_sdpa` found `SYNCALL<AIVOnly>` deadlocks in that configuration.
+
+**One open discrepancy, deliberately not folded into C33b's number.** `ffn` measured a flat
+**9-13 us** for rebuilding a Cube stage inside a MIX binary, where C33b documents ~2.88 us.
+7-10 us is unexplained. Do not quote 2.88 us for a Cube stage until that is probed; measure the
+toll for your own stage with a noop-launch probe and report what you measured.
 
 ### C33b: A VECTOR-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH -- it costs 2.88 us per call
 
@@ -1114,7 +1157,8 @@ source /usr/local/Ascend/cann/set_env.sh   # -> ASCEND_HOME_PATH (default: cann-
 # ARCH: pick per stage archetype -- see the table below. Vector-only stages MUST use
 # dav-c220-vec; using dav-c220 on them costs a flat ~2.86 us per call (C33b).
 ARCH=dav-c220-vec      # vector-only stage (no Cube op in the StageSpec)
-# ARCH=dav-c220        # genuine Cube+Vector stage
+# ARCH=dav-c220-cube   # CUBE-ONLY stage (no Vec op in the StageSpec) -- see C33c
+# ARCH=dav-c220        # genuine Cube+Vector stage, and ONLY that
 
 "$ASCEND_HOME_PATH/bin/bisheng" -fPIC -shared -xcce -DMEMORY_BASE -O2 \
   -std=gnu++17 --cce-aicore-arch=$ARCH \

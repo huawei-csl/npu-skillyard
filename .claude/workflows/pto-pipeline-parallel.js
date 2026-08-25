@@ -83,7 +83,7 @@ const OPTIMIZE = ARGS?.optimize !== false            // default ON; pass optimiz
 // case differ by 1.16x vs 1.52x against the vendor at identical correctness.
 // Pass optimize_top_n to narrow it deliberately.
 const OPTIMIZE_TOP_N = ARGS?.optimize_top_n ?? Infinity
-const OPTIMIZE_ATTEMPTS = ARGS?.optimize_attempts ?? 10
+const OPTIMIZE_ATTEMPTS = ARGS?.optimize_attempts ?? 25
 const COMPOSE_MODE = (ARGS?.compose_mode === 'host-stream') ? 'host-stream' : 'ffts'  // default ffts (auto-falls back to host-stream)
 const FUSE = ARGS?.fuse === true                     // OPT-IN; default OFF -- fusion runs only if requested
 const REPORT = ARGS?.report !== false                // default ON; organize run dir + write report

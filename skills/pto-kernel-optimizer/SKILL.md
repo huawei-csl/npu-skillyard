@@ -171,23 +171,51 @@ validated.
 6. **Stop** at the irreducible floor or a wholesale-clone boundary (see Stop-criteria),
    but not before the mandatory attempt budget below.
 
-## 3.5 MANDATORY attempt budget: 15 attempts, and they go in the report
+## 3.5 MANDATORY attempt budget: 25 attempts, and they go in the report
 
 Every generated kernel gets an optimization campaign. It is not optional, and it is not
 finished when the kernel merely validates.
 
-**The budget is 15 measured attempts.** An "attempt" is a *change with a paired
+**The budget is 25 measured attempts.** An "attempt" is a *change with a paired
 re-measurement* — a hypothesis, a build, a number. Reverted regressions COUNT, and are
 often the most informative entries; do not quietly drop them.
 
-| stage archetype | minimum attempts | early stop allowed? |
-|---|---|---|
-| `mixed` (Cube + Vec, cross-core, composed/fused) | **15, always** | **No.** Run all 15 even when it is expensive. |
-| `vec_only` | 15 | Yes — see the gate below |
-| `cube_only` | 15 | Yes — see the gate below |
+> **Raised from 15 to 25 in v0.94.0, on measured evidence.** In the v0.93 campaign every
+> stage that ran to exhaustion overshot the nominal 15 anyway — 21, 23, 28, 29 and 35
+> candidates — and stages that stopped *below* 15 were still far from any floor
+> (`top_k_top_p/cutoff` stopped at 10/15 while sitting **6.9x above its own streaming
+> roofline**, and that case is the campaign's only regression). 15 was neither a real
+> ceiling nor a sufficient floor.
 
-**Early-stop gate (single-engine stages only).** You may stop before 15 *only* if you can
-show the kernel is at a **hardware limit**, with a measurement, not an argument:
+**THE BUDGET IS A HARD CAP IN BOTH DIRECTIONS.**
+
+* **You may not exceed it.** At 25 measured attempts you STOP and report
+  `budget_exhausted`. Diagnostics (probes that change no shipped code — ablations, noop
+  launches, roofline measurements) do NOT count against it and MUST be reported under a
+  separate `diagnostics` count. If you find yourself at attempt 26, you have been
+  miscounting diagnostics as attempts or attempts as diagnostics; say which.
+* **You may not stop below it** except through the early-stop gate below. Running out of
+  ideas is NOT a licence to stop. If you cannot think of another hypothesis, that is a
+  reportable state — see "when you run out of hypotheses" below — but it is
+  `budget_exhausted` with the unspent count stated, never a new stop reason.
+
+| stage archetype | attempts | early stop allowed? |
+|---|---|---|
+| `mixed` (Cube + Vec, cross-core, composed/fused) | **25, always** | **No.** Run all 25 even when it is expensive. |
+| `vec_only` | 25 | Yes — see the gate below |
+| `cube_only` | 25 | Yes — see the gate below |
+
+**When you run out of hypotheses before the budget.** This happened in 5 of 11 stages in
+the v0.93 campaign, and every one of them invented a stop reason for it. Do not. The
+sanctioned response, in order: re-run `3.6` and name the binding resource again with a
+fresh measurement; consult the bottleneck-to-lever tree in `4` for a class you have not
+attacked; try a lever you previously rejected on reasoning rather than measurement; and if
+all of that is genuinely spent, report `budget_exhausted` with `attempts_spent` and
+`attempts_unspent` both recorded and one sentence naming what you would try with more.
+**An unspent budget is a finding about the search, not a licence to stop.**
+
+**Early-stop gate (single-engine stages only).** You may stop before the budget *only* if
+you can show the kernel is at a **hardware limit**, with a measurement, not an argument:
 * achieved bandwidth is within ~10% of the measured streaming ceiling (A2/A3: a PTO
   `TLOAD` extracts **~920 GB/s** from an out-of-L2 working set — see
   `PLAT-§ReadCeiling`; measure it for your shape, do not quote it), **or**
@@ -292,7 +320,7 @@ An attempt whose correctness was not re-checked has no ratio. Record it as
                "kind": "candidate",      // or "diagnostic" for a probe
                "why": "...",
                "kernel": "src/variants/kernel_<stage>_a01.cpp"}],
- "stop_reason": "budget_exhausted|hardware_limit",
+ "stop_reason": "budget_exhausted|structure_limit|hardware_limit",
  "gate": "...", "gate_value": "..."}
 ```
 
@@ -328,7 +356,7 @@ look complete.
 2. **The trajectory graph** from the script above, embedded.
 3. **The stop reason**, explicitly: budget exhausted, or which hardware-limit gate fired
    with its number.
-4. If fewer than 15 attempts were made on a single-engine stage, the gate evidence.
+4. If fewer than 25 attempts were made on a single-engine stage, the gate evidence.
    If fewer than 10 on a `mixed` stage, that is a **process failure** — say so plainly
    in the report rather than presenting the result as complete.
 
@@ -512,7 +540,7 @@ lost to the vendor by 1.09x-3.35x -- because the gap was the dataflow, not the c
 
 **If the amplification grows: stop and report it.** Say the kernel is at N% of its achievable
 ceiling and that the remaining gap is `<amplification>x` of traffic inherent to the
-decomposition. That is a complete, useful result. Burning 15 attempts to confirm it is not.
+decomposition. That is a complete, useful result. Burning the budget to confirm it is not.
 
 **Report the ceiling you are at AND the ceiling you cannot reach.** "730 of a measured 734 GB/s
 ceiling (99.5%), moving 17x the vendor's bytes" tells a reader exactly where the work is. "1.09x
@@ -754,6 +782,16 @@ bound, you are at the floor of a structure, not of the problem, and the remainin
 `hardware_limit` is the ONLY one that means "done", and it requires the
 structure-independent bound -- not your own ablation floor. An engine-nulled ablation can
 only ever produce `structure_limit`.
+
+**THESE THREE NAMES ARE CLOSED. Inventing a fourth is a process failure.** In the v0.93
+campaign five stages across two cases emitted `budget_partially_spent` and
+`no_further_hypotheses` -- both are `budget_exhausted` with an unspent count, and naming
+them otherwise concealed that the stage stopped with headroom it never used. If your
+situation does not fit one of the three, it is `budget_exhausted`; say what is unspent and
+why you stopped. The stop reason MUST also be written to `pipeline_results.json` under
+`optimization.stop_reason` (and per-stage under `stages[].optimization.stop_reason` when
+stages are optimized separately) -- a stop reason that exists only in prose is not
+reportable and did not happen.
 
 **When `structure_limit` fires, the report MUST carry:** your floor, the
 structure-independent bound, the ratio between them, and a named structural hypothesis for

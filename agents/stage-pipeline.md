@@ -500,7 +500,7 @@ When the gate passes, benchmark **each** stage on real NPU (not the simulator):
    `pto-kernel-optimizer` BEFORE Phase 7 -- the gap lives in the per-stage kernels, not in
    the composition.
 
-### Phase 6.5: Optimization campaign -- MANDATORY, 15 attempts (not optional)
+### Phase 6.5: Optimization campaign -- MANDATORY, 25 attempts (not optional)
 
 Every stage gets an optimization campaign via `pto-kernel-optimizer`. A stage that merely
 validates is NOT finished. See `pto-kernel-optimizer` SKILL.md §3.5 for the full rule; the
@@ -717,7 +717,7 @@ modify kernels, re-validate, or re-benchmark here.
    trajectory table (attempt # | hypothesis | what changed | measured ratio + 95% CI | kept
    or reverted | why), the trajectory graph, the attempt count, and the STOP REASON --
    budget exhausted, or which hardware-limit gate fired with its number. A `mixed` stage
-   with fewer than 15 attempts must be flagged as a process failure, not presented as
+   with fewer than 25 attempts must be flagged as a process failure, not presented as
    complete.
 4. **`<output_dir>/README.md`** -- the top-level narrative a human reads first: what the run
    ACHIEVED, the BLOCKERS and what was TRIED (per failed stage: repair_attempts +
