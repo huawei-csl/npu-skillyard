@@ -44,7 +44,7 @@ Conventions this script assumes, and enforces in what it draws:
   * a DIAGNOSTIC (a noop-floor probe, a strided-vs-contiguous test) is a measurement,
     not a shippable kernel. Plotting it as a candidate conflates "something I
     measured" with "something I could have shipped", so it is drawn separately;
-  * the budget is 15, so the x-axis always shows all 15 slots even when fewer were
+  * the budget is 25, so the x-axis always shows all 25 slots even when fewer were
     used. An early stop is then visible as empty space, which is the intent: you
     should be able to SEE that the campaign stopped short and read why.
 """
@@ -55,7 +55,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-BUDGET_DEFAULT = 15
+BUDGET_DEFAULT = 25
 
 
 def _budget(doc, att):
@@ -197,7 +197,7 @@ def plot(doc, out_png):
     ax.annotate("vendor parity", xy=(0.015, 1.0), xycoords=("axes fraction", "data"),
                 va="bottom", ha="left", fontsize=9, color="#333")
 
-    # Always show all 15 slots: an early stop should be VISIBLE as unused budget.
+    # Always show all 25 slots: an early stop should be VISIBLE as unused budget.
     ax.set_xlim(0.4, budget + 0.6)
     ax.set_xticks(range(1, budget + 1))
     # SKILL 3.5 defines an attempt as "a change WITH a paired re-measurement", and a

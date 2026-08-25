@@ -139,6 +139,45 @@ Use a generic split-benefit vs boundary-cost heuristic:
 
 Split only when the estimated benefit clearly exceeds the interface/materialization cost.
 
+### OCCUPANCY IS A SPLIT CRITERION -- compute each stage's parallel width BEFORE choosing
+
+The list above weighs semantics and bytes and says nothing about whether a stage can fill
+the machine. That omission has cost a measured **2.7x**, twice, on the same algorithm: a
+plan folded three blocks into one stage whose only parallel axis was a **contract dim as
+small as 4**, on a part with 48 cores. The seam arithmetic was immaculate -- intermediate
+1024 B against 77.9 MB of input, `O(B)` against `O(B*V)`, about as cheap as a boundary
+gets -- and the plan was still wrong, because a nearly-free seam says nothing about
+whether either side can use the device.
+
+**For every candidate stage, write down its parallel width: the number of independent
+work items the stage can issue, as an expression over contract dims.** Then:
+
+* **A stage whose parallel width is bounded by a SMALL contract dim cannot fill the
+  device.** Compare it against the part's core count (A2/A3: 48 AIV / 24 AIC). A width of
+  `B` where `B` can be 4 leaves ~92% of the machine idle no matter how good the kernel is,
+  and no amount of Phase 6.5 will recover it -- the optimizer searches schedules, not
+  decompositions.
+* **Folding work INTO a narrow stage is a strong boundary cost**, and it is the failure
+  mode this rule exists to catch. Merging a wide block into a narrow one does not save a
+  seam; it drags the wide work down to the narrow width.
+* **Splitting to WIDEN is a first-class split benefit**, even when the seam is not free.
+  If one candidate boundary yields stages of width `O(B)` and `O(B*V)` while another
+  yields two stages both `O(B*V)`, the second is better on occupancy grounds even at a
+  larger intermediate. Price both.
+
+**Record `parallel_width` per stage in the plan, and the imbalance ratio per boundary.**
+Where two adjacent stages differ by more than ~4x in achievable width at the SMALLEST
+contract shape, say so explicitly and justify keeping them together. A measured 20.7x
+imbalance at the small end has been observed to survive the whole pipeline and land as a
+2.7x end-to-end loss.
+
+**If you defer a split, pre-register the flip condition with a number.** State the
+measurement that would overturn the choice ("adopt the column split if stage A at the
+smallest shape exceeds stage B by more than 2x"), and CHECK IT in Phase 6. This works --
+the condition above fired at 20.7x and correctly identified the decomposition as the
+binding defect. A deferred split with a pre-registered trigger is a decision; a deferred
+split without one is a guess that never gets revisited.
+
 Practical rule:
 
 - prefer fewer, semantically complete stages when adjacent blocks share the same dominant lowering family and the intermediate has no independent reuse value
@@ -160,7 +199,10 @@ Practical rule:
    - `problem` (dimension constants: tile_size, feature_dim, sequence_dim, batch_dim, etc.)
    - `code_region` (source line range, e.g., `"lines 62-73"`)
    - `instruction_families` (PTO instruction names verified via npu-coding MCP)
-   - `lowering_hint` (free-text: dominant parallel axis, reduction axis, tile shape constraints)
+   - `parallel_width` (expression over contract dims for the number of independent work
+    items this stage can issue, plus its value at the SMALLEST contract shape -- see
+    the occupancy criterion above)
+  - `lowering_hint` (free-text: dominant parallel axis, reduction axis, tile shape constraints)
    - `reference_source` (self-contained pure-torch function for this stage — see Reference Implementation Rules)
    - `evidence_gaps` (list of uncertainties; empty list if all fields are confirmed)
 4. **Write per-stage reference** — a standalone pure-torch function that computes just this stage's math, no control flow from other stages
@@ -279,6 +321,13 @@ Retro-tested against every multi-stage case in the campaign:
 | **HIGHER order** than inputs | `attention_sdpa`, `flash_attention_grad` | **both LOSE and DEGRADE with size** (1.16->2.28x, 1.09->3.35x) |
 | **SMALLER** than inputs | `cross_entropy_loss`, `rms_norm_backward`, `moe_token_permute`, `top_k_top_p`, `group_norm_silu`, `hans_compress` | **all compose cleanly** -- 5 wins (1.19x-5.69x), 1 blocked on unrelated ISA grounds |
 | **SAME order** | `ffn`, `grouped_matmul`, `grouped_matmul_swiglu_quant`, `kv_rmsnorm_rope_cache` | bounded: parity to 1.51x slower, **not degrading** |
+
+**A cheap seam is NOT a verdict that the plan is good.** This table ranks boundaries by
+seam growth and says nothing about occupancy. A plan in the "SMALLER than inputs" row --
+the safest row here -- was measured **2.7x slower end to end** than a finer decomposition
+of the same algorithm, because the cheap seam sat next to a stage whose parallel width was
+bounded by a contract dim of 4. Read this table together with the occupancy criterion
+above, never instead of it.
 
 **It predicts "can per-stage tuning close this gap?" -- not "will we win?".** Only the
 higher-order row is a structural verdict. The same-order losses are ordinary Cube-efficiency

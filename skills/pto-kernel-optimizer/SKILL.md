@@ -183,9 +183,9 @@ often the most informative entries; do not quietly drop them.
 > **Raised from 15 to 25 in v0.94.0, on measured evidence.** In the v0.93 campaign every
 > stage that ran to exhaustion overshot the nominal 15 anyway — 21, 23, 28, 29 and 35
 > candidates — and stages that stopped *below* 15 were still far from any floor
-> (`top_k_top_p/cutoff` stopped at 10/15 while sitting **6.9x above its own streaming
-> roofline**, and that case is the campaign's only regression). 15 was neither a real
-> ceiling nor a sufficient floor.
+> (one stopped at 10/15 while sitting **6.9x above its own streaming roofline**, and that
+> stage was the campaign's only regression against the previous generation). 15 was
+> neither a real ceiling nor a sufficient floor.
 
 **THE BUDGET IS A HARD CAP IN BOTH DIRECTIONS.**
 
@@ -205,14 +205,37 @@ often the most informative entries; do not quietly drop them.
 | `vec_only` | 25 | Yes — see the gate below |
 | `cube_only` | 25 | Yes — see the gate below |
 
-**When you run out of hypotheses before the budget.** This happened in 5 of 11 stages in
-the v0.93 campaign, and every one of them invented a stop reason for it. Do not. The
-sanctioned response, in order: re-run `3.6` and name the binding resource again with a
-fresh measurement; consult the bottleneck-to-lever tree in `4` for a class you have not
-attacked; try a lever you previously rejected on reasoning rather than measurement; and if
-all of that is genuinely spent, report `budget_exhausted` with `attempts_spent` and
-`attempts_unspent` both recorded and one sentence naming what you would try with more.
-**An unspent budget is a finding about the search, not a licence to stop.**
+**When you run out of hypotheses before the budget.** This is the commonest way a
+campaign quietly under-runs, and the escape below is DELIBERATELY expensive to reach --
+the first version of this rule offered it unconditionally and stages promptly stopped at
+**6 of 25**, worse utilisation than the 15-budget it replaced.
+
+"I have no more ideas" is a statement about the search, not about the kernel, and it is
+**not** sufficient on its own. Before you may report `budget_exhausted` below the cap you
+must have DONE and RECORDED all four of these:
+
+1. **Re-measured the binding resource** per `3.6`, in the CURRENT configuration -- not the
+   one you measured at attempt 1. The bottleneck moves as you optimize; a stale diagnosis
+   is the usual reason the idea list looks empty.
+2. **Walked the bottleneck-to-lever tree in `4` for the resource you just named**, and
+   recorded each lever in that class as attempted, measured-and-reverted, or
+   **inapplicable with a one-line reason**. "Not tried" is not one of the three.
+3. **Retried at least one lever you rejected on REASONING rather than measurement.**
+   Reasoning has been wrong here repeatedly -- a named headline lever measured 0.999x, an
+   L2 alias sign-flipped with the protocol, and a "faster" attempt scored 1/38 on
+   validation. If every rejection in your log is argued rather than measured, you have not
+   run out of hypotheses; you have run out of willingness to measure.
+4. **Named the structural hypothesis** that would close the remaining gap, with your floor,
+   the structure-independent bound and the ratio between them.
+
+If all four are in the record, report `budget_exhausted` with `attempts_spent`,
+`attempts_unspent`, and one sentence on what more attempts would buy. **If any of the four
+is missing, you have not earned the stop -- keep going.** A campaign that reports
+`budget_exhausted` at low single-digit attempts with an empty lever table is a process
+failure, and the report must say so rather than presenting it as a result.
+
+Note the asymmetry, which is intended: stopping at the cap needs no justification;
+stopping below it needs four pieces of evidence.
 
 **Early-stop gate (single-engine stages only).** You may stop before the budget *only* if
 you can show the kernel is at a **hardware limit**, with a measurement, not an argument:
