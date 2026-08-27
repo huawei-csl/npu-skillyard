@@ -1358,6 +1358,40 @@ using UbDN = pto::Tile<pto::TileType::Vec, T, R, C,
 
 ---
 
+## COOK-§8.5B: Skip the ND→NZ reordering load when the tile is one 16-wide block-column (C1 == 1)
+
+The Cube's L1 Mat tile is NZ (fractal) format, so the general GM→L1 loader
+`TLoadGm2L1Nd2nz` (`pto/common/arch/memory/tload_common.hpp`) *reformats* row-major ND
+into NZ as it copies — via `copy_gm_to_cbuf_multi_nd2nz`, which issues **one row
+descriptor per row** (`nValue = M`) and never coalesces, even for fully contiguous data.
+
+**When the tile is a single 16-wide block-column (C1 == 1 — inner dim == 16, i.e. one
+32-byte C0 block for a 16-bit dtype), the NZ layout is byte-identical to plain row-major
+ND.** The reorder is a no-op, but the gather still fires M tiny 32-byte descriptors:
+transaction-bound at **~110 GB/s regardless of M**. Declare the *same* GM pointer as an
+NZ `GlobalTensor` (→ `TLoadGm2L1Nz2nz`, one contiguous burst) or issue one plain
+`copy_gm_to_cbuf(nBurst=1, lenBurst=M*32B)` — identical bytes, **~2.7 TB/s. Measured
+10–31× faster on real 910B (fp16 ≡ bf16); the ratio grows with M.**
+
+Boundary — do NOT over-apply:
+- **Exactly C1 == 1.** At C1 ≥ 2 (inner dim ≥ 32) the gather's descriptors widen and it
+  already coalesces (~1.05–1.1× of a burst), AND a single flat burst would land the
+  wrong NZ permutation — keep the gather there.
+- **Column-major mirror:** `TLoadGm2L1Dn2zn` (DN→ZN) has the identical footgun when the
+  tile is a single 16-*tall* block-row; same single-burst fix.
+- **Vector GM→UB is broader:** `TLoadGm2ubNd2nd` / `TLoadGm2ubDn2dn`
+  (`copy_gm_to_ubuf_align_b16`) do NOT auto-coalesce — *any* contiguous ND/DN UB load
+  (`gmGap==ubGap==0`, any width) should be **one burst, not per-row** (9–25× measured).
+  UB is linear (no fractal), so there is no C1==1 caveat here at all.
+- **No action needed** on stores (`copy_cbuf_to_gm` / `copy_ubuf_to_gm`) or the GM→L1
+  ND→ND load (`copy_gm_to_cbuf`): those DMA intrinsics coalesce contiguous zero-gap
+  bursts in hardware already.
+
+Rule of thumb: the reordering load only earns its per-row cost when there is a real
+reorder to do (C1 ≥ 2 for NZ; ≥ 2 blocks for ZN). **One block-column / row ⇒ one burst.**
+
+---
+
 ## COOK-§8.6: Cross-Core Sync Protocol (Cube ↔ Vec)
 
 Cube and Vec are separate cores. They cannot access each other's UB/L1/L0.
