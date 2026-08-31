@@ -1264,8 +1264,14 @@ host_enqueue_us_per_call # measured, per arm
 launch_floor_us         # empty-launch probe on THIS build's arch (~2.7 single-engine, ~4.8 MIX)
 ```
 
-A row is **NON-DISCRIMINATING** if either arm is HOST-BOUND (`enqueue > device`) or the
-launch floor exceeds ~10% of the smaller arm's device time. When it is:
+**Two tests, not one -- keep them apart.** HOST-BOUND (`enqueue > device`) bars the EVENT
+and WALL-CLOCK instruments for that arm and nothing more; the profiler still reads that row
+correctly. A row is **NON-DISCRIMINATING** when **fixed cost exceeds ~10% of the faster
+arm's device time** -- that is the shape test, and it is the one that decides whether a
+ratio is about the kernels. Measure fixed cost as the **intercept of device time against the
+sweep dim**, not as a noop-launch probe: on `grouped_matmul` the intercept was **9.63 us
+against a 2.72 us noop probe**, and trusting the probe would have blessed a shape three
+sizes too small. When a row is non-discriminating:
 
 1. **Label the ratio `NON-DISCRIMINATING`, do not drop it and do not promote it.** It still
    goes in the JSON with both arms' device times -- it is a real measurement of a shape that
@@ -1279,6 +1285,18 @@ launch floor exceeds ~10% of the smaller arm's device time. When it is:
 4. **Report the smallest sweep point that WOULD discriminate**, from the measured device-time
    slope. That is the actionable output of a non-discriminating run, and it feeds back to
    Phase 0 as a proposed contract amendment rather than a silent shape change.
+
+5. **Fit the intercept inside ONE regime.** A sweep wide enough to discriminate usually
+   crosses a cache-capacity break, and a fit spanning it returns a meaningless (even
+   negative) intercept. The signature is a **simultaneous** jump in BOTH arms' marginal cost
+   per unit -- on `grouped_matmul`, ~1.5x in both at once, as the working set went from
+   148 MB to 295 MB. Fit below the break; report the spilled point, do not headline it.
+6. **Cross-check against a MEASURED ceiling, not a datasheet one.** Achieved rate vs the
+   part's measured cube/HBM peak is method-independent and it is what makes a gap physical.
+   At the `grouped_matmul` headline the vendor sat at **97% of the measured 320 TFLOP/s**
+   and we sat at 53% -- a 1.82x gap where the faster arm is at the machine limit is real,
+   and it locates the headroom. A quoted 295 TFLOP/s would have put that arm at 106% of
+   "peak" and looked like an instrument error instead.
 
 A sweep in which EVERY point is non-discriminating is a failed benchmark, not a parity
 result, and the stage's headline is `no admissible ratio` with the reason named.

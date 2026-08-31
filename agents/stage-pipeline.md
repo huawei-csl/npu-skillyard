@@ -109,8 +109,11 @@ variant; do not bake in any one algorithm's dimension names.
    - **A Tier-1 contract can still be unconfirmed FOR BENCHMARKING.** Price the largest
      sweep point before proceeding: estimated device time per call must exceed the enqueue
      cost of every arm you will time (a `ctypes` launch enqueues in 10-12 us; a `torch_npu`
-     op in 50-64 us) and must be at least ~10x the launch floor (~2.7 us single-engine,
-     ~4.8 us MIX). If it is not, the sweep is **NON-DISCRIMINATING** -- record
+     op in 50-70 us) and must be at least ~10x the FIXED cost -- launch PLUS ramp, read as
+     the intercept of device time against the sweep dim, which measured **9.63 us against a
+     2.72 us noop probe** on `grouped_matmul`. Pricing the noop probe alone blesses a shape
+     three sizes too small. Host-boundedness is a separate test: it bars event and
+     wall-clock timing for that arm, not the shape. If it is not, the sweep is **NON-DISCRIMINATING** -- record
      `bench_discrimination` with that verdict, set `confidence: needs-confirmation`, and
      **STOP with a PROPOSED larger benchmark point** (with its tier and the arithmetic).
      Never substitute a bigger shape yourself: a discovered constraint amends the contract,

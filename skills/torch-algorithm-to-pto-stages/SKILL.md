@@ -94,13 +94,28 @@ framework op. An earlier run of the same algorithm at `M=16384` -- 9.1x the work
 
 1. **Estimate device time per call at the largest sweep point.** FLOPs or bytes against the
    part's ceiling is enough; you are checking an order of magnitude, not calibrating.
-2. **Compare it against the launch floor** (an empty kernel launch: ~2.7 us single-engine,
-   ~4.8 us MIX on A2/A3) **and against the enqueue cost of the SLOWEST arm you will time**
-   (a `ctypes` launch enqueues in 10-12 us; a `torch_npu` framework op in 50-64 us).
-3. **The largest sweep point must satisfy BOTH:** device time per call exceeds the enqueue
-   cost of every arm, and the launch floor is under ~10% of it. A sweep whose largest point
-   fails either is **non-discriminating**, and any ratio measured there is a property of the
-   launch paths, not of the kernels.
+2. **Compare it against the FIXED COST -- which is launch PLUS ramp, and is bigger than
+   you think.** The empty-launch probe (~2.7 us single-engine, ~4.8 us MIX on A2/A3) is a
+   LOWER BOUND, not the number. Measured on `grouped_matmul`, the true fixed cost was
+   **9.63 us -- 3.5x the noop probe** -- the rest being weight load, pipeline fill and
+   group dispatch. Pricing only the launch floor calls a shape adequate three sizes before
+   it is. **Read the fixed cost as the INTERCEPT of device time against the sweep dim**,
+   fitted inside one regime (see below); that captures ramp, a noop probe cannot.
+3. **The largest sweep point must have fixed cost under ~10% of the FASTER arm's device
+   time.** Below that, the ratio is a property of the two overheads. `grouped_matmul` at
+   its Tier-1 shape was **80% fixed cost**, and because the two arms' fixed costs were
+   within 8% of each other, it read as parity while the kernels differed by 1.82x.
+4. **These are separate from INSTRUMENT admissibility.** An arm is HOST-BOUND when its
+   enqueue exceeds its device time (a `ctypes` launch enqueues in 10-12 us; a `torch_npu`
+   framework op in 50-70 us). That bars EVENT and WALL-CLOCK timing for that arm -- it does
+   NOT make the shape undiscriminating, because the device profiler reads on-device
+   duration and is unaffected. Do not merge the two tests: one picks the instrument, the
+   other picks the shape.
+5. **Fit inside ONE regime.** A sweep wide enough to discriminate is usually wide enough to
+   cross a cache-capacity break, and a fit spanning the break returns nonsense -- on this
+   case a 0.41 us intercept for one arm and a NEGATIVE one for the other. Watch the
+   marginal cost per unit between adjacent points: a simultaneous jump in BOTH arms is a
+   regime change, not a trend. Fit below it, and report the spilled point separately.
 
 **When the Tier-1 shape is non-discriminating, that is a REPORTABLE CONTRACT DEFECT, and it
 does NOT license substituting a bigger number.** The standing rule holds: a discovered
@@ -137,7 +152,10 @@ Emit the contract as a top-level `shape_contract` block in the stage plan:
   "bench_discrimination": {
     "largest_point": {"<dim_name>": 32768},
     "est_device_us_per_call": 118.0,
+    "fixed_cost_us": 9.63,
+    "fixed_cost_method": "intercept of device time vs sweep dim, fitted below the cache break",
     "launch_floor_us": 2.72,
+    "launch_floor_note": "noop-launch probe: a LOWER BOUND on fixed cost, not the number",
     "slowest_arm_enqueue_us": 64.0,
     "verdict": "discriminating | NON-DISCRIMINATING",
     "note": "<if non-discriminating: the proposed larger point, its tier, and the arithmetic>"
