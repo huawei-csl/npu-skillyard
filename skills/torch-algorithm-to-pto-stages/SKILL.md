@@ -73,6 +73,53 @@ length, batch, head count). Record `locked_reason` when known. Downstream genera
 may DISCOVER a new constraint and amend the contract -- that feedback must be
 preserved, never used to silently override a user-supplied value.
 
+### A CORRECTNESS SHAPE IS NOT A BENCHMARK SHAPE -- the sweep must be able to discriminate
+
+Tier 1 is the gold standard for CORRECTNESS, and it is a **trap for PERFORMANCE**. The
+richest Tier-1 source is usually a unit test, and a unit test's shapes are chosen to
+exercise the code path cheaply. Reusing them as the benchmark sweep asks the hardware to
+distinguish two implementations on a problem too small to distinguish them.
+
+**This has already cost a headline.** `grouped_matmul` took `M_total=1792` from
+`test_npu_grouped_matmul` -- every dim Tier 1, `confidence: high`, gate correctly passed.
+At that shape the production config runs **12.41 us** against the vendor's **12.40 us**,
+and **2.72 us of that (22%) is empty-launch floor neither kernel controls**. Both arms
+were HOST-BOUND (ours 21.6-37.3 us enqueue against 20-21 us of device work; the vendor
+63.8-63.9 against 61.5-63.0), so the event harness read **3.0x** where the device profiler
+read **1.001x** -- the entire apparent win was the gap between a `ctypes` launch and a
+framework op. An earlier run of the same algorithm at `M=16384` -- 9.1x the work for only
+3.9x the time, the fixed cost showing through -- was device-bound and discriminating.
+
+**So price the largest sweep point BEFORE committing the contract:**
+
+1. **Estimate device time per call at the largest sweep point.** FLOPs or bytes against the
+   part's ceiling is enough; you are checking an order of magnitude, not calibrating.
+2. **Compare it against the launch floor** (an empty kernel launch: ~2.7 us single-engine,
+   ~4.8 us MIX on A2/A3) **and against the enqueue cost of the SLOWEST arm you will time**
+   (a `ctypes` launch enqueues in 10-12 us; a `torch_npu` framework op in 50-64 us).
+3. **The largest sweep point must satisfy BOTH:** device time per call exceeds the enqueue
+   cost of every arm, and the launch floor is under ~10% of it. A sweep whose largest point
+   fails either is **non-discriminating**, and any ratio measured there is a property of the
+   launch paths, not of the kernels.
+
+**When the Tier-1 shape is non-discriminating, that is a REPORTABLE CONTRACT DEFECT, and it
+does NOT license substituting a bigger number.** The standing rule holds: a discovered
+constraint amends the contract, never silently replaces a user-supplied or source-evidenced
+dim. Do this instead:
+
+* Keep the Tier-1 shape as the **validation** sweep -- it is entirely valid there.
+* **Propose** an added benchmark point large enough to discriminate, with its tier (a size
+  not in the source is Tier 2 at best) and the arithmetic that justifies it.
+* Set `confidence` to `needs-confirmation` on the basis of the benchmark point alone, and
+  **STOP at the autonomy gate.** A correctness contract that is Tier 1 throughout can still
+  be `needs-confirmation` for benchmarking; say which of the two is unconfirmed.
+* If the run proceeds anyway on the small shape, the report must say **"this shape cannot
+  discriminate"** and must NOT present the resulting parity as a finding. Parity measured
+  below the discrimination threshold is an absence of evidence, not evidence of absence.
+
+Record the check in the contract as `bench_discrimination` so downstream phases can see the
+verdict rather than re-deriving it.
+
 ### Contract shape
 
 Emit the contract as a top-level `shape_contract` block in the stage plan:
@@ -87,6 +134,14 @@ Emit the contract as a top-level `shape_contract` block in the stage plan:
                    "source": "reference benchmark args"}
   },
   "sweep_axis": {"dim": "<dim_name>", "values": [4096, 8192, 32768]},
+  "bench_discrimination": {
+    "largest_point": {"<dim_name>": 32768},
+    "est_device_us_per_call": 118.0,
+    "launch_floor_us": 2.72,
+    "slowest_arm_enqueue_us": 64.0,
+    "verdict": "discriminating | NON-DISCRIMINATING",
+    "note": "<if non-discriminating: the proposed larger point, its tier, and the arithmetic>"
+  },
   "tolerance": {"rtol": 0.02, "atol": 0.02, "derived_from": "dtype=float16"},
   "confidence": "high | needs-confirmation",
   "notes": "<anything the caller should see before committing a long run>"
@@ -444,6 +499,7 @@ Before returning the stage plan, verify:
 
 - [ ] Top-level keys present: `schema_version`, `algorithm`, `source`, `shape_contract`, `stages`
 - [ ] `shape_contract` has `dtype`, `dims` (each with `value`, `tier`, `source`, `locked`), `tolerance`, and `confidence`; `confidence` is `high` iff EVERY dim and the dtype is Tier 1, else `needs-confirmation`
+- [ ] `shape_contract` has `bench_discrimination` with the largest sweep point priced against the launch floor AND the slowest arm's enqueue cost; a `NON-DISCRIMINATING` verdict sets `confidence: needs-confirmation` and STOPS at the autonomy gate with a PROPOSED larger point (never a silently substituted one)
 - [ ] Each stage has: `name`, `stage_index`, `inputs`, `outputs`, `problem`, `instruction_families`, `reference_source`, `evidence_gaps`
 - [ ] All shapes are lists of integers or contract symbolic dimension names, not empty
 - [ ] All dtypes match the contract dtype and are valid torch dtypes (float32, float16, bfloat16, int32, etc.)

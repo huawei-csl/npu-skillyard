@@ -220,6 +220,7 @@ Before returning the JSON output, verify:
 - [ ] BenchmarkScript uses `torch.npu.Event` device timing (default) with a 256 MiB L2 flush and **K>=16 calls per event window (K reported on every row)**; `--timer wallclock` is an optional fallback, not the default
 - [ ] BenchmarkScript reports all 6 statistics (mean, min, max, median, p95, stddev) in ns
 - [ ] BenchmarkScript benchmarks at the contract production sweep and supports `--l-seg-list`
+- [ ] BenchmarkScript re-checks `bench_discrimination` from MEASURED per-arm device and enqueue times plus an empty-launch floor probe, labels any row where an arm is HOST-BOUND or the floor exceeds ~10% of device time as `NON-DISCRIMINATING`, and reports the smallest sweep point that would discriminate; parity from such a row is never reported as a result
 - [ ] BenchmarkScript sweeps >=2 sizes and reports `slope_per_unit` (per work-unit) as the headline, with the `(size, units, median_ns)` fit points (rule 27)
 - [ ] BenchmarkScript supports `--baseline-so` for a within-process paired A/B and reports the paired delta (rule 28)
 - [ ] If a VENDOR framework operator is timed, rule 29 is satisfied in full, INCLUDING arity match with byte counts for both sides (h), allocation symmetry on our side (i), both A/B arms measured in the SAME PROCESS (j), and a rep count justified by convergence rather than habit (k): flush enqueued and never drained; the timed region is symmetric on both sides; outputs allocated per call with `torch.empty` (not `torch.zeros`, not preallocated); issue order randomized per repetition; a null control reported whose CI includes 1.0; >=200 reps with a bootstrap CI; arity/semantics match stated with its bias direction. Otherwise the ratio is labelled ADVISORY
@@ -1246,6 +1247,41 @@ varied 22% across all states; the vendor's varied **124%**.
 4. A kernel that **bypasses L2** is insensitive to this; one that streams through L2 is not. So the
    asymmetry is largest exactly where one arm uses a bypass alias and the other does not -- i.e.
    precisely the cases whose wins we attribute to the alias.
+
+### A SHAPE CAN BE TOO SMALL TO CARRY A RATIO -- report the verdict, not the number
+
+The rules above fix the INSTRUMENT. This one is about the SHAPE, and no instrument repairs
+it. Below a certain size the launch floor and the enqueue paths dominate, and the two arms
+are being compared on how they are *submitted* rather than on what they *compute*.
+
+Phase 0 prices this into the contract as `bench_discrimination`. **The benchmark script must
+re-check it against MEASURED numbers, because the estimate can be wrong**, and report the
+verdict on every row:
+
+```
+device_us_per_call      # measured, per arm
+host_enqueue_us_per_call # measured, per arm
+launch_floor_us         # empty-launch probe on THIS build's arch (~2.7 single-engine, ~4.8 MIX)
+```
+
+A row is **NON-DISCRIMINATING** if either arm is HOST-BOUND (`enqueue > device`) or the
+launch floor exceeds ~10% of the smaller arm's device time. When it is:
+
+1. **Label the ratio `NON-DISCRIMINATING`, do not drop it and do not promote it.** It still
+   goes in the JSON with both arms' device times -- it is a real measurement of a shape that
+   cannot separate the kernels.
+2. **Never write parity from such a row as a result.** `1.001x` at a shape with a 22% launch
+   floor means *this experiment could not tell*, and a report that says "parity" invites the
+   reader to conclude the kernels are equal. `grouped_matmul` produced exactly that row.
+3. **Do not fall back to the event harness to rescue it.** At a non-discriminating shape the
+   event number is LARGER and looks better -- 3.0x against the profiler's 1.001x on the case
+   above -- and it is the launch-path gap, in our favour. The temptation runs one way.
+4. **Report the smallest sweep point that WOULD discriminate**, from the measured device-time
+   slope. That is the actionable output of a non-discriminating run, and it feeds back to
+   Phase 0 as a proposed contract amendment rather than a silent shape change.
+
+A sweep in which EVERY point is non-discriminating is a failed benchmark, not a parity
+result, and the stage's headline is `no admissible ratio` with the reason named.
 
 ### WHEN BOTH ARMS ARE HOST-BOUND, USE THE DEVICE PROFILER
 

@@ -106,6 +106,16 @@ variant; do not bake in any one algorithm's dimension names.
      edits, then re-invokes you with the confirmed contract). A family-convention guess
      (Tier 2) is still a guess about THIS algorithm -- burning the full pipeline on any
      non-evidenced value is the failure this phase prevents.
+   - **A Tier-1 contract can still be unconfirmed FOR BENCHMARKING.** Price the largest
+     sweep point before proceeding: estimated device time per call must exceed the enqueue
+     cost of every arm you will time (a `ctypes` launch enqueues in 10-12 us; a `torch_npu`
+     op in 50-64 us) and must be at least ~10x the launch floor (~2.7 us single-engine,
+     ~4.8 us MIX). If it is not, the sweep is **NON-DISCRIMINATING** -- record
+     `bench_discrimination` with that verdict, set `confidence: needs-confirmation`, and
+     **STOP with a PROPOSED larger benchmark point** (with its tier and the arithmetic).
+     Never substitute a bigger shape yourself: a discovered constraint amends the contract,
+     it does not overwrite a source-evidenced dim. A unit test's shapes are Tier 1 for
+     correctness and routinely too small to separate two implementations.
 
 4. **Persist** the agreed contract as the top-level `shape_contract` block in
    `stage_plan.json`. Every later phase reads shapes, dtype, tolerance, and the
@@ -431,7 +441,12 @@ The benchmark must time the kernel rigorously, not with host wall-clock:
   do not benefit from L2 residency.
 - **Shapes:** benchmark at the **contract's production sweep** (`shape_contract.sweep_axis`),
   not the tiny decomposition dims. A latency number at a non-production shape is
-  meaningless for comparison.
+  meaningless for comparison. **Re-check `bench_discrimination` against measured numbers:**
+  label any row where an arm is HOST-BOUND (enqueue > device) or the launch floor exceeds
+  ~10% of device time as `NON-DISCRIMINATING`, and never report parity from such a row as a
+  result -- it means the experiment could not tell, and the event harness will make it look
+  BETTER (3.0x against a profiler's 1.001x, in our favour) rather than fixing it. Report the
+  smallest sweep point that would discriminate.
 - **Knobs are parameters:** expose timer / warmup / iters / flush-size so the harness
   can be set to MATCH an external baseline's method exactly when the run's purpose is a
   head-to-head comparison (defaults: npu.Event, 256 MiB flush, warmup 5, iters 15+).
