@@ -205,6 +205,49 @@ often the most informative entries; do not quietly drop them.
 | `vec_only` | 25 | Yes — see the gate below |
 | `cube_only` | 25 | Yes — see the gate below |
 
+**PROVE A LEVER IS WIRED BEFORE YOU MEASURE IT -- and never record a broken knob as a
+rejected technique.** This is the most expensive failure in the campaign so far and it is
+invisible in every artifact the optimizer produces.
+
+`grouped_matmul` shipped a kernel whose K-step serialises MTE2, MTE1 and MAD behind adjacent
+`set_flag`/`wait_flag` pairs -- cost per step `t_MTE2 + t_MTE1 + t_MAD` where the hardware
+gives `max(...)`. The generator KNEW: its own header says "L1 and L0 are single-buffered ...
+Double buffering both levels is the second lever." Three variants were built (`PTO_DBUF_L1`,
+`PTO_DBUF_L0`, both), measured, and recorded as rejected. The kernel is **1.94x off the
+vendor in steady-state throughput**, and that is the entire gap.
+
+The knobs did nothing. They resolved to `kL1Slots = 2`, which widened an offset and tightened
+a `static_assert`, and **the buffers were bound ONCE, before the K loop, to slot 0** --
+`TASSIGN` appears zero times inside the loop, nothing selects `kb & 1`, and no flag distance
+changed. So the "lever" reserved memory it never used, shifted the addresses of the buffers
+after it (breaking the bias path numerically: rel err **4.9e-1** and **6.2e-2** at
+`L_nobias`), and halved the L0 tile cap. Measured result: slower, wrong, and at a larger
+shape two of the three raise **aicore exceptions** on a device that passes its control
+before and after.
+
+Every one of those measurements was correct. The conclusion drawn from them --
+"double buffering: rejected" -- was not, because the thing measured was not double buffering.
+
+**Before a knob's measurement counts as evidence about its technique:**
+
+1. **Show the knob changes the instruction stream, not just the allocation.** A slot count,
+   a buffer offset, a `constexpr` that only feeds a `static_assert` -- none of these are a
+   lever. For a buffering knob specifically: the buffer binding must be INSIDE the loop and
+   indexed by the iteration, and the producer/consumer flag distance must actually increase.
+   Grep your own emitted source for it.
+2. **A variant that computes WRONG ANSWERS is evidence the knob is MIS-WIRED, not evidence
+   the technique is bad.** Record it as `lever_broken`, never as a rejected lever. A correct
+   implementation of a standard technique does not produce a 0.49 relative error; a
+   mis-addressed buffer does.
+3. **A variant that FAULTS the aicore is the same finding**, once the device passes its
+   control. Fix the wiring and re-measure; do not spend the attempt and move on.
+4. **Say so in the stop evidence.** "Double buffering tried and rejected" in a report where
+   the knob was a no-op is worse than silence: it closes off the one lever that mattered,
+   for every future run that reads the report.
+
+The asymmetry to remember: a lever that is wired and loses costs you one attempt. A lever
+that is NOT wired and appears to lose costs you the technique, permanently, in the record.
+
 **When you run out of hypotheses before the budget.** This is the commonest way a
 campaign quietly under-runs, and the escape below is DELIBERATELY expensive to reach --
 the first version of this rule offered it unconditionally and stages promptly stopped at

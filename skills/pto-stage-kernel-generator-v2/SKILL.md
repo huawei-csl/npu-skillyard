@@ -406,6 +406,43 @@ On A2/A3, Cube-side `wait_flag_dev` for V→C reduces over both Vec subblocks;
 if `vid != 0` returns early, Cube cannot safely wait on that V→C flag.
 Use `pipe_barrier(PIPE_ALL)` only for intra-core sync, never cross-core. → COOK-§8, §8.6
 
+### C34: A COMPILE-TIME KNOB MUST CHANGE THE INSTRUCTION STREAM, NOT JUST THE ALLOCATION
+
+If you emit a `#define` knob and name it as an optimizer target, it must be **wired end to
+end**. A knob that only widens a buffer reservation is a no-op that costs capacity, and it
+will be measured, lose, and retire the technique it was named after.
+
+The instance: `grouped_matmul` emitted `PTO_DBUF_L1` / `PTO_DBUF_L0` and a header comment
+naming double buffering as "the second lever". They resolved to `kL1Slots = 2`, widening an
+offset and a `static_assert`. But every buffer was bound once, before the K loop:
+
+```cpp
+TASSIGN(a_l1, LM::A_L1);      // slot 0, hoisted out of the loop
+for (int64_t kb = 0; kb < nk; ++kb) { ... }   // zero TASSIGN inside
+```
+
+Nothing selected `kb & 1`; no `set_flag`/`wait_flag` distance changed. The reserved slot
+shifted the addresses of the buffers allocated after it, so the variants were numerically
+WRONG at the no-bias config (rel err 4.9e-1 and 6.2e-2) and raised **aicore exceptions** at
+larger shapes. The kernel shipped single-buffered and is **1.94x** off the vendor's
+steady-state throughput -- the entire gap -- with "double buffering rejected" in its record.
+
+**If you emit a buffering knob, it must do all three:**
+
+1. **Bind inside the loop, indexed by the iteration** -- `TASSIGN(a_l1, LM::A_L1 + (kb & 1) * A_L1_STRIDE)`,
+   not once before it.
+2. **Increase the producer/consumer flag distance.** Adjacent `set_flag(P, C, e)` /
+   `wait_flag(P, C, e)` is a BARRIER. Overlap requires waiting on the flag set one iteration
+   earlier -- issue step `kb+1`'s TLOAD, then wait for step `kb`'s. Use distinct event ids
+   per slot.
+3. **Keep the allocation valid at BOTH settings.** Anything addressed after a slotted buffer
+   moves when the slot count changes; `static_assert` the layout at each setting and validate
+   at every contract config, including the ones that exercise different optional inputs.
+
+If you cannot satisfy all three, **do not emit the knob**. Write the limitation in the header
+as an unbuilt target instead. A named-but-unwired lever is worse than an absent one, because
+the campaign will spend an attempt disproving a technique you never implemented.
+
 ### C33c: A CUBE-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH EITHER -- `dav-c220-cube` exists
 
 **C33b's mirror, and the generator has been leaving it on the table.** A stage whose StageSpec
