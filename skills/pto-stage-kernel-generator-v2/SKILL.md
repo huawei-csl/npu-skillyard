@@ -812,31 +812,35 @@ string literals, and code. → COMPILER
 
 **C14. Tile alignment and minimum sizes.**
 PTO tiles have strict alignment requirements. FORBIDDEN tile configurations:
-- `UbND<T, 1, 1>` or any 1x1 tile — violates 32-byte alignment
-- `UbND<float, R, C>` where `R * C * sizeof(float) < 32` bytes
+- a 1x1 tile — violates 32-byte alignment
+- any `Tile<TileType::Vec, float, R, C, ...>` where `R * C * sizeof(float) < 32` bytes
 - Tiles with `Cols < 8` for float32 (minimum 8 floats = 32 bytes)
 
 REQUIRED minimum tile sizes:
-- For `float32`: minimum `UbND<float, 1, 8>` (1 row × 8 cols = 32 bytes)
-- For `float16`: minimum `UbND<half, 1, 16>` (1 row × 16 cols = 32 bytes)
-- For scalar values: use `UbND<float, 1, 8>` and access element 0 via `GetValue(0)`
+- For `float32`: minimum `1 x 8` (32 bytes)
+- For `float16`: minimum `1 x 16` (32 bytes)
+- For scalar values: use a `1 x 8` fp32 tile and access element 0 via `GetValue(0)`
 
 When you need to store a single scalar result (e.g., from a reduction), use:
 ```cpp
-UbND<float, 1, 8, 1, DYNAMIC> scalar_tile(1);  // Valid: 1×8 = 32 bytes
+// NOTE: `UbND` is NOT a pto-isa type. It is a LOCAL alias, declared in EX-3 as
+//   template <typename T, int R, int C>
+//   using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor, -1, -1>;
+// Either declare that alias yourself or write the Tile<> form directly, as EX-2 does.
+Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, -1, -1> scalar_tile(1, 8);
 TASSIGN(scalar_tile, SCALAR_UB_ADDR);
 TROWSUM(scalar_tile, source_tile, temp_tile);
 float result = scalar_tile.GetValue(0);
 ```
 
-Do NOT use `UbND<T, 1, 1>` — it will fail compilation with alignment errors. → PLAT-§Alignment
+Do NOT use a 1x1 tile — it will fail compilation with alignment errors. → PLAT-§Alignment
 
 **C15. Reduction instruction correctness.**
 PTO reduction instructions have specific input/output shape requirements:
 
 - `TROWSUM(dst, src, temp)`: Reduces each row of `src` to a single value in `dst`
-  - `src`: `UbND<T, R, C>` (R rows, C cols)
-  - `dst`: `UbND<T, R, 8>` (R rows, minimum 8 cols for alignment)
+  - `src`: `Tile<TileType::Vec, T, R, C, BLayout::RowMajor, -1, -1>` (R rows, C cols)
+  - `dst`: `Tile<TileType::Vec, T, R, 8, BLayout::RowMajor, -1, -1>` (R rows, minimum 8 cols for alignment)
   - `temp`: **must scale with the SOURCE width, not the destination.** `src/2` is
     exact; `src/4` is silently WRONG (measured ~0.22 relative error). A `[R,8]`
     scratch is correct only for a narrow `src` -- see the corrected note below.
@@ -871,19 +875,19 @@ PTO reduction instructions have specific input/output shape requirements:
   - Result: `dst.GetValue(i)` contains sum of row `i` from `src`
 
 - `TCOLSUM(dst, src)`: Reduces each column of `src` to a single value in `dst`
-  - `src`: `UbND<T, R, C>` (R rows, C cols)
-  - `dst`: `UbND<T, 1, C>` (1 row, C cols) — NOT `UbND<T, 1, 8>`
+  - `src`: `Tile<TileType::Vec, T, R, C, BLayout::RowMajor, -1, -1>` (R rows, C cols)
+  - `dst`: `Tile<TileType::Vec, T, 1, C, BLayout::RowMajor, -1, -1>` (1 row, C cols) — NOT `Tile<TileType::Vec, T, 1, 8, BLayout::RowMajor, -1, -1>`
   - Result: `dst.GetValue(j)` contains sum of column `j` from `src`
 
 Common mistake: Using `TCOLSUM` to reduce a 1×K tile to 1×1. This is WRONG.
 Correct approach for reducing 1×K to scalar:
 ```cpp
-// WRONG: TCOLSUM(sum_1x1, g_row_1xK);  // sum_1x1 is UbND<T,1,1> — INVALID
+// WRONG: TCOLSUM(sum_1x1, g_row_1xK);  // sum_1x1 is a 1x1 tile — INVALID
 
 // CORRECT: Use TROWSUM with proper shapes
-UbND<float, 1, 128, 1, DYNAMIC> g_row(k);      // Source: 1×K
-UbND<float, 1, 8, 1, DYNAMIC> sum_tile(1);     // Dest: 1×8 (aligned)
-UbND<float, 1, 8, 1, DYNAMIC> temp_tile(1);    // Workspace: 1×8
+Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, -1, -1> g_row(1, k);   // Source: 1xK
+Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, -1, -1> sum_tile(1, 8);  // Dest: 1x8
+Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, -1, -1> temp_tile(1, 8); // Workspace
 TASSIGN(g_row, G_ROW_ADDR);
 TASSIGN(sum_tile, SUM_ADDR);
 TASSIGN(temp_tile, TEMP_ADDR);
@@ -1916,6 +1920,87 @@ matmul, fix engine choice (Cube vs Vec, S3) and precision residency (S10.4) FIRS
 and fuse only for deployment. → COOK-§8
 
 ---
+
+## C35: AN ALIASED DESTINATION CAN BE SILENTLY WRONG -- TRECIP IS
+
+On A2/A3 (`dav-c220`), `TRECIP(dst, src)` **returns 1.0 for every input when `dst` aliases
+`src`**. There is no compile error, no `PTO_ASSERT`, and no runtime signal. With a distinct
+destination it is exact (probed at 0.5 / 1 / 2 / 4 / 10 / 1.368).
+
+`TEXP`, `TMULS` and `TADDS` are all correct in place. **The restriction is specific to
+TRECIP**, so "the other unary ops alias fine" is not evidence that this one does.
+
+```cpp
+TRECIP(w, w);   // WRONG: silently yields 1.0
+TRECIP(o, w);   // correct; budget UB for a separate destination
+```
+
+**Failure signature:** the kernel returns its *input unchanged*, which reads as "the kernel
+never ran" or "the launch is broken" rather than "one instruction is wrong". If a vector
+chain emits its input, suspect an aliased TRECIP before you suspect the launch.
+
+**Generalisation:** for any unary tile op, do not assume in-place is legal. If a chain can
+be written with a distinct destination at no UB cost, prefer that; if it cannot, probe the
+aliased form against a CPU reference on a handful of scalars before building on it.
+
+## C36: THE TUNARY FAMILY REJECTS BFLOAT16 -- ROUND-TRIP THROUGH TCVT
+
+`TUNARY_IMPL` (the implementation behind `TEXP`, `TRECIP`, and the rest of the unary
+elementwise family) `static_assert`s on **float32 or half only**. `bfloat16_t` is rejected
+outright at compile time.
+
+A bf16 elementwise kernel must therefore stage through fp32:
+
+```cpp
+TCVT(w_f32, src_bf16, RoundMode::CAST_NONE);   // widen  (exact)
+// ... arithmetic in fp32 ...
+TCVT(dst_bf16, o_f32, RoundMode::CAST_RINT);   // narrow (round to nearest even)
+```
+
+Both directions exist on A2/A3 (`bf16 <-> fp32`). This is a **correctness constraint, not a
+precision preference** -- budget the extra fp32 tiles into the UB plan at Phase 4, not after
+the first compile failure. fp16 usually wants the same treatment for accuracy reasons even
+though it is accepted.
+
+## C37: IN A VEC-ONLY BUILD THERE IS NO SECOND SUB-BLOCK
+
+Under `--cce-aicore-arch=dav-c220-vec`, `get_subblockid()` **always returns 0** and
+`get_block_num()` equals the launch `block_dim` (probed at block_dim 1 / 8 / 48). The
+two-AIV-sub-block model belongs to MIX builds.
+
+Consequently a grid-stride scheme of the form
+
+```cpp
+const int64_t lane   = get_block_idx() * 2 + get_subblockid();   // WRONG in a vec build
+const int64_t nlanes = get_block_num() * 2;
+```
+
+yields only **even** lanes, so half of every multi-tile problem is never written. It passes
+any test whose input fits a single tile and fails everything larger -- a size-dependent
+correctness bug that a small-shape unit test cannot catch.
+
+Index work by `get_block_idx()` / `get_block_num()` alone in vec-only builds. `EX-2`'s
+`if (vid != 0) return;` is a harmless no-op here and is **required** in MIX builds.
+Validate any lane-indexing change at a size spanning at least three tiles (see C33b/C33c for
+when each arch flag applies).
+
+## C38: `ValidCol` GIVES A BYTE-EXACT STORE -- RAGGED TAILS ARE SAFE
+
+`TSTORE` on the ND path computes `lenBurst = validCol * sizeof(DType)` **in bytes**, so a
+tile whose `ValidCol` is not a multiple of the 32-byte block still writes exactly
+`ValidCol` elements and nothing past them. Verified with a guard-padded output buffer at
+`N % 8` = 1, 3, 4, 5, 6, 7 including a prime `N = 1000003`: no overrun.
+
+This separates two constraints that are easy to conflate:
+
+* **`Cols`** (the tile's allocated width) must satisfy the 32-byte alignment rule --
+  fp32 `Cols % 8 == 0`, fp16/bf16 `Cols % 16 == 0` (PLAT-Align, COOK alignment section).
+* **`ValidCol`** (the runtime extent) is unconstrained.
+
+So the correct pattern for a dynamic length is a fixed, aligned `Cols` with the ragged tail
+carried by a runtime `ValidCol` -- **not** a narrower tile, and **not** an overlapping
+backward-shifted final tile (which breaks the *start* alignment instead).
+
 
 ## Generator Workflow
 

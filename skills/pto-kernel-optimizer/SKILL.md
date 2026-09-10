@@ -942,3 +942,119 @@ about the contract, not about one shape.
 Corollary: effects under ~3% require interleaved replication (subject to §3.8) before they
 are believed. One campaign retracted a 1.006-1.008x "win" with a within-process CI clear of
 1.0 after replication put it at 1.000-1.004x against a 0.6-1.3% spread.
+## 3.11 A NOOP-FLOOR RATIO IS A CEILING, NOT A PRIZE
+
+A noop-floor decomposition -- delete the arithmetic, delete the memory, re-measure -- yields
+`full / own_memory_floor`. That number bounds the gap. It is **not** a predicted speedup, and
+it must never be reported as a "measured prize".
+
+It is reachable only if overlap were free, and overlap is never free: it must be bought with
+some resource, usually tile width or UB. **Price what closing the gap would consume before
+quoting the ratio as an opportunity.** If the fix spends the resource the current wins depend
+on, predict a regression and test it cheaply instead of promising the number.
+
+Worked instance: a sigmoid campaign closed by naming a 2-slot pipeline with a shared
+chunk-wide work buffer and quoting "measured prize 1.88x / 1.88x / 2.15x" from exactly this
+ratio. Implemented, it **regressed in both of its degrees of freedom** -- buying the second
+slot from tile width gave 790 GB/s (from 1186), buying it from chunk width gave 684 -- while
+staying correct at 26/26. The reason was structural and knowable in advance: with the UB full
+at one tile, a second slot has to come out of tile width, and tile width was what the three
+largest wins in that campaign had been buying.
+
+Also: a noop-floor probe that keeps the kernel's buffer layout measures **that layout's**
+floor, not the machine's. On the same op it overstated the 16-bit memory cost by ~2x
+(140.9 us vs 64.6 us for identical traffic from a clean load/store kernel), which pointed the
+next round at entirely the wrong half of the problem. If you want a hardware ceiling, write a
+probe with no arithmetic **and no arithmetic buffers**, so tile width and depth can be swept
+independently.
+
+## 3.12 PROVE A COMPILE-TIME LEVER CHANGED THE GENERATED CODE
+
+Before believing any A/B on a knob that is supposed to change a structural quantity --
+pipeline depth, slot count, tile width, buffer count -- **assert the realised value at
+compile time** and check that the assertion fails when it should:
+
+```cpp
+#ifdef PTO_EXPECT_NS
+  static_assert(NS == PTO_EXPECT_NS, "pipeline depth is not what was intended");
+#endif
+```
+
+Build the baseline asserting the old value (must compile), the baseline asserting the new
+value (**must fail**), and the treatment asserting the new value (must compile). Only then is
+the A/B a test of the hypothesis rather than of nothing. This is the companion to the v0.97
+rule that an unwired lever retires the technique, not the attempt: that rule says an unwired
+lever invalidates a negative result; this one tells you how to know.
+
+## 3.13 CHAIN-TRUNCATION DIFFERENCING IS INVALID ON THIS TOOLCHAIN
+
+Measuring an instruction's cost by deleting it and differencing does not work here. On a
+6-op vector chain, truncating after each op gave times that were **non-monotonic by 2x** --
+360.7 -> 183.8 -> 359.1 us as ops were *added*. The full-chain build reproduced the shipped
+kernel exactly, so the builds were sound; truncation perturbs codegen far more than the ops
+cost.
+
+This is the same family as the measured finding that a raw CCE intrinsic reached through an
+integer->`__ubuf__` cast made an **unrelated kernel in the same translation unit** 2.12x
+slower. Treat per-instruction attribution by code deletion as unavailable; use pipe
+counters (`AiCMetrics.PipeUtilization`) and cycle counts instead, which attribute without
+changing the binary.
+
+## 3.14 WHEN SCORING AGAINST AN EXTERNAL BENCHMARK, REPLICATE ITS MEASUREMENT PROTOCOL
+
+Published baselines are collected under a protocol. Reproduce it before treating any of its
+numbers as a target, and **verify the reproduction** by measuring the published arm yourself.
+
+Measured instance (cann-bench, `torch.sigmoid` on 910B2): the harness calls a frequency boost
+(a 10240x10240 fp16 matmul) and an L2 flush (a ReduceMax over 201 MB) **before every active
+rep**. Without them:
+
+| published / measured-here | median | min | max |
+|---|---|---|---|
+| no protocol | 1.110 | **0.430** | **1.958** |
+| protocol matched | **1.011** | 0.885 | 1.062 |
+
+The signs are diagnostic: the boost helps large sustained cases, the flush hurts
+cache-resident ones. A 0.43x-1.96x spread is not noise, and an analysis built on the
+unmatched numbers pointed at the wrong bottleneck entirely (it concluded the largest case was
+at a hard bandwidth wall the vendor beat; under the matched protocol that case was the
+**best** one, at 1.22x).
+
+Corollary: **run the vendor's own code on your machine.** A published number is not a
+measurement of your hardware.
+
+## 3.15 DO NOT INTERLEAVE TWO KERNELS IN ONE SESSION TO A/B THEM
+
+Alternating two different kernels inside a single profiler session looks like the strongest
+design -- identical machine conditions, order effects cancelled. It is biased. Measured: it
+inflated the **reference** arm's small-case times ~2x (5.2 -> 10.4 us) while leaving large
+cases untouched, the signature of a per-alternation kernel reload. Control: the same arm
+measured **alone** on the same device reproduced its published baseline on all 20 cases.
+
+Scoring harnesses run one operator's kernel repeatedly, so interleaving is *less* faithful,
+not more. Measure each arm alone, same device, same protocol, and check the device is idle
+first. (Note from the same experiment: absolute times moved with contention but the
+ours/vendor **ratio** was stable to 0.3% across a contended and an idle device -- so a ratio
+can survive contention that invalidates the absolutes.)
+
+## 3.16 IDENTIFY THE BINDING PIPE BEFORE PROPOSING A FIX -- AND BELIEVE IT
+
+`AiCMetrics.PipeUtilization` gives per-pipe time and a ratio per kernel. Two numbers decide
+the next move:
+
+* **which pipe dominates.** On a sigmoid kernel 4.9x off the vendor, `aiv_vec_time` was
+  1.29x the vendor's and `aiv_mte2_time` 1.38x -- the real work was nearly at parity -- while
+  `aiv_scalar_time` was **7.6x** theirs. The kernel was scalar-bound, not compute- or
+  memory-bound, which no amount of tiling or bandwidth work would have fixed.
+* **whether the pipes overlap.** Summed ratios < 1 means idle time on every pipe (0.625 was
+  measured, i.e. 37% idle); the vendor's summed to 1.38. A sum below 1 is the signature of a
+  serialised kernel and is worth more attention than any single pipe's share.
+
+Then resist the first explanation. For the scalar-bound kernel above, **two plausible causes
+were tested and both were falsified**: moving all tiling arithmetic to the host (5 64-bit
+divisions per lane removed) changed scalar time 7.046 -> 7.083 us, and bisecting the six
+`pipe_barrier(PIPE_V)` down to the one load-bearing barrier changed it 6.918 -> 7.039 us.
+Normalising first would have helped: the cost was **~3.8 us per chunk-loop iteration and
+essentially independent of N**, which already ruled out a fixed prologue cost before either
+experiment was built.
+

@@ -880,121 +880,106 @@ extern "C" void call_kernel(
 
 ## EX-§6: Activation Function Patterns
 
-### ReLU (simple pointwise)
+> **Corrected.** The previous version of this section used `UbND<T, rows, cols>` without
+> defining it. `UbND` is **not a pto-isa type** -- it is a local alias declared inside
+> `EX-3` (`using UbND = pto::Tile<pto::TileType::Vec, T, R, C, ...>`). Code copied from
+> this section in isolation therefore does not compile. Its GELU was also mathematically wrong (it formed
+> `1 + exp(-2x)`, noted in a comment that a reciprocal was needed, then applied `TADDS(+1)`
+> again and multiplied -- the reciprocal and the `2s-1` were both missing, so no tanh was
+> ever computed). Both are fixed below. The compile-proven tile type is the one `EX-2` uses.
 
-**Instruction chain**: TLOAD → TRELU → TSTORE
+The declarations every pattern here assumes:
 
 ```cpp
-// ReLU: y = max(0, x)
-UbND<float, 1, COLS> x_tile(1, cols);
-UbND<float, 1, COLS> y_tile(1, cols);
-TASSIGN(x_tile, X_UB_ADDR);
-TASSIGN(y_tile, Y_UB_ADDR);
+using ShapeD  = pto::Shape<1, 1, 1, 1, COLS>;
+using StrideD = pto::Stride<1, 1, 1, 1, 1>;
+using GlobalT = pto::GlobalTensor<float, ShapeD, StrideD>;
+using TileF   = Tile<TileType::Vec, float, 1, COLS, BLayout::RowMajor, -1, -1>;
+```
 
-TLOAD(x_tile, x_gm);
+`COLS` is the allocated width and must be 32-byte aligned (fp32 `% 8 == 0`); the runtime
+extent rides the constructor argument, `TileF t(1, cur_cols)` -- see **C38**.
+
+### Sigmoid (the reference elementwise chain)
+
+`y = 1 / (1 + exp(-x))`. Four ops. Note the destination of `TRECIP` -- **C35**.
+
+```cpp
+TileF w(1, cl);  TASSIGN(w, W_ADDR);
+TileF o(1, cl);  TASSIGN(o, O_ADDR);     // MUST differ from w: TRECIP cannot alias
+
+TLOAD(w, x_gm);
 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-TRELU(y_tile, x_tile);  // pointwise max(0, x)
-pipe_barrier(PIPE_V);
+TMULS(w, w, -1.0f);   pipe_barrier(PIPE_V);   // -x
+TEXP(w, w);                                   // exp(-x)   (in-place is fine)
+TADDS(w, w, 1.0f);                            // 1 + exp(-x)
+TRECIP(o, w);                                 // 1/(1+exp(-x))  -- o != w REQUIRED
 
 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+TSTORE(y_gm, o);
+```
+
+**On the barriers:** this chain was bisected on hardware one barrier at a time. Of the six
+barriers in the full fp16/bf16 version (after widen-cvt, TMULS, TEXP, TADDS, TRECIP,
+narrow-cvt), **only the one after `TMULS` is load-bearing** -- removing any other single
+barrier keeps 26/26, removing that one fails 25/26, and removing all six fails. Removing
+the five optional ones was also **measured worth nothing** (scalar time 7.04 vs 6.92 us,
+unchanged). So: keep the barrier after the first producer into a freshly-assigned tile, do
+not bother trimming the rest, and do not expect barrier count to be a performance lever.
+
+For bf16 the same chain must stage through fp32 -- **C36**.
+
+### ReLU (single op)
+
+```cpp
+TLOAD(x_tile, x_gm);
+set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+TRELU(y_tile, x_tile);
+set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 TSTORE(y_gm, y_tile);
 ```
 
-### GELU (Gaussian Error Linear Unit)
+### GELU (tanh approximation) -- CORRECTED
 
-GELU has no direct PTO instruction. Approximate using:
-```
-GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-```
+`GELU(x) ~= 0.5 * x * (1 + tanh(c * (x + 0.044715 x^3)))`, `c = sqrt(2/pi)`.
 
-**Instruction chain**: TLOAD → TMUL → TMULS → TADD → TMULS → TEXP → TADD → TMULS → TMUL → TSTORE
-
-```cpp
-// GELU approximation using tanh via exponential
-// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) ≈ 2*sigmoid(2x) - 1
-
-UbND<float, 1, COLS> x_tile, x3_tile, inner_tile, tanh_tile, out_tile;
-// ... allocate and TASSIGN ...
-
-TLOAD(x_tile, x_gm);
-// ... sync ...
-
-// x³ = x * x * x
-TMUL(x3_tile, x_tile, x_tile);  // x²
-TMUL(x3_tile, x3_tile, x_tile); // x³
-pipe_barrier(PIPE_V);
-
-// x + 0.044715 * x³
-TMULS(inner_tile, x3_tile, 0.044715f);
-TADD(inner_tile, x_tile, inner_tile);
-pipe_barrier(PIPE_V);
-
-// sqrt(2/π) * (x + 0.044715 * x³)
-TMULS(inner_tile, inner_tile, 0.7978845608f);  // sqrt(2/π)
-pipe_barrier(PIPE_V);
-
-// tanh approximation: tanh(x) ≈ 2*sigmoid(2x) - 1
-// sigmoid(2x) = 1 / (1 + exp(-2x))
-TMULS(inner_tile, inner_tile, 2.0f);  // 2x
-TMULS(inner_tile, inner_tile, -1.0f); // -2x
-TEXP(tanh_tile, inner_tile);           // exp(-2x)
-TADDS(tanh_tile, tanh_tile, 1.0f);    // 1 + exp(-2x)
-// ... need TRECIP for 1/(1+exp(-2x)), then scale and shift ...
-
-// 0.5 * x * (1 + tanh(...))
-TADDS(tanh_tile, tanh_tile, 1.0f);    // 1 + tanh
-TMUL(out_tile, x_tile, tanh_tile);
-TMULS(out_tile, out_tile, 0.5f);
-pipe_barrier(PIPE_V);
-
-TSTORE(out_gm, out_tile);
-```
-
-**Key points:**
-- GELU requires decomposition into multiple PTO ops
-- Consider using `TRECIP` (reciprocal) if available (verify with MCP)
-- Alternative: use polynomial approximation if stage spec allows
-- Always verify intermediate tile values don't overflow UB budget
-
-### Leaky ReLU (conditional activation)
-
-**Instruction chain**: TLOAD → TCMP → TSEL → TSTORE (or TLRELU if available)
+Build tanh from sigmoid, which is the only identity that keeps every step to ops that exist:
+`tanh(u) = 2*sigmoid(2u) - 1`, so `1 + tanh(u) = 2*sigmoid(2u)` and the whole expression
+collapses to `GELU(x) = x * sigmoid(2c(x + 0.044715 x^3))`. That removes the `+1`, the
+`-1` and a multiply:
 
 ```cpp
-// Leaky ReLU: y = x if x > 0, else 0.01 * x
-// Check if TLRELU instruction is available via MCP
-
-UbND<float, 1, COLS> x_tile, mask_tile, y_tile;
-UbND<float, 1, COLS> leak_tile;
-// ... allocate and TASSIGN ...
-
-TLOAD(x_tile, x_gm);
-// ... sync ...
-
-// Option 1: Use TLRELU if available
-TLRELU(y_tile, x_tile, 0.01f);  // verify signature with MCP
-pipe_barrier(PIPE_V);
-
-// Option 2: Decompose using TCMP + TSEL
-TEXPANDS(leak_tile, 0.01f);
-TMUL(leak_tile, x_tile, leak_tile);  // 0.01 * x
-TCMP(mask_tile, x_tile, 0.0f);       // mask = (x > 0)
-TSEL(y_tile, mask_tile, x_tile, leak_tile);  // y = mask ? x : 0.01*x
-pipe_barrier(PIPE_V);
-
-TSTORE(out_gm, y_tile);
+TileF u(1, cl), t(1, cl), s(1, cl);     // s is the TRECIP destination (C35)
+// u = x^3
+TMUL(u, x, x);   pipe_barrier(PIPE_V);
+TMUL(u, u, x);   pipe_barrier(PIPE_V);
+// u = 2c*(x + 0.044715 x^3),  2c = 1.5957691216
+TMULS(u, u, 0.044715f);       pipe_barrier(PIPE_V);
+TADD(u, x, u);                pipe_barrier(PIPE_V);
+TMULS(u, u, 1.5957691216f);   pipe_barrier(PIPE_V);
+// s = sigmoid(u)
+TMULS(t, u, -1.0f);  pipe_barrier(PIPE_V);
+TEXP(t, t);
+TADDS(t, t, 1.0f);
+TRECIP(s, t);        pipe_barrier(PIPE_V);
+// y = x * s
+TMUL(y, x, s);
 ```
 
-**Key points:**
-- Prefer fused `TLRELU` if available (verify with MCP)
-- `TCMP` generates a boolean mask tile
-- `TSEL` performs conditional selection: `mask ? a : b`
-- All conditional logic stays on tiles, no scalar branching
+**Verify any activation against a CPU float64 reference before trusting it.** The previous
+version of this section compiled and produced plausible-looking numbers while computing the
+wrong function; only a reference comparison catches that.
 
----
+### Leaky ReLU
+
+```cpp
+TLRELU(y_tile, x_tile, 0.01f);          // verify availability with the MCP first
+// fallback: TEXPANDS(leak, 0.01f); TMUL(leak, x, leak);
+//           TCMP(mask, x, 0.0f); TSEL(y, mask, x, leak);
+```
 
 ## EX-§FlashAttention: Vec+Cube Pipeline (from pto-isa CPU tests)
 

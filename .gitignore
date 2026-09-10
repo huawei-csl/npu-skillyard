@@ -12,3 +12,7 @@ kernel_meta/
 __pycache__/
 *.pyc
 .venv/
+
+# stray msprof/torch_npu profiler exports
+export_only_prof_dir/
+*_ascend_pt/

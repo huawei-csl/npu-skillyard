@@ -533,6 +533,51 @@ Before returning the stage plan, verify:
 - Do not include scalar loop bodies as pseudo-kernel placeholders.
 - Keep output strictly to algorithm stage decomposition metadata.
 
+## AN EXTERNAL BENCHMARK'S PUBLISHED BASELINE IS NOT A MEASUREMENT OF YOUR MACHINE
+
+When the contract's comparison target comes from a third-party benchmark (cann-bench or
+similar), the published per-case baseline is a number collected on **someone else's device
+under their protocol**. Before it enters the contract as a target:
+
+1. **Find what the baseline actually executes.** It is usually a named reference function,
+   not a mystery. (cann-bench: `scripts/baseline/refs/levelN.py` -- for sigmoid it is
+   literally `torch.sigmoid(inputs[0])`, dispatching to `aclnnSigmoid_SigmoidAiCore_Sigmoid`.)
+2. **Run it on your hardware and reproduce the published number.** Record the ratio per case.
+3. **Replicate their measurement protocol** or the reproduction will fail -- see the optimizer
+   skill 3.14. Measured: unmatched protocol gave published/measured spanning 0.43x-1.96x;
+   matched, it was 1.011 median.
+4. **Use their comparator, not your own.** Reimplementing an accuracy standard from its prose
+   is how you ship a gate that is stricter than the official one in one domain and absent in
+   another. Import theirs (cann-bench: `kernel_eval.utils.compare.compare_tensors`, which
+   loads standalone with only a PYTHONPATH) and call it with the arguments their evaluator
+   uses -- including the same-precision `native_output` reference, whose absence makes the
+   small-value branch *harsher*, not softer.
+
+Record in the contract, per case: the published baseline, **your measured value for the same
+reference**, and the protocol. A contract that cites only the published number cannot tell a
+real regression from a protocol mismatch.
+
+## YOUR OWN HARNESS HAS A FLOOR -- FIND IT BEFORE READING FIXED COST
+
+Device-event timing of a back-to-back launch loop reports `max(device_time, host_enqueue)`.
+Measure the floor directly with an empty kernel: on this host it was **~4 us/launch**, with
+`npu.Event` device time and host enqueue time agreeing to 3% -- i.e. the event timer was
+reporting the enqueue rate, not the kernel.
+
+Consequences for Phase 0's `bench_discrimination` block:
+
+* a case whose device time is below that floor measures the harness, and its ratio is not a
+  kernel result;
+* a fitted fixed cost extrapolates to the floor, so quote **how much of it is launch** --
+  here at most ~3.9 us of a fitted 6.3 us, leaving ~2.4 us of genuine kernel prologue;
+* never compare your fitted fixed cost against an *inferred* vendor fixed cost. Measure both
+  on the same instrument or say you have not.
+
+Where the scoring harness uses the profiler (kernel-only device time), measure there too, so
+your number and the scorer's measure the same thing. On the op above the two instruments
+agreed within a few percent once every case sat above the floor -- which is the result you
+want to be able to state, rather than assume.
+
 ## Evidence Gaps
 
 If you cannot determine a stage boundary, shape, dtype, or instruction family with confidence, record the uncertainty in the stage entry as `evidence_gaps` rather than guessing.
