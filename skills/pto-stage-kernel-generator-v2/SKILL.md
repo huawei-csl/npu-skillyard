@@ -2054,6 +2054,65 @@ Related skew, same run: `TMADD` and `TMULA` are served by the npu-coding MCP but
 a2a3 implementation in pto-isa `109c9f72`**, and there is **no `TCVT` path for bf16 -> int8**
 (stage through fp32). Verify against the headers you compile against, not the index.
 
+## C41: `pipe_barrier(PIPE_X)` ORDERS PIPE X ONLY -- CROSS-PIPE WAR NEEDS A FLAG
+
+`pipe_barrier(PIPE_V)` orders the vector pipe against itself. It does **not** hold MTE2 back.
+So a loop that re-`TLOAD`s into a tile the vector pipe is still reading has a
+write-after-read hazard that no amount of `pipe_barrier(PIPE_V)` closes:
+
+```cpp
+for (c = 0; c < nchunks; ++c) {
+    // WRONG if MTE2 can run ahead: the next TLOAD may land while V still reads t
+    TLOAD(t, chunk(c));
+    ... wait MTE2->V ...
+    TMAX(acc, acc, t);
+    pipe_barrier(PIPE_V);          // orders V only -- does NOT protect t from MTE2
+}
+```
+
+The fix is an explicit `V -> MTE2` flag: `set_flag(PIPE_V, PIPE_MTE2, ev)` once the vector work
+has consumed the tile, and `wait_flag(PIPE_V, PIPE_MTE2, ev)` before the next `TLOAD` into it.
+(Equivalently, give the loop two tile slots.)
+
+**Observed failure mode** (v0.99 run on `grouped_matmul_swiglu_quant`): a row max silently
+reduced over **one chunk instead of all of them** -- 245 of 1024 rows wrong on one case, and
+*which* chunk survived varied run to run. Nothing faults; the number is just wrong and
+non-deterministic.
+
+**Provenance note, stated honestly:** the general rule above is ordinary cross-pipe WAR
+semantics and is not in doubt. The specific failure mode was observed by that run; a parent-session
+attempt to reproduce it in isolation returned 12/12 correct for *both* variants, because the
+probe placed an adjacent `set_flag`/`wait_flag(MTE2 -> V)` straight after the `TLOAD`, which
+serialises the two pipes so completely that MTE2 can never run ahead. **That is a lesson about
+probe design, not evidence against the rule:** a probe for a run-ahead hazard must leave the
+producing pipe free to run ahead, or it tests nothing. Use >=2 slots and defer the consumer's
+wait (see optimizer 3.12 for the companion discipline of proving a lever is live).
+
+## C42: AN OVERLOAD CAN CHANGE THE REQUIRED OPERAND LAYOUT, SILENTLY
+
+C39 established that an extra tmp argument can change which *precision* path runs. The same
+mechanism changes required **layouts**, with the same silence.
+
+Reported by the v0.99 run, found by probing: **`TQUANT`'s 4-argument overload (with an explicit
+scratch tile) requires a ColMajor per-row scale.** Handed a RowMajor lane-filled `[R, 8]` scale
+it is silently wrong -- max int8 difference 126 on 42% of elements. The 3-argument overload is
+bit-exact on the same inputs.
+
+So the rule from C39 generalises: **when an instruction has several overloads, the extra
+argument can change the contract on the arguments you already had.** Do not assume an overload
+is a superset. Probe the exact arity and layout you intend to emit against a CPU reference
+before building on it. (Not independently re-probed in the parent session -- it is recorded with
+its origin so the next run can confirm or correct it cheaply.)
+
+Two more from the same run, same status -- reported by it, worth confirming when next in scope:
+
+* **An int8 L0 operand's contraction extent is honoured only inside its last 32-deep fractal**
+  (the k direction). `K = 1040` was the only failing case of 20 and the only K with
+  `K % 128 != 0`; an operand-*width* explanation was ruled out by a separate probe.
+* **C15's reduce-scratch is `src/2`, not src-shaped.** A `kWC/2` scratch validated 10/10, so
+  src-shaped is sufficient but not necessary. `TROWMAX` takes the scratch as a required third
+  argument -- `TROWMAX(dst, src, tmp)`; the 2-argument form does not exist.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
