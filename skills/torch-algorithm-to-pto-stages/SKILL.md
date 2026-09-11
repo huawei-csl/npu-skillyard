@@ -578,6 +578,46 @@ your number and the scorer's measure the same thing. On the op above the two ins
 agreed within a few percent once every case sat above the floor -- which is the result you
 want to be able to state, rather than assume.
 
+## A SEAM THAT MUST WIDEN ITS DTYPE IS FUSION-REQUIRED
+
+The existing Phase 1 fusion test asks whether the seam tensor's **size** grows without bound
+in the sweep dim (the `O(S^2)` vs `O(S*D)` amplification test). Add a second, independent
+trigger: **does the seam have to carry a WIDER dtype than either endpoint in order to be
+numerically correct?**
+
+If a downstream stage derives something accuracy-critical from the upstream result -- a
+normalization scale, a quantization scale, a reduction over a normalized row -- then handing it
+the *native* dtype loses bits the downstream stage cannot recover, and the seam must be
+promoted to fp32. That promotion multiplies the staged traffic and is invisible to the
+size-based amplification test, because the element *count* never changes.
+
+Measured instance (`add_rms_norm_dynamic_quant`, Add -> RmsNorm -> DynamicQuant): forwarding the
+native-dtype `xOut` across the add->norm seam put `scaleOut` at **2.4e-4 mean relative error
+against a 1.22e-4 threshold**, so the seam had to carry an **fp32 `[M, D]`** intermediate.
+Consequence:
+
+| | traffic | vs the vendor op, measured |
+|---|---|---|
+| composed chain (Phase 7 Part A) | 23 B/element | **0.46x -- i.e. 2.2x SLOWER** |
+| fused kernel (Phase 7 Part B) | 7 B/element | **1.33x -- faster** |
+
+Fusion was worth **2.89x geomean** over the chain, bracketed by the 23/7 = 3.29x structural
+traffic ratio. **Composition alone would have shipped an honest loss on nearly every case.**
+
+Two consequences for Phase 0/1:
+
+1. **Flag the op fusion-required before Phase 3** when a seam must widen, and say so in
+   `stage_plan.json` with the error figure that forces it. This is cheap to establish: compute
+   the downstream output both ways in float64 on the host and compare against the dtype
+   threshold, before any kernel exists.
+2. **A row reduction downstream of a normalization is the canonical instance** -- the reduce
+   depends on the whole normalized row, so the downstream stage cannot stream and the seam
+   cannot be chunked away. Look for `row_max`, `row_sum`, `amax` over a normalized quantity.
+
+Contrast with the case where composition is right: a memory-bound elementwise chain whose seam
+keeps its dtype gains nothing from fusion, because there is no width promotion and no
+reduction. The test is the dtype, not the op count.
+
 ## Evidence Gaps
 
 If you cannot determine a stage boundary, shape, dtype, or instruction family with confidence, record the uncertainty in the stage entry as `evidence_gaps` rather than guessing.

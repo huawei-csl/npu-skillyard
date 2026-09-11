@@ -1058,3 +1058,40 @@ Normalising first would have helped: the cost was **~3.8 us per chunk-loop itera
 essentially independent of N**, which already ruled out a fixed prologue cost before either
 experiment was built.
 
+## 3.17 A ROW REDUCTION IS ~6x AN ELEMENTWISE OP -- PRICE IT, THEN LOG-FOLD IT
+
+A horizontal reduce (`vcadd`, `vcmax`, and the `TROW*`/`TCOL*` families built on them) costs
+roughly **6x an elementwise op per element**. On a fused RMSNorm+quant kernel a noop-floor
+probe priced the **two** row reductions at **36-40% of the whole kernel** -- more than either
+the memory traffic or the remaining arithmetic.
+
+Two transformations followed, and both paid:
+
+* **Log-fold with elementwise ops, reduce only the tail.** Instead of reducing `D` elements
+  horizontally, fold the row in half repeatedly with `TADD` / `TMAX` (cheap, elementwise) and
+  pay the horizontal reduce only on the final 64 lanes. **1.22x.**
+* **Check what the library's wide-row reduce emits.** The built-in path for a wide row inserts
+  a `pipe_barrier(PIPE_V)` **per tree step**; reshaping the reduce to avoid them was
+  **1.48x.** Read the header for the op you are calling before assuming its shape is free.
+
+So: when a stage contains a reduction, price the reduction *separately* from the elementwise
+work before choosing an axis to attack. A kernel that looks memory-bound by its byte count can
+be reduction-bound in practice.
+
+## 3.18 AN OPTIMIZATION PRIOR DOES NOT TRANSFER ACROSS ARCHETYPES
+
+Carry levers forward as hypotheses, never as expectations, and re-price them on the new
+archetype before spending attempts.
+
+Measured instance: the L2-bypass output alias (`rtGetL2CacheOffset`) was worth **1.39-1.70x**
+on memory-bound elementwise kernels. On a fused reduction kernel moving comparable bytes it
+was worth **1.023x** -- indistinguishable from the noise floor. The prior was not wrong, it was
+out of domain: the fused kernel's bottleneck was the reductions (3.17), not the cache.
+
+What told the truth was the **noop-floor probe run first**, which priced the reductions at
+36-40% before any attempt was spent. Run the decomposition before the lever list, every time.
+The inverse also holds: six levers closed on a memory-bound elementwise op (pipeline depth,
+shared work buffers, barrier trimming, a block_dim schedule, host tiling, chain truncation)
+should be re-opened as *questions* on a reduction- or compute-bound stage, not assumed dead --
+but re-testing one costs an attempt and needs a stated reason.
+

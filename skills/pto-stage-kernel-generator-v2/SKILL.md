@@ -2002,6 +2002,58 @@ carried by a runtime `ValidCol` -- **not** a narrower tile, and **not** an overl
 backward-shifted final tile (which breaks the *start* alignment instead).
 
 
+## C39: A PRECISION TEMPLATE ARGUMENT CAN BE SILENTLY IGNORED
+
+Several PTO instructions take an `auto PrecisionType` template parameter (`RsqrtAlgorithm`,
+`ExpAlgorithm`, `RecipAlgorithm`, `LogAlgorithm`, ... each `{DEFAULT, HIGH_PRECISION}`).
+**Requesting `HIGH_PRECISION` does not guarantee you get it.** Where the instruction also has a
+**tmp-tile overload**, the high-precision path lives in the tmp overload only, and the
+no-tmp form accepts the tag and discards it.
+
+Measured on dav-c220, fp32, input in [0.1, 10], against the fp32 threshold 2^-13 = 1.22e-4:
+
+| call | max rel err | |
+|---|---|---|
+| `TRSQRT(b, a)` | 3.047e-03 | FAIL |
+| `TRSQRT<RsqrtAlgorithm::HIGH_PRECISION>(b, a)` | **3.047e-03 -- identical** | FAIL |
+| `TRSQRT<RsqrtAlgorithm::HIGH_PRECISION>(b, a, tmp)` | **1.202e-07** | PASS |
+| `TSQRT(t,a)` then `TDIV(b, one, t)` | 1.202e-07 | PASS |
+
+In `pto_instr.hpp` TRSQRT declares two overloads, `(dst, src)` and `(dst, src, tmp)`; only the
+second reaches `TRsqrtHighPrecision`. The first routes to `TUNARY_IMPL<RsqrtOp<...>>`, which
+never sees the tag. `TROWEXPANDDIV` has the same no-tmp / tmp pair and the same exposure.
+
+**Rules:**
+1. **Never infer accuracy from the enum.** Probe the exact call you intend to emit against a
+   CPU float64 reference, at the dtype threshold you must meet.
+2. If an instruction has both a precision parameter and a tmp overload, **pass the tmp** when
+   you want precision, and budget the tile.
+3. `TRSQRT` at default precision is ~25x over the fp32 threshold **on its own**, before any
+   other error source. Every fp32 normalization scale (RMSNorm, LayerNorm, any
+   quantization scale) must use the 3-arg form or `TSQRT`+`TDIV`. They measure identically,
+   so choose on UB and op count, not accuracy.
+
+## C40: AN fp32 VEC TILE WITH `Cols >= 2048` SILENTLY BREAKS THE ROW REDUCE
+
+For a multi-row fp32 Vec tile, `Cols >= 2048` puts the row stride beyond the 255-block
+repeat-stride field, and the **row reduction silently returns wrong values**. Found by
+bisection on a fused RMSNorm+quant kernel.
+
+What makes it dangerous is that the corruption is **selective**: the reduction-derived output
+was wrong on every affected case while the elementwise output from the *same tile* stayed
+**bit-exact**. A gate that checks only the elementwise output passes, and the symptom reads as
+a numerical accuracy problem rather than an addressing limit.
+
+**Rules:** cap chunk width at **1024 elements** for fp32 Vec tiles that feed a row reduce
+(`TROWSUM`, `TROWMAX`, `TCOLSUM`, ...), and record the cap as a locked dim in
+`shape_contract.json` with the reason, so a later tile-width sweep cannot quietly undo it.
+When a reduction output is wrong but an elementwise output from the same tile is exact,
+**suspect the stride field before the arithmetic**.
+
+Related skew, same run: `TMADD` and `TMULA` are served by the npu-coding MCP but have **no
+a2a3 implementation in pto-isa `109c9f72`**, and there is **no `TCVT` path for bf16 -> int8**
+(stage through fp32). Verify against the headers you compile against, not the index.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
