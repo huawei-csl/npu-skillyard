@@ -1023,6 +1023,55 @@ at a hard bandwidth wall the vendor beat; under the matched protocol that case w
 Corollary: **run the vendor's own code on your machine.** A published number is not a
 measurement of your hardware.
 
+### 3.14a AMENDMENT -- A PROTOCOL HAS A VERSION. READ THE HARNESS, NOT ITS DOCS.
+
+The protocol above was replicated from `docs/design/perf_collection_design.md`, which says
+`_boost_freq_and_clear_cache()` runs "每次调用前" -- before every call. **The code does not do
+that, and has not for some time.** `eval/perf_eval.py::_profile` says so in its own docstring:
+
+    性能优化：频率提升仅在测量窗口前执行一次（而非每个 step），
+    L2 cache 清理仅在测量 step 前执行（warmup step 跳过）。
+    原先 (warmup+repeat) x (MatMul+ReduceMax) -> 1 x (MatMul+ReduceMax) + repeat x ReduceMax。
+
+"原先" is *formerly*. We had replicated the superseded protocol. The live one is **two
+different operations at two different places**:
+
+| where | what | guard |
+|---|---|---|
+| `eval/op_runner.py:186` -- ONCE per case, **OUTSIDE** the profiler | `_boost_freq_and_clear_cache()`: 10240^2 fp16 matmul **+** 201 MB ReduceMax | `if enable_perf` |
+| `eval/perf_eval.py::_profile` -- **INSIDE** the window, per step | `_clear_cache()`: 201 MB ReduceMax **only** | `if freq_boost and i >= warmup` (warmup steps skipped) |
+
+A 10240^2 fp16 matmul inside a Level1 profiler window, immediately ahead of a ~7 us kernel, is
+not a neutral preamble. Fixing only the placement -- same kernel `.so`, same cases, same
+device, same seeds, nothing else touched -- on `level2/dynamic_quant`:
+
+| case | W | old (boost in-window) | fixed (flush in-window) | official harness | old/official |
+|---|---|---|---|---|---|
+| 14 | 67 | 368.98 | **191.26** | 200.79 | **1.84x** |
+| 13 | 251 | 12.90 | 8.46 | 8.83 | 1.46x |
+| 8 | 1021 | 9.82 | 6.80 | 7.07 | 1.39x |
+| 7 | 1023 | 9.42 | 6.52 | 6.82 | 1.38x |
+| 10 | 373 | 274.84 | 235.54 | 233.24 | 1.18x |
+| 6 | 16384 | 241.98 | 243.36 | 242.21 | 1.00x |
+
+The error is **not uniform** -- it is largest on narrow-W, many-row cases (case 14 is 162,877
+rows of 67) and vanishes on the wide sustained ones. So it does not cancel in a ratio and it
+does not cancel in a score: it **reshapes which cases look like your weak ones**. Cases 10 and
+14 had been written down as anomalies to investigate; they were the instrument.
+
+Three rules fall out:
+
+1. **Replicate a protocol from the harness source, at the commit you are being scored
+   against.** A design doc describes an intent; `git log` describes what ran.
+2. **Nothing that runs inside the profiler window may be larger than the thing being
+   measured.** Ballast belongs outside the window; only the per-rep state reset belongs
+   inside, and it should be the smallest operation that achieves the reset.
+3. **When your own number disagrees with the scorer's, suspect your instrument before your
+   kernel.** We scored 84.33 where the official harness scored 85.78 on the same binary, and
+   spent the gap looking for a kernel-side cause. Formula, weights, baselines and accuracy all
+   agreed; the entire residual was the protocol. The tell was available without the official
+   run at all: our max run-to-run spread was 81.4% against the official harness's 16.5%.
+
 ## 3.15 DO NOT INTERLEAVE TWO KERNELS IN ONE SESSION TO A/B THEM
 
 Alternating two different kernels inside a single profiler session looks like the strongest
