@@ -1095,3 +1095,51 @@ shared work buffers, barrier trimming, a block_dim schedule, host tiling, chain 
 should be re-opened as *questions* on a reduction- or compute-bound stage, not assumed dead --
 but re-testing one costs an attempt and needs a stated reason.
 
+## 3.19 MEASURE THE PER-CASE BELIEVABILITY THRESHOLD FROM CODE-IDENTICAL CASES
+
+The ~3.3% figure this skill quotes elsewhere is a **geomean** over a whole case set from a
+byte-identical null control. The **per-case** threshold is wider, and it is the per-case number
+you need when a change only touches some cases.
+
+Measure it for free on every partial change: in a shipped-vs-baseline pair, the cases the change
+does **not** touch are a null control you already ran. On `grouped_matmul_swiglu_quant` the **17
+code-identical cases spanned 0.952-1.067** (geomean 0.9888), i.e. a per-case believability
+threshold of about **+/-5%**, not +/-3%.
+
+Consequence, and the run that measured it applied this to itself: a +2-4% improvement on two
+cases was **reported but not claimed**, because it sat inside the threshold its own null control
+had just established. Do that. A partial change gives you the control automatically -- use it
+before deciding which per-case numbers you are entitled to assert.
+
+## 3.20 A PREDICTION IS PRICED AT ITS ASSUMPTIONS -- STATE THEM, THEN REPORT WHICH FAILED
+
+When you price a fix from a profile, write the assumptions down with the number, because the
+useful output of a failed prediction is *which assumption broke*.
+
+Worked instance. A profile priced removing an fp32 activation round-trip at **case 5: 579.88 ->
+~497 us**, which would have passed the vendor's 524.86. Measured: **529.12 us** -- the byte count
+moved exactly as predicted (`aiv_UB_to_GM` 41,472 -> 8,704 KB against the vendor's 8.6 MB, with
+`aic_GM_to_L1` byte-identical, proving the Cube side untouched), the Cube-idle tail fell 12.6% ->
+4.8%, and the result was **parity with the vendor (0.996x, up from 0.891x) but not past it**.
+
+The two assumptions that failed are the report's most valuable content: the prediction priced the
+tail at its **full** 78 us and the overlap cost at **zero**. Measured, the cheapest cross-core
+rendezvous that overlaps the tail **adds 8 us of Cube-active time and leaves 26 us of tail**.
+
+So: when the mechanism metric moves as predicted and the latency does not, you have learned the
+price of the mechanism, not that the mechanism was wrong. Report it that way. And note what it
+licenses -- here, that the remaining duty gap (0.777 vs 0.866) is untouched and is a *different*
+lever, which is a stronger conclusion than the latency number alone supports.
+
+## 3.21 LOAD IMBALANCE IS INVISIBLE TO PIPE COUNTERS
+
+A work-distribution regression can cost double digits with **every pipe counter unchanged**,
+because each core is equally busy -- just for different lengths of time.
+
+Measured instance: re-anchoring the task->core map at a stripe boundary gave cores 0-3 eight
+tasks against a mean of 5.8 and cost **19%**, with no pipe ratio moving. The rule it yields:
+**a stripe or phase boundary must not re-anchor the task->core map** -- anchor it once, globally.
+
+Diagnose this by computing tasks-per-core from the index arithmetic and comparing the maximum
+against the mean, *before* reaching for a profile. A pipe profile cannot see it.
+

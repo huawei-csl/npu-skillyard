@@ -2079,6 +2079,14 @@ reduced over **one chunk instead of all of them** -- 245 of 1024 rows wrong on o
 *which* chunk survived varied run to run. Nothing faults; the number is just wrong and
 non-deterministic.
 
+**Second independent instance** (`grouped_matmul_swiglu_quant`, a different kernel and a
+different pipe pair): a `y_scale` **MTE3 store** read a tile that the next group's **MTE2 load**
+clobbered. Case 15 returned another unit's `x_scale` as `y_scale` on **224 of 1009 rows**,
+racily, **while `y` stayed correct**. Same signature as the first instance: one output wrong,
+another from the same region exact, and non-deterministic. Treat every reuse of a tile across a
+pipe boundary as needing an explicit flag, in both directions -- the hazard is not specific to
+MTE2-overwriting-V.
+
 **Provenance note, stated honestly:** the general rule above is ordinary cross-pipe WAR
 semantics and is not in doubt. The specific failure mode was observed by that run; a parent-session
 attempt to reproduce it in isolation returned 12/12 correct for *both* variants, because the
