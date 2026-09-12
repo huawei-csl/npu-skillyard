@@ -2333,6 +2333,43 @@ as a softmax precision issue.
 contract's **largest** `validCol`, not the one you are testing. A row reduction that is right
 at 64 and 128 columns has told you nothing about 256.
 
+## C50: `TCOLEXPAND*` NARROWS `validRow` TO `uint8_t` -- BUT ONLY ON THE STATIC-`ValidCol` PATH
+
+`ColExpandBinInstr` takes `uint8_t repeats`, and `TColExpandBinaryNormMode`
+(`pto/npu/a2a3/TColExpandBinOp.hpp:33`) passes `unsigned validRow` straight into it. No clamp,
+no assert -- `TCOLEXPANDOP_IMPL`'s two `static_assert`s cover dtype and row-major only. So on
+that path the op computes `validRow % 256` rows and silently leaves the rest untouched.
+
+**Which path you get is a COMPILE-TIME property of the tile declaration.**
+`ColExpandBinaryInstr` dispatches on `TileData::Cols == TileData::ValidCol || TileData::Rows == 1`:
+
+| tile | dispatch | behaviour |
+|---|---|---|
+| `Tile<..., R, C, RowMajor, -1, -1>` (dynamic ValidCol) | `TColExpandBinaryCountMode` -- a per-row `for` loop | **correct at any R** |
+| `Tile<..., R, C, RowMajor, -1, C>` (static `ValidCol == Cols`) | `TColExpandBinaryNormMode` -- one call, `validRow` as `uint8_t` | **`validRow % 256` rows** |
+
+Measured, `TCOLEXPANDDIV`, fp32, 64 columns, sentinel-filled dst, counting rows actually
+written (`reports/probe_colexpand_uint8/` in `skillyard-runs-v101/cross_entropy_loss`):
+
+| rows | dynamic ValidCol | static ValidCol |
+|---|---|---|
+| 128 | 128 | 128 |
+| 255 | 255 | 255 |
+| **256** | **256** | **0** |
+| **300** | **300** | **44** |
+
+At 256 rows the static-`ValidCol` form computes **nothing at all** and reports success.
+
+**Note `ValidRow` must stay `-1` regardless** -- `SetValidRow` carries
+`static_assert(ValidRow == DYNAMIC, "Only Dynamic Valid Row Support Set Value.")`.
+
+**Rule:** keep row-expand tiles on the `-1, -1` form this skill already prescribes and the
+bug cannot reach you. If you pin `ValidCol` statically to get NormMode's single-call issue
+(it is cheaper), then **chunk the rows to <= 255 per call** and `static_assert` the chunk
+height. This was reported to me as an unconditional ">255 rows computes nothing"; probing it
+showed the default tile form is immune, and that distinction is the whole rule -- a kernel
+that uses both tile forms will see the bug on one and not the other.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
