@@ -2287,6 +2287,52 @@ amendment, the safe default for any producer/consumer pair sharing a buffer -- s
 not -- is an explicit barrier, and the optimisation is removing the ones you can prove
 unnecessary, not adding the ones you find you need.
 
+## C49: THE ROW-REDUCE `tmp` TILE MUST BE `validCol/2` WIDE, NOT 64 -- AND NOTHING CHECKS IT
+
+`TROWSUM` / `TROWMAX` / `TROWARGMAX` take a scratch tile. Its required width is **a function
+of `validCol`**, and an undersized one produces a **silently wrong reduction** -- no compile
+error, no runtime error, no assert.
+
+`pto/npu/a2a3/TRowSum.hpp::FillTmp` writes `tmp + i * ElemPerRpt` for
+`i` in `[0, srcRptPerRow / 2)`, where `srcRptPerRow = ceil(validCol / ElemPerRpt)` and
+`ElemPerRpt` is 64 for fp32. So per row:
+
+```
+tmp_cols_needed = max(ElemPerRpt, (ceil(validCol / ElemPerRpt) / 2) * ElemPerRpt)
+```
+
+`TRowReduceCheck` has five `static_assert`s -- Loc, row-major, dst layout, dtype, dtype
+consistency. **None of them mentions `TileDataTmp::Cols`.** `tmpRptStride` is computed from
+`TileDataTmp::Cols`, so a narrow tmp just walks into the next row's scratch.
+
+Measured directly (fp32, 16 rows, `reports/probe_rowsum_tmpwidth/` in
+`skillyard-runs-v101/moe_gating_top_k_softmax`), max relative error vs a CPU float64 row sum:
+
+| validCol | tmp cols | needed | max rel err | |
+|---|---|---|---|---|
+| 64 | 64 | 64 | 9.6e-08 | ok |
+| 128 | 64 | 64 | 9.2e-08 | ok |
+| 256 | **64** | 128 | **6.9e-02** | WRONG |
+| 256 | 128 | 128 | 1.2e-07 | ok |
+| 512 | **64** | 256 | **1.09e+00** | WRONG |
+| 512 | **128** | 256 | **2.8e-01** | WRONG |
+| 512 | 256 | 256 | 5.2e-08 | ok |
+
+The formula predicts every row. Note the error is **not** a clean factor -- it depends on what
+the overrun lands on -- so it does not look like a scaling bug and will not be recognised as
+one.
+
+**Why `validCol = 128` is the trap.** At 128 columns the requirement is exactly 64, so the
+"obvious" 64-wide tmp is correct, and a kernel validated only at small widths passes. The
+first wider case then fails and reads as an *accuracy* problem in the surrounding math. In the
+`moe_gating_top_k_softmax` run this took out 5 of 20 cases (every `E >= 256`) and was chased
+as a softmax precision issue.
+
+**Rule:** size the row-reduce scratch from `validCol` with the formula above and
+`static_assert` it against the tile's `Cols`. If `validCol` is dynamic, size the tile for the
+contract's **largest** `validCol`, not the one you are testing. A row reduction that is right
+at 64 and 128 columns has told you nothing about 256.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
