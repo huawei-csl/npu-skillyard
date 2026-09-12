@@ -2079,6 +2079,42 @@ reduced over **one chunk instead of all of them** -- 245 of 1024 rows wrong on o
 *which* chunk survived varied run to run. Nothing faults; the number is just wrong and
 non-deterministic.
 
+**AMENDMENT -- the prescribed remedy is not always sufficient.** A third run
+(`dynamic_quant`) reports that at a **task seam**, where a Vec READ of a UB buffer must be
+ordered against a later MTE2 WRITE to it, the textbook `set_flag/wait_flag(PIPE_V, PIPE_MTE2)`
+**did not hold**:
+
+| guard at the seam | first-launch corruption |
+|---|---|
+| `set_flag/wait_flag(PIPE_V, PIPE_MTE2, id)` | **6 of 6 fresh processes** |
+| + entry-time normalisation of every event id the kernel holds | 4 of 8 |
+| `set_flag/wait_flag(PIPE_MTE3, PIPE_MTE2, id)` chained behind the store's `V->MTE3` | **0 of 18** |
+| `pipe_barrier(PIPE_ALL)` | **0 of 18** |
+
+Read this carefully, because it is narrower than "the flag does not work":
+
+* The **same kernel uses `V -> MTE2` flags successfully elsewhere** -- the failure is specific
+  to the read-then-overwrite at the seam, not to the pipe pair.
+* The **`MTE3 -> MTE2` row is a positive control**: cross-pipe flags *are* honoured, so this is
+  not a blanket flag failure.
+* The **entry-normalisation row is a falsification**: it rules out the obvious "stale event
+  register" explanation.
+* The bug is **invisible to a contract sweep, invisible to same-process determinism, and
+  showed on only 1 run in 3 to 1 in 20** -- it took the C44 out-of-contract probe plus a
+  **fresh-process** soak to find. A determinism check that does not start a new process will
+  not see it.
+
+**Status: reported by that run, not independently reproduced here** (the racy variant was
+removed rather than kept behind a knob, so it could not be cheaply rebuilt). What *was*
+verified in the parent session: the shipped kernel rebuilds byte-identically and shows
+**0 of 12 fresh-process corruptions** on the exact geometry that flagged the bug.
+
+**Practical rule until someone reproduces the racy arm:** at a task seam where a Vec read is
+followed by an MTE2 overwrite of the same buffer, do not rely on `V -> MTE2` alone. Use
+`pipe_barrier(PIPE_ALL)`, or chain `MTE3 -> MTE2` behind the store's `V -> MTE3`. The measured
+cost of the drain on that op was ~6% (1.335 racy vs 1.255 safe) -- cheap for the class of bug
+it removes. And **soak in fresh processes**, not just repeated launches.
+
 **Second independent instance** (`grouped_matmul_swiglu_quant`, a different kernel and a
 different pipe pair): a `y_scale` **MTE3 store** read a tile that the next group's **MTE2 load**
 clobbered. Case 15 returned another unit's `x_scale` as `y_scale` on **224 of 1009 rows**,
