@@ -1042,35 +1042,52 @@ different operations at two different places**:
 | `eval/perf_eval.py::_profile` -- **INSIDE** the window, per step | `_clear_cache()`: 201 MB ReduceMax **only** | `if freq_boost and i >= warmup` (warmup steps skipped) |
 
 A 10240^2 fp16 matmul inside a Level1 profiler window, immediately ahead of a ~7 us kernel, is
-not a neutral preamble. Fixing only the placement -- same kernel `.so`, same cases, same
-device, same seeds, nothing else touched -- on `level2/dynamic_quant`:
+not a neutral preamble. Fix the placement.
 
-| case | W | old (boost in-window) | fixed (flush in-window) | official harness | old/official |
-|---|---|---|---|---|---|
-| 14 | 67 | 368.98 | **191.26** | 200.79 | **1.84x** |
-| 13 | 251 | 12.90 | 8.46 | 8.83 | 1.46x |
-| 8 | 1021 | 9.82 | 6.80 | 7.07 | 1.39x |
-| 7 | 1023 | 9.42 | 6.52 | 6.82 | 1.38x |
-| 10 | 373 | 274.84 | 235.54 | 233.24 | 1.18x |
-| 6 | 16384 | 241.98 | 243.36 | 242.21 | 1.00x |
+**How much is it worth? Run the control.** Same kernel `.so`, same device, same session,
+two protocols alternated, 2 replicates each (`level2/dynamic_quant`, 20 cases):
 
-The error is **not uniform** -- it is largest on narrow-W, many-row cases (case 14 is 162,877
-rows of 67) and vanishes on the wide sustained ones. So it does not cancel in a ratio and it
-does not cancel in a score: it **reshapes which cases look like your weak ones**. Cases 10 and
-14 had been written down as anomalies to investigate; they were the instrument.
+| | geomean | max |
+|---|---|---|
+| legacy (boost in-window, every active rep) / fixed | **1.068x** | 1.204x |
 
-Three rules fall out:
+Real, systematic, worth removing -- and **an order of magnitude smaller than what I first
+claimed for it.**
 
-1. **Replicate a protocol from the harness source, at the commit you are being scored
-   against.** A design doc describes an intent; `git log` describes what ran.
-2. **Nothing that runs inside the profiler window may be larger than the thing being
-   measured.** Ballast belongs outside the window; only the per-rep state reset belongs
-   inside, and it should be the smallest operation that achieves the reset.
-3. **When your own number disagrees with the scorer's, suspect your instrument before your
-   kernel.** We scored 84.33 where the official harness scored 85.78 on the same binary, and
-   spent the gap looking for a kernel-side cause. Formula, weights, baselines and accuracy all
-   agreed; the entire residual was the protocol. The tell was available without the official
-   run at all: our max run-to-run spread was 81.4% against the official harness's 16.5%.
+### 3.14b THE CONTROL IS NOT OPTIONAL WHEN YOU ARE THE ONE WHO FOUND THE BUG
+
+I found the placement defect, fixed it, re-measured, and wrote 1.84x into a skill, a store
+and three commit messages -- while writing the section above, which says to suspect the
+instrument. What I actually had was a before/after across two different measurement
+sessions, which is not a control. Twelve minutes of alternating the two protocols on one
+device in one session gave the real decomposition:
+
+| `level2/dynamic_quant` case 14 (162877 rows x 67) | us |
+|---|---|
+| old stored number | 368.98 |
+| legacy protocol, re-run today | 203.75 |
+| fixed protocol, re-run today | 192.24 |
+| the official scoring harness | 200.64 |
+
+The protocol is worth 1.06x on that case. The other 1.81x is an unexplained condition of the
+original session and **is not reproducible under either protocol.** Across all 20 cases the
+old numbers sit 1.116x geomean above even the legacy arm.
+
+Three things to take from it:
+
+1. **A before/after across sessions is not a control; alternating arms within one session
+   is.** If the treatment is a change to your instrument, the untreated arm must be
+   re-measured now, not read out of a file.
+2. **When a fix "explains" more than it should, that is the signal, not the reward.** Eight
+   other ops re-measured under the same fix moved 0.963-1.009x on their case sums. One op
+   moving 1.19x while eight move 1.00x was visible before I wrote the claim down, and I read
+   it as "the fix mattered most where cases are small" instead of "my attribution is wrong."
+3. **An unexplained residual is a finding, not noise to absorb into the nearest story.** The
+   1.116x that is left over is now the open question, and it applies to every number measured
+   in that earlier session -- which is the actual reason re-measuring everything was worth it.
+
+Do not delete the fix because its effect shrank. 1.068x systematic is still a systematic
+error against a scorer whose whole metric is a time ratio. Just do not sell it as 1.84x.
 
 ## 3.15 DO NOT INTERLEAVE TWO KERNELS IN ONE SESSION TO A/B THEM
 
