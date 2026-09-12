@@ -1143,3 +1143,36 @@ tasks against a mean of 5.8 and cost **19%**, with no pipe ratio moving. The rul
 Diagnose this by computing tasks-per-core from the index arithmetic and comparing the maximum
 against the mean, *before* reaching for a profile. A pipe profile cannot see it.
 
+## 3.22 THREE STANDING PRIORS, CORRECTED BY A DATA-MOVEMENT KERNEL
+
+Every rule below had been asserted confidently in this skill and in run briefs. A single
+`LayoutTransform` op (`moe_re_routing` -- gather/scatter, no arithmetic) falsified all three.
+They are corrected here, and the pattern is 3.18 turned on our own instructions.
+
+**1. "Pipeline depth is closed" -- scope it to arithmetic kernels.** Depth had been falsified
+**six** times and was being briefed as settled. On a data-movement kernel it is **monotone**:
+
+| buffers | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|
+| speedup | 1.384 | 1.403 | 1.458 | 1.508 | **1.541** |
+
+The six falsifications were all kernels where a slot costs **tile width**, and tile width was
+what generated the throughput. Here the hidden resource is **GM read latency**, which more
+slots genuinely cover. **Say "depth is closed for arithmetic kernels where slots cost tile
+width", never "depth is closed".**
+
+**2. "The launch floor is ~4 us" -- that was HOST ENQUEUE, not the device.** Measured on the
+device: **1.14 us at block_dim 48, 0.74 us at block_dim 8.** The 4 us figure came from an
+`npu.Event` loop where host enqueue and device time agreed -- i.e. it measured the harness.
+Quote the two separately, and note the device floor **falls with block_dim**.
+
+**3. "block_dim does not matter" -- it was the biggest single win here (+14%).** The prior came
+from two ops where a sweep moved nothing. On this one, choosing `block_dim` from payload size
+was the campaign's largest gain and **48 was optimal on 0 of 20 cases**. A block_dim sweep is
+cheap; run it per archetype rather than inheriting a verdict.
+
+The meta-lesson is the one worth carrying: **a prior that has survived several falsification
+attempts is still scoped to the archetype it was tested on.** Before briefing a rule as closed,
+name the archetype it was closed on -- and prefer sending an exploratory op at a *different*
+archetype precisely because it is where standing rules break.
+

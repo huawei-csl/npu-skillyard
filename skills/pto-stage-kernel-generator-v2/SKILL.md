@@ -2266,6 +2266,27 @@ if (rtGetL2CacheOffset(d, &off) != 0 || off == 0) return -4;   // fail loudly
 measures as *exactly* neutral, check that it is wired before concluding it does not work --
 this is the v0.97 unwired-lever rule with a specific, recurring instance.
 
+## C48: A BACK-TO-BACK RAW ON THE SAME PIPE IS NOT COVERED BY PROGRAM ORDER
+
+Two vector instructions where the second reads what the first wrote, issued back to back on
+`PIPE_V`, can execute **out of order**. Measured on a ramp built by doubling
+(`ramp[len..2len) = ramp[0..len) + len`): **two runs of the same `.so` corrupted different
+32-byte blocks.** One `pipe_barrier(PIPE_V)` between them fixes it -- 6/6 clean.
+
+This is distinct from C41, which is about *cross-pipe* WAR. Here both instructions are on the
+**same** pipe and program order still does not guarantee the read sees the write.
+
+**Why it is easy to ship:** it was invisible below ~22-row runs, so **19 of 20 contract cases
+passed** while one failed on exactly 256 of 2048 index entries -- and non-deterministically, so
+a single re-run could clear it.
+
+**Rule:** when one vector op consumes another's output *in place or into an overlapping range*,
+put a `pipe_barrier(PIPE_V)` between them unless you have measured that you can omit it. The
+in-order intuition for a single pipe is not reliable on this part. Combined with C41's
+amendment, the safe default for any producer/consumer pair sharing a buffer -- same pipe or
+not -- is an explicit barrier, and the optimisation is removing the ones you can prove
+unnecessary, not adding the ones you find you need.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
