@@ -2121,6 +2121,56 @@ Two more from the same run, same status -- reported by it, worth confirming when
   src-shaped is sufficient but not necessary. `TROWMAX` takes the scratch as a required third
   argument -- `TROWMAX(dst, src, tmp)`; the 2-argument form does not exist.
 
+## C43: `TQUANT<INT8_SYM>` ALIASES ITS STAGING TILE ONTO THE SOURCE -- WRONG ON A TAIL
+
+`TQUANT_IMPL` in `pto/npu/a2a3/TQuant.hpp` does this (two call sites, lines ~97 and ~153):
+
+```cpp
+TASSIGN_IMPL(src_f16, reinterpret_cast<uintptr_t>(src.data()));   // fp16 staging
+TASSIGN_IMPL(src_s32, reinterpret_cast<uintptr_t>(src.data()));   // int32 staging
+```
+
+Both staging tiles are placed **on top of the fp32 source buffer**. When the fp32 -> fp16
+conversion splits into a full-repeat pass plus a **column tail**, the main pass's fp16 write
+for row `2i+1` (byte `2*(2i+1)*RowStride`) lands on **fp32 row `i`'s tail columns**
+(byte `4*i*RowStride + 4*mainCols`) *before the tail pass reads them*.
+
+**Fingerprint, measured:** the first row of every work unit comes back saturated
+(`|y - golden| = 255`) in exactly the last `w mod 64` columns of each chunk, while the
+per-token `scale` -- computed from the same fp32 data **before** the conversion -- stays exact
+to 1e-7. **One output garbage in a periodic column band, another from the same data perfect.**
+
+**Rule:** do not use `TQUANT<QuantType::INT8_SYM>` on A2/A3 for a tile whose valid width is
+neither a multiple of the 64-element fp32 repeat nor `<= 64`, unless you control the geometry.
+Give the conversion its own staging tile instead of letting the library alias the source; on the
+op where this was found that cost **zero extra UB** and measured 1.014x.
+
+**Why this rule exists at all** is the part worth internalising: the defect had been in every
+build of that kernel for 24 attempts, and **the 20-case contract sweep structurally could not
+sample it** -- every benchmark `H` is a multiple of 64, `<= 64`, or leaves a 1-column tail. An
+out-of-contract shape probe failed **8 of 11** shapes on the first run. See C44.
+
+## C44: RUN AN OUT-OF-CONTRACT SHAPE PROBE -- THE SWEEP CANNOT FIND THIS CLASS
+
+A contract sweep validates the shapes the benchmark happens to sample. For a kernel declared
+dynamic-shape that is not the same as validating the kernel, and this project has now hit the
+gap **three times**, each time silently:
+
+| op | window the sweep missed | symptom |
+|---|---|---|
+| `grouped_matmul_swiglu_quant` | `K % 128` in (64, 128] | 24.9% of `y` wrong, bit-reproducible |
+| `dequant_swiglu_quant` | valid width not a multiple of 64 and > 64 | last `w mod 64` columns saturated, `scale` exact |
+| (both) | -- | one output wrong, another from the same region exact |
+
+**So: after Phase 5 and after any change to a tiling, tail, or L0/staging layout, probe shapes
+the contract does NOT contain** -- each dim just above and just below every internal blocking
+constant, and at least one prime. Compare against the CPU float64 reference, not against
+another run of the same kernel.
+
+This is cheap (a handful of launches) and it is the only thing that finds this class. Record the
+probed shapes and their results next to the contract sweep, and treat a *narrower* validated
+range than the declared contract as a contract amendment, not a footnote.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
