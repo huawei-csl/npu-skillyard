@@ -2207,6 +2207,65 @@ This is cheap (a handful of launches) and it is the only thing that finds this c
 probed shapes and their results next to the contract sweep, and treat a *narrower* validated
 range than the declared contract as a contract amendment, not a footnote.
 
+## C45: THE MCP CATALOGUES INSTRUCTIONS THAT DO NOT EXIST IN THE COMPILED LIBRARY
+
+The npu-coding MCP indexes a **different** pto-isa than the one we compile against
+(`/home/endrix/git/pto-isa`, github/hw-native-sys). Instructions it lists and describes may
+have **no implementation at all** in your checkout. Verified absent so far:
+
+| instruction | MCP | pto-isa `109c9f72` |
+|---|---|---|
+| `TMADD`, `TMULA` | catalogued | no a2a3 implementation |
+| `TINTERLEAVE`, `TDEINTERLEAVE` | catalogued under Data Movement / Layout | **absent from `include/` entirely** |
+
+`TINTERLEAVE`/`TDEINTERLEAVE` matter because they are the obvious primitives for an
+interleaved RoPE rotation, and a design that assumes them has to be thrown away. (One run
+planned around them, found them missing, and had to build a permutation from an index
+`TGATHER` instead -- which then took three iterations to get fast.)
+
+**Rule: before an instruction enters a design, `grep` it in the headers you compile against.**
+The MCP is a search aid, not the API. `get_cpp_intrinsic` returning a signature proves the
+*index* has it, nothing more. This is the same source-skew already recorded for constraints
+and dtype support -- treat existence the same way.
+
+## C46: A UB-TO-UB COPY RUNS ON THE VECTOR PIPE, NOT MTE3
+
+`pto_copy_ubuf_to_ubuf` -- the primitive under `TINSERT`, `TCOLEXPAND` and `TCONCAT` -- is
+**not** an MTE3 operation. A run that guarded it with an MTE3 barrier was **silently wrong on
+8 of 20 cases**; the correct pipe is `PIPE_V`.
+
+The header does not annotate the pipe (`common/arch_cce_intrinsic.hpp` just declares the
+intrinsic), so this is a *behavioural* finding, established by measurement rather than by
+reading -- which is exactly why it is easy to get wrong: "copy" reads like data movement, and
+data movement reads like MTE.
+
+**Rule:** the pipe an instruction runs on is a property to **verify**, not to infer from its
+name or its category in the docs. When a barrier or flag around a data-movement helper does
+not behave, test the other pipe before assuming a hardware bug. Family-level guidance:
+anything that moves data **within** UB is Vector; only GM<->UB traffic is MTE2/MTE3.
+
+## C47: `rtGetL2CacheOffset` TAKES A DEVICE ID AND SILENTLY RETURNS 0 FOR DEVICE 0
+
+`rtGetL2CacheOffset(deviceId, &offset)` returns **success with `offset == 0`** when asked
+about device 0. The offset is per-device, and a hardcoded `0` is the value most callers write.
+The consequence is an **L2-bypass alias that is silently not applied** -- the kernel runs
+uncached-in-name-only and the measurement looks like "the alias does nothing".
+
+**Reported independently by two runs in the same session**, both of which had already banked
+measurements before noticing: one found three alias measurements invalid, the other found its
+first alias probe entirely invalid.
+
+```cpp
+int32_t d = 0; rtGetDevice(&d);            // ask about the device you are actually on
+uint64_t off = 0;
+if (rtGetL2CacheOffset(d, &off) != 0 || off == 0) return -4;   // fail loudly
+```
+
+**Rule:** never pass a literal device id to a per-device runtime query, and treat
+`offset == 0` as failure rather than as "no offset needed". More generally: when a lever
+measures as *exactly* neutral, check that it is wired before concluding it does not work --
+this is the v0.97 unwired-lever rule with a specific, recurring instance.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
