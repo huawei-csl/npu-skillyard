@@ -2375,12 +2375,47 @@ At 256 rows the static-`ValidCol` form computes **nothing at all** and reports s
 **Note `ValidRow` must stay `-1` regardless** -- `SetValidRow` carries
 `static_assert(ValidRow == DYNAMIC, "Only Dynamic Valid Row Support Set Value.")`.
 
-**Rule:** keep row-expand tiles on the `-1, -1` form this skill already prescribes and the
-bug cannot reach you. If you pin `ValidCol` statically to get NormMode's single-call issue
-(it is cheaper), then **chunk the rows to <= 255 per call** and `static_assert` the chunk
-height. This was reported to me as an unconditional ">255 rows computes nothing"; probing it
-showed the default tile form is immune, and that distinction is the whole rule -- a kernel
-that uses both tile forms will see the bug on one and not the other.
+### The other half: what the dynamic form COSTS, and when that matters
+
+CountMode is a C-level `for (i < validRow)` issuing **one instruction per row**; NormMode
+issues **one instruction with `validRow` hardware repeats**. A later run reported this as a
+large penalty -- switching its destinations to static `ValidCol` took `aiv_scalar` from
+**92.0 to 66.4 us, -28%**, in a kernel where scalar was co-binding.
+
+**Measured in isolation, the two paths are the same speed.** 200 back-to-back
+`TCOLEXPANDDIV` calls per launch (so the ~2 us launch floor cannot bury the difference),
+fp32, 64 columns, arms alternated (`reports/probe_colexpand_dispatch/` in
+`skillyard-runs-v102/engram_gate_fusion`):
+
+| rows | dynamic (CountMode) | static (NormMode) |
+|---|---|---|
+| 128 | 48.221 / 48.221 us | 47.781 / 47.961 us |
+| 255 | 91.102 / 91.062 us | 90.902 / 90.642 us |
+
+0.4-0.9% apart, and both scale linearly with rows. So "48 instructions instead of 1" is not
+by itself a cost: the hardware repeat and the issued instructions do the same work at the
+same rate **when the vector unit is the bottleneck**.
+
+**Reconcile the two with C52.** Instruction count is free when you are throughput-bound and
+expensive when you are issue-bound -- and C52 gives the signature of issue-bound: nonzero
+`aiv_icache_miss_rate`, a pipe-ratio sum below 1.0, scalar dominating Duration. My probe is a
+tight loop of full-width vector ops, i.e. throughput-bound, which is exactly why it shows
+nothing. The reporting kernel was scalar-co-bound, which is exactly why it showed 28%.
+
+**Rule, both halves:**
+
+* **Default to `-1, -1`.** It is correct at any row count and costs nothing measurable unless
+  you are issue-bound.
+* **Only if you have MEASURED that you are issue-bound** (C52's signature) is static
+  `ValidCol` worth reaching for -- and then you must **chunk rows to <= 255 per call** and
+  `static_assert` the chunk height, or you will silently compute `validRow % 256` rows.
+* Do not switch tile forms on the theory that fewer instructions must be faster. Two probes
+  in two days say that theory is regime-dependent, and the regime is measurable.
+
+This rule was reported to me twice, in opposite directions -- once as an unconditional
+">255 rows computes nothing" and once as an unconditional "the dynamic form costs 28%".
+Probing narrowed both. A kernel that uses both tile forms will see one hazard on one and the
+other on the other.
 
 ## C51: GUARDING THE `__global__` DECLARATION WITH `__CCE_AICORE__` DELETES THE LAUNCH, SILENTLY
 
