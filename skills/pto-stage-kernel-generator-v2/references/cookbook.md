@@ -3469,6 +3469,40 @@ that kernel together cost 2.1% -- but spend your validation effort on the varian
 `uniform(0,100)` gives mean/std of only 2.45, where the broken single-pass form scores
 1.99e-07 and **PASSES**. Only a constructed large-mean case separates them.
 
+## COOK-§6.12b -- "ALWAYS UNFUSE" BREAKS ON NON-FINITE `gamma`/`beta`: THE NaN MAP DIFFERS
+
+Both texts above decide affine fusion on *precision* alone. There is a second axis, and it
+points the other way: **which elements come out NaN**.
+
+`compare_tensors` checks NaN/Inf **positions** before it computes any error metric, so a
+NaN-map mismatch is an outright FAIL no matter how small the numeric error is.
+
+Torch computes the fused form, `y = x*scale + (beta - mean*scale)`. With
+`gamma = beta = -inf` (reachable whenever the case's `value_range` is the dtype's full range --
+cann-bench `level2/group_norm` case 15 does this), the folded bias `beta - mean*scale` is:
+
+| row | `mean` | `beta - mean*scale` | torch `y` |
+|---|---|---|---|
+| positive mean | `> 0` | `-inf - (-inf)` = **NaN** | NaN |
+| negative mean | `< 0` | `-inf - (+inf)` = `-inf` | `-inf` |
+
+The unfused form `(x - mean)*scale + beta` never forms that difference, so it produces `-inf`
+on **both** rows -- numerically defensible, and a **different NaN map from the reference**.
+cann-bench `level2/group_norm` case 15 fails on exactly this, with no error-metric complaint.
+
+**Rule: branch per channel on `isfinite(gamma) && isfinite(beta)`.**
+
+* finite affine -> **unfused** `(x - mean)*scale + beta`, for the accuracy headroom the
+  sections above establish;
+* non-finite affine -> **fused** `x*scale + (beta - mean*scale)`, to reproduce the reference's
+  NaN map.
+
+The branch is per channel, not per kernel, because a single tensor can carry both. And note
+the general lesson: when the reference is a specific expression rather than a mathematical
+function, matching its **non-finite behaviour** can require reproducing its exact association
+order, which is not always the numerically better one.
+
+
 ## COOK-§6.18 -- A "flat" TROWSUM over a wide row is SLOWER than a chunked one
 
 Replacing a chunked reduction with a single flat `TROWSUM` over the full row measured
