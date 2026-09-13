@@ -1935,6 +1935,18 @@ TRECIP(w, w);   // WRONG: silently yields 1.0
 TRECIP(o, w);   // correct; budget UB for a separate destination
 ```
 
+**MECHANISM, found later and it explains the 1.0 exactly.** `TRECIP` is **not** a `vrec`
+intrinsic. It expands to `TDIVS(dst, 1, src)`, which is `vector_dup(dst, 1.0)` + a barrier +
+`vdiv(dst, dst, src)`. When `dst` aliases `src`, **the dup overwrites the divisor with 1.0
+before the divide reads it**, so you compute `1.0 / 1.0` for every lane. That is why the wrong
+answer is exactly 1.0 rather than garbage, and it predicts the rule: *any* PTO op that
+internally seeds its destination before reading its source will fail the same way on an aliased
+destination. Check the expansion before assuming an op is a single instruction.
+
+Corollary, measured: **substituting a raw `vrec` for `TRECIP` is not a free speedup** -- it
+measured MERE 1.10e-3 and failed 10 of 26 accuracy cases. `TDIVS` is the more accurate
+expansion, and that accuracy is why it is written that way.
+
 **Failure signature:** the kernel returns its *input unchanged*, which reads as "the kernel
 never ran" or "the launch is broken" rather than "one instruction is wrong". If a vector
 chain emits its input, suspect an aliased TRECIP before you suspect the launch.
@@ -2412,6 +2424,58 @@ consequence explicit, and that omission cost two separate runs their longest deb
 **Detection:** this is invisible to any test that does not check the output actually changed.
 **Poison every output buffer before every launch** (fill with a sentinel, assert it is gone).
 A zero return code from `call_kernel` means nothing at all here.
+
+## C52: FOR A SMALL ELEMENTWISE KERNEL, PTO'S GENERIC WRAPPERS ARE THE BOTTLENECK -- CHECK `aiv_icache_miss_rate`
+
+`level1/sigmoid` was the worst op in our cann-bench campaign for weeks: score 58.40, **0 of 20
+cases beating the published baseline**, on the simplest op in the benchmark. The store said
+"scalar-bound, cause unresolved."
+
+**The cause is instruction-fetch, and the tell is a profiler column nobody was reading.**
+
+| | ours (v0.97) | vendor `aclnnSigmoid` |
+|---|---|---|
+| `aiv_scalar` share of Duration | **43-81%** | 2-5% |
+| **`aiv_icache_miss_rate`** | **6.1-10.8%** | **exactly 0.000** at every size |
+| pipe ratio sum, small cases | **0.84** (every pipe idle 16%) | 1.34 |
+
+`PTO`'s generic `TLOAD`/`TSTORE`/`TUnaryOp` wrappers emit **21,180 bytes of device `.text` for a
+seven-instruction inner loop**: ~2,400 scalar cycles per `TLOAD` and ~320 extra per vector op.
+`TLoadGm2ubNd2nd` wraps one `copy_gm_to_ubuf_align_bXX` in a **runtime triple loop over
+`gShape0/1/2`** -- for a `Shape<1,1,1,1,C>` tensor, where all three trip-count 1. Issuing the
+same MTE and vector instructions directly takes `.text` to 6,076 B and icache to **0.000%**.
+
+Measured end to end, same harness, same idle device, arms alternated in one session
+(`skillyard-runs-v102/sigmoid_rootcause`, re-verified independently by the parent):
+
+| | score | mean HAP | beats baseline | |
+|---|---|---|---|---|
+| PTO wrappers | 58.39 | 0.168 | 0/20 | |
+| raw intrinsics | **72.72** | **0.454** | **5/20** | geomean **3.04x** per case |
+
+**The gain is a function of how issue-bound the kernel is**, so scope it:
+
+* case 1 (1.05 M fp16, small): 23.90 -> 5.98 us, **4.00x**
+* case 5 (67.1 M fp32, bandwidth-bound): 414.16 -> 343.44 us, **1.21x**
+
+An ablation confirms the arithmetic was never the problem: with the sigmoid body replaced by a
+pure copy the kernel still ran **356.68 us against the vendor's complete sigmoid at 337.90** --
+**zeroing the transcendental entirely left us slower than the vendor.** `TEXP` + `TRECIP`
+together are 7.2% of the time; the whole arithmetic chain is 11.6%.
+
+**Rules:**
+
+1. **Add `aiv_icache_miss_rate` to every `PipeUtilization` read.** A nonzero value on a small
+   kernel means the inner loop does not fit, and no amount of pipe rebalancing will fix it.
+   A pipe-ratio sum **below 1.0** says the same thing from the other side: nothing is
+   overlapping because the core is starved of instructions, not of work.
+2. **For an elementwise kernel whose inner loop is a handful of instructions, do not pay for
+   the generic tile wrappers.** Issue the MTE and vector intrinsics directly. The wrappers earn
+   their size on shaped, strided, multi-dimensional traffic; on a flat 1-D surface they are
+   pure overhead.
+3. **Suspect this whenever fixed cost dominates.** The intercept of the size sweep was **17.08
+   us against the vendor's 2.03 us (8.4x)** while the slope was only 3.1x off -- fixed cost,
+   not throughput, and that ratio is the signature.
 
 ## Generator Workflow
 
