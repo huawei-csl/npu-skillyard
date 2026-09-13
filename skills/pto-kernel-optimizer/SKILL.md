@@ -1089,6 +1089,66 @@ Three things to take from it:
 Do not delete the fix because its effect shrank. 1.068x systematic is still a systematic
 error against a scorer whose whole metric is a time ratio. Just do not sell it as 1.84x.
 
+### 3.14c A REWRITE THAT WINS BIG IS NOT A RULE UNTIL THE MINIMAL CASE REPRODUCES IT
+
+Two runs in one batch reported the same causal claim: **"a `constexpr` array indexed by a
+runtime value inside an `[aicore]` function is expensive."** The evidence was large and came
+from real kernels:
+
+* `quant_matmul` case 19: `constexpr int32_t kAL1[4]; TASSIGN(al1, kAL1[buf])` rewritten as
+  `#define kAL1(I) ((I)*MTv*kKT1)` -- **1157 us -> 372 us, 3.1x**, "nothing else changed".
+* `adaptive_avg_pool_3d` case 12: a runtime-indexed slot array **9.7 -> 13.5 us, 1.39x**.
+
+Both reported that it does not show as a scalar bottleneck in the profiler. That is a striking,
+actionable, cookbook-shaped claim. **It does not reproduce in the minimal case.**
+
+Probe (`reports/probe_constexpr_index_NEGATIVE/` in `skillyard-runs-v102/quant_matmul`): one
+source, one `-D` flip, identical work on identical addresses, arms measured alone and
+alternated twice, boost outside the window and L2 flush per active step:
+
+| variant | run 1 | run 2 |
+|---|---|---|
+| computed address, Vec loop | 26.90 us | 26.94 us |
+| **constexpr table, runtime index**, Vec loop | 26.84 us | 26.88 us |
+| computed address, address feeds MTE2 `TLOAD` | 99.64 us | 96.72 us |
+| **constexpr table, runtime index**, feeds MTE2 | 100.50 us | 99.08 us |
+
+No effect, in either direction, in either setting. The table was also **permuted** so the
+compiler could not strength-reduce `kAddr[i]` back into `affine(i)` -- the obvious way to make
+the probe vacuous, and it was checked.
+
+**So the rule is NOT "avoid runtime-indexed constexpr arrays."** What those two runs measured
+was a real speedup from a specific rewrite inside a specific pipelined structure (a K-loop with
+L1 tiles, double buffering and Cube in one case). The speedup is not in doubt; the **attributed
+cause** is, and the cause is what would have gone into the cookbook and shaped every future
+kernel.
+
+**Rule: before a "this construct is slow" claim becomes a rule, reproduce it in a minimal case
+that isolates the construct.** If the minimal case is silent, what you found is a property of
+your structure, not of the construct -- keep the win, describe it as "this rewrite helped in
+this structure", and say what you could not isolate. A rule that names the wrong cause is worse
+than no rule: it will be applied everywhere and will not help anywhere.
+
+This is 3.14b's failure mode arriving from a different direction -- there I over-attributed my
+own fix, here two agents over-attributed theirs. Four causal attributions were checked in this
+batch: one held exactly (C49), one held only on one dispatch path (C50), one does not reproduce
+at all (this), and one was **falsified by the reporting agent itself before it reached me** --
+`a2a3/TStore.hpp:42`'s `ubGap = ((Cols-validCol)*sizeof(T))>>5` reads exactly like a C49-style
+silent truncation, and 8 rows x 8 `validCol` values measured 0 wrong rows, max error 0. That is
+the standard.
+
+**A better candidate cause, stated as a hypothesis and not a rule.** A third run in the same
+batch measured, in a scalar accumulate loop, that **two UB banks the compiler cannot prove
+disjoint serialise completely**: `for (e) dst[e] += src[e]` cost ~36 AIV cycles/element, and
+the same loop unrolled 8-way **with all loads hoisted above all stores** cost 2.60x less
+(2669.7 -> 1028.3 us, against a 0.4% band); the same rewrite took an id-bucketing loop from
+~30 to ~5 cycles/id. Note what the "constexpr table" rewrite also did: it removed **a scalar
+load from a dependency chain in front of every `TASSIGN`**. Serialisation on scalar
+loads/stores the compiler cannot disambiguate would explain both observations, and unlike
+"constexpr arrays are slow" it is a mechanism with a testable prediction: the penalty should
+track whether the loads can be hoisted, not whether the source is a table. **Nobody has tested
+that yet.** Do not write it down as a rule until someone does.
+
 ## 3.15 DO NOT INTERLEAVE TWO KERNELS IN ONE SESSION TO A/B THEM
 
 Alternating two different kernels inside a single profiler session looks like the strongest
