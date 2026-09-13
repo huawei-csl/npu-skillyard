@@ -2370,6 +2370,49 @@ height. This was reported to me as an unconditional ">255 rows computes nothing"
 showed the default tile form is immune, and that distinction is the whole rule -- a kernel
 that uses both tile forms will see the bug on one and not the other.
 
+## C51: GUARDING THE `__global__` DECLARATION WITH `__CCE_AICORE__` DELETES THE LAUNCH, SILENTLY
+
+`bisheng -xcce` runs **two passes**: a device pass with `__CCE_AICORE__` defined and a **host
+pass with it undefined**. The `<<<...>>>` launch is lowered in the HOST pass. So if the
+`__global__` entry point's **declaration** sits inside `#if defined(__CCE_AICORE__)`, the host
+pass sees no declaration, the launch statement compiles to nothing, and you get:
+
+* a clean compile, no warning;
+* a `.so` that loads;
+* `call_kernel` returning **0**;
+* the output buffer **completely untouched**.
+
+Reproduced minimally -- one source, one `-D` flip, `reports/probe_launch_guard/` in
+`skillyard-runs-v102/adaptive_avg_pool_3d`:
+
+| build | rc | elements written | |
+|---|---|---|---|
+| declaration unguarded, body guarded | 0 | **256 / 256** | launch ran |
+| declaration inside `#if defined(__CCE_AICORE__)` | 0 | **0 / 256** | **silently dropped** |
+
+**Rule:** the `__global__` entry point's *signature* and the `<<<>>>` call site are **host-visible
+code and must never be inside a `__CCE_AICORE__` guard**. Guard the **body**:
+
+```cpp
+extern "C" __global__ AICORE void launch_stage(__gm__ uint8_t* out, ...) {
+#if defined(__DAV_C220_VEC__)          // guard the BODY
+  ...
+#endif
+}
+
+extern "C" void call_kernel(uint32_t block_dim, void* stream, uint8_t* out, ...) {
+  launch_stage<<<block_dim, nullptr, stream>>>(out, ...);   // NEVER guarded
+}
+```
+
+`BUILD-§` already puts the guard inside the body; `COOK-§1`'s skeleton does not make the
+consequence explicit, and that omission cost two separate runs their longest debug of the week
+-- both found it independently, both by output poisoning.
+
+**Detection:** this is invisible to any test that does not check the output actually changed.
+**Poison every output buffer before every launch** (fill with a sentinel, assert it is gone).
+A zero return code from `call_kernel` means nothing at all here.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:

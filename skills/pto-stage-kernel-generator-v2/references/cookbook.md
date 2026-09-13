@@ -2673,10 +2673,36 @@ is misleading here (see the "why not one TROWSUM" note).
 - `TROWSUM(dst, src, tmp)` reduces each row over its COLUMNS -> one **per-row scalar**
   (narrow output). This is the right shape for a matvec: output `y[i]` is one value per
   output row.
-- `TCOLSUM(dst, src)` reduces each column over its ROWS -> a `[1, W]` per-column row. It
-  masks `set_vector_mask(0, W)` and issues a single `vadd` (`rptTimes = 0`), so its
-  OUTPUT width truncates to the first **64 fp32 lanes**: for `W > 64` the tail is
-  silently wrong. This is the trap behind "only the first 64 outputs are correct."
+- `TCOLSUM(dst, src)` reduces each column over its ROWS -> a `[1, W]` per-column row.
+
+> **THE 64-LANE TRUNCATION CLAIM ABOVE IS FALSE -- MEASURED.** This text said TCOLSUM's
+> "OUTPUT width truncates to the first 64 fp32 lanes: for `W > 64` the tail is silently
+> wrong." It does not. Probed directly on dav-c220 / CANN 9.1.0, fp32, 32 rows, against a
+> CPU float64 column sum, with the output buffer sentinel-filled first
+> (`reports/probe_tcolsum_width/` in `skillyard-runs-v102/adaptive_avg_pool_3d`):
+>
+> | tile width | max rel err, lanes 0-63 | max rel err, lanes 64+ |
+> |---|---|---|
+> | 64 | 2.12e-07 | -- |
+> | 128 | 2.12e-07 | **2.01e-07** |
+> | 256 | 1.88e-07 | **2.06e-07** |
+> | 512 | 2.62e-07 | **2.29e-07** |
+>
+> Every lane is correct at every width tested. **Use `TCOLSUM` at full width without the
+> manual 64-lane fold.** Direction (A) -- pick `TROWSUM` vs `TCOLSUM` by which axis you are
+> reducing and which output shape you want -- still stands; only the truncation claim is
+> withdrawn.
+>
+> **What is NOT established: ragged `validCol`.** All the widths above have
+> `validCol == Cols`. A first attempt to test `validCol < Cols` read as "TCOLSUM is wrong
+> when ragged", but the control refuted the probe, not the instruction: a plain
+> `TLOAD -> TSTORE` round trip with the same ragged `validCol` **also** failed to match,
+> against BOTH a `Cols`-strided reference and a `validCol`-packed one, with exactly
+> `Rows * (Cols - validCol)` elements left untouched. So the GM<->UB layout under a ragged
+> `validCol` is not either of the two obvious candidates, and any ragged measurement taken
+> against a guessed layout carries no information. **Establish the layout with a
+> load/store round trip before drawing a conclusion from a ragged reduction.** This is the
+> second time today a reduction probe's reference, not the instruction, was the defect.
 
 > **PREMISE (B) BELOW IS FALSE -- see C15.** `TROWSUM` does NOT truncate at 64 lanes;
 > it is exact at 128-wide when its scratch is sized to the SOURCE (`tmp = src/2` exact,
