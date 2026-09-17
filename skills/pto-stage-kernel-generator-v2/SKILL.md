@@ -2578,6 +2578,123 @@ do not register keep the default.
 3. **Verify the engine on device, not from the build log.** The profiler reports `Accelerator
    Core` per kernel (`AI_CORE` vs `MIX_AIC`); check it says what you intended.
 
+## C54: THE HARDWARE AIV-ONLY `SYNCALL` HANGS IN A PLAIN VEC-ONLY LAUNCH -- USE A SOFTWARE BARRIER
+
+Any kernel that reduces ACROSS cores in ONE launch -- a norm, a sum, a max, anything whose
+output is smaller than one lane's share -- needs a cross-core barrier between "publish my
+partial" and "combine everybody's". `pto/npu/a2a3/SyncAll.hpp` offers one:
+
+```cpp
+pipe_barrier(PIPE_ALL);
+ffts_cross_core_sync(PIPE_MTE3, getFFTSMsg(0x0, SYNC_AIV_ONLY_ALL));  // == 3585
+wait_flag_dev(SYNC_AIV_ONLY_ALL);                                     // == 14
+```
+
+**It deadlocks the vector core** when the kernel is launched as
+`<<<blockdim, nullptr, stream>>>` and built `--cce-aicore-arch=dav-c220-vec` -- at **every**
+block_dim including **1**, and with `set_ffts_base_addr(rtGetC2cCtrlAddr(...))` already done at
+entry. It presumably needs an FFTS+ task context that only a MIX/FFTS dispatch establishes;
+pointing the core at the C2C control area by hand is not enough.
+
+Measured (`skillyard-runs-v104/foreach_norm/src/probes/probe_sync.cpp`, dav-c220-vec,
+CANN 9.1.0). Each lane writes `lane+1` to a GM slot, barriers, lane 0 sums the slots;
+correct answer `bn*(bn+1)/2`. Mode 0 is the sensitivity control and must be wrong:
+
+| mode | bd 1 | bd 8 | bd 24 | bd 48 |
+|---|---|---|---|---|
+| 0 -- no barrier (control) | 1 / 1 | 10 / 36 | 293 / 300 | 29 / 1176 |
+| 1 -- `ffts_cross_core_sync` + `wait_flag_dev` | **hang** | **hang** | **hang** | **hang** |
+| 2 -- software GM barrier | 1 / 1 | 36 / 36 | 300 / 300 | **1176 / 1176** |
+
+**The software barrier that works, and the three things that make it cheap.** It started at
+**6.6-7.6 us** -- half the duration of every case under 2 MiB -- and six measured variants took
+it to **~2.8 us**:
+
+1. **The generation comes from the HOST, not from the slot.** A read-modify-write
+   (`cur = slot + 1`, then wait for all slots `>= cur`) costs a full GM read round trip before
+   the poll can start, AND it deadlocks the moment two launches share one workspace at
+   different `block_dim` -- a lane that sat out the previous launch is permanently one
+   generation behind. Pass a monotone `int32 gen` as a kernel argument and just WRITE it.
+2. **Slots 4 B apart, not 32 B.** The poll then reads 192 B / 3 cache lines at block_dim 48
+   instead of 1536 B / 48. Store with `copy_ubuf_to_gm_align_b32` (the non-align form's minimum
+   burst is one 32 B block and would clobber seven neighbours). **But only if step 3 is also
+   done**: with ALL 48 lanes polling those 3 lines the contention makes it **1.8x WORSE**
+   (24.0 us against 13.7 us) than the 48-separate-lines layout.
+3. **Only the lanes that CONSUME the partials poll.** Everyone else publishes and leaves;
+   nothing waits on them.
+
+Dropping `dcci` from the poll measured inside the null band -- keep it. Dropping
+`pipe_barrier(PIPE_ALL)` from inside the poll loop is worth ~0.7 us. **Dedicating lanes to the
+combine** so they are already polling when the last producer arrives measured **2.7%-8.9%
+WORSE** on 8 of 9 cases: the residual is the poll's GM round trip, not the arrival skew, and
+the lost compute width costs more than it saves.
+
+**Do it in ONE launch anyway.** A second kernel for the combine is correct and simple, and it
+costs another ~4.5 us launch floor -- on `level1/foreach_norm` four of the twenty published
+baselines are under 14 us, so that is the whole margin.
+
+**And it needs the device.** A spin barrier requires all of the launch's blocks to be
+co-resident. Sharing the device with a second process **times it out** (reproduced: the same
+wheel validated 20/20 idle and timed out in the poll loop under a concurrent benchmark).
+Official evaluation gives the operator the device; a shared box does not.
+
+## C55: A DMA BURST SHORTER THAN ONE 32 B BLOCK REPLICATES, AND AN MTE STORE'S **UB** SOURCE MUST BE 32 B ALIGNED
+
+Two separate hazards on the same code path -- moving a handful of fp32 partials between UB and
+GM -- and both are silent in the way that matters: the first is a wrong number, the second is
+list-length dependent.
+
+**(A) `copy_gm_to_ubuf_align_b32` with `lenBurst < 32 B` fills the whole destination block with
+COPIES of the value.** A 4-byte load came back as **eight** copies, and the 64-lane `vcadd`
+that followed summed it eight times: the kernel read **exactly 8x its own sum** on every
+summing case while the GM it read from was bit-exact (`foreach_norm`, case 8 gave 37.084
+against a golden 22.050, and `37.084^4 / 22.050^4 = 8.000`). 8 = 32 B / 4 B. The **store** side
+is exact at the same length -- a 4-byte `copy_ubuf_to_gm_align_b32` writes 4 bytes and leaves
+the next seven words alone (verified by dumping the destination) -- so it is the **load** that
+broadens.
+
+*Rule:* size any GM<->UB partial array in whole 32 B blocks -- give it a FIXED stride that does
+not depend on the lane count -- and mask the reduction to the live lanes with COUNT mode
+instead of shortening the burst. This is invisible at block_dim 8 and above, because
+`nlanes * 4` is then a whole number of blocks; it appears at block_dim 1-7, which is exactly
+what you reach for while debugging.
+
+**(B) The UB address an MTE store reads FROM must be 32 B aligned.** The GM destination may be
+4-byte aligned; the UB source may not.
+
+```cpp
+vcadd(SCR, ACC, LT, 1, 1, 8, false);                       // LT results, 4 BYTES apart
+fn_store<float>(gm + ..., SCR + t, 4u);                    // faults for every t > 0
+```
+
+`errorStr: The access address of the MTE instruction is not aligned with the data type bit
+width`, `subErrType:4`. Every single-tensor case passed and every list of two or more faulted.
+*Fix:* `vcadd(SCR, ACC, LT, 8, 1, 8, false)` -- a destination repeat stride of 8 elements, so
+each result lands on its own 32 B boundary.
+
+## C56: MASK **COUNT** MODE REMOVES THE RAGGED-TAIL PATH ENTIRELY, AND IT IS EXACT
+
+`set_mask_count(); set_vector_mask(0, n);` with every instruction issued at `repeat = 0` makes
+each op process exactly `n` elements. Probed against a CPU float64 reference at
+n = 64, 65, 100, 128, 192, 1000, 4096, 12032 (`foreach_norm/src/probes/probe_reduce.cpp`):
+`vcadd`, `vcmax`, `vabs` and `vmul` (including `dst == src0 == src1`) are **exact at every
+length**, ragged ones included, and `vcadd` writes `ceil(n/64)` contiguous partials with
+`dstRptStride = 1`. NORM mode with `repeat = ceil(n/64)` is correctly wrong on the dead lanes of
+the final repeat -- at n=65 it returned `-1.5e+38` for the second repeat where COUNT mode
+returned the exact value.
+
+So a tiled kernel needs **no tail path at all**: run every tile, full or ragged, in COUNT mode
+with the tile's own element count. That is strictly simpler than a masked `vector_dup` over the
+dead lanes and strictly safer than padding the input (there is no pad value that is the
+identity for a negative norm order -- `0^-1` is `inf`).
+
+`vabs` has **no `bfloat16_t` overload** (`error: the 1st parameter maybe need a type
+'__ubuf__ half *'`). Taking `|x|` in the input's own 16-bit width is still worth it -- one b16
+issue covers 128 elements against the fp32 form's 64 -- but do it with a **`vand` against
+`0x7fff` on a `__ubuf__ uint16_t*` view**, which is a bitwise sign clear: exact, and identical
+for float16 and bfloat16. Reinterpreting a bfloat16 buffer as `half*` to borrow the fp16
+`vabs` is NOT provably exact (fp16 denormal flush, NaN canonicalisation).
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
