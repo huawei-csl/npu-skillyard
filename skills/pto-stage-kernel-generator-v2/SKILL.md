@@ -2695,6 +2695,47 @@ issue covers 128 elements against the fp32 form's 64 -- but do it with a **`vand
 for float16 and bfloat16. Reinterpreting a bfloat16 buffer as `half*` to borrow the fp16
 `vabs` is NOT provably exact (fp16 denormal flush, NaN canonicalisation).
 
+## C57: A 2-D GM VIEW COSTS ONE MTE2 BURST **PER ROW** -- FLATTEN IT WHEN THE ROWS ARE CONTIGUOUS
+
+A `GlobalTensor` with a row stride makes `TLOAD` issue **one MTE2 burst per row**. With 48 lanes
+each issuing 48 rows that is 2304 sub-cache-line requests at once, and the cost is **linear in
+lane count**.
+
+Measured two ways that agree. A micro-probe (`reports/probe_2dview_parent/`, 64 `TLOAD`s of the
+**same 1536 contiguous bytes**, 2-D `[48,8]` view against a flat `[1,384]` view, arms alternated):
+
+| lanes | flat | 2-D | ratio |
+|---|---|---|---|
+| 1 | 9.66 us | 53.89 us | **5.58x** |
+| 16 | 46.13 | 701.59 | **15.21x** |
+| 48 | 136.30 | 2103.00 | **15.43x** |
+
+Per `TLOAD` at 48 lanes that is 2.13 us flat against **32.86 us** 2-D. Independently, bisecting a
+shipped kernel put **30.5 us** on one such `TLOAD` of a `[48,8]` fp32 tile -- 1536 bytes. The two
+numbers were obtained separately and match.
+
+**It is the 2-D-ness, not the `DYNAMIC` extent:** static extents measured 0.344 vs 0.333 us, no
+difference. And the marginal cost is flat per request, ~6.1 ns.
+
+**Rule: if a GM region's rows are contiguous, view it as `[1, rows*cols]`, not `[rows, cols]`.**
+The tile that receives it can be reshaped just as freely. This costs nothing to do and is worth
+more than most schedule changes: flattening **two call sites** in one shipped kernel was worth
+**1.231x geomean** and **+2.93 operator score points**.
+
+**Why it hides:** a 1536-byte load looks trivially cheap, so it is the last thing anyone bisects.
+It does not show up as a scalar bottleneck and it does not raise `aiv_icache_miss_rate`. Look for
+it whenever a phase costs far more than its byte count can justify.
+
+### C57a: `SYNCALL<*>` DEADLOCKS SILENTLY ABOVE `block_dim = 24`
+
+Separate finding from the same investigation, and it is a correctness hazard rather than a
+performance one. With **0** barriers, `block_dim` 25 / 32 / 48 all launch and all 75 / 96 / 144
+participants report. With **1** barrier, `block_dim` 25 and 32 **never return** -- no error, no
+diagnostic, `npu-smi` Health OK throughout.
+
+**Rule: any kernel containing a `SYNCALL<*>` must clamp `block_dim` to 24 host-side**, and should
+`static_assert` or `TORCH_CHECK` it rather than relying on a schedule that happens to stay under.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
