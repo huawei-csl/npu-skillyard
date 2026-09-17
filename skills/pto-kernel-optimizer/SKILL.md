@@ -1054,6 +1054,35 @@ two protocols alternated, 2 replicates each (`level2/dynamic_quant`, 20 cases):
 Real, systematic, worth removing -- and **an order of magnitude smaller than what I first
 claimed for it.**
 
+### 3.23 A PASSING SCORE IS NOT A CORRECTNESS PROOF -- STRESS BEYOND THE SCORED CASES
+
+`level2/maximum` shipped **20/20 through the official evaluator** while carrying two real
+correctness bugs that **no scored case can reach**:
+
+* a WAR hazard on the broadcast row buffer -- 27,021 of 3,000,021 elements wrong on a 245-chunk
+  shape;
+* in-place scratching of the shared broadcast row by the int64 path.
+
+Both were found by a purpose-written stress script sweeping shapes the 20 cases do not contain,
+and both were fixed before shipping. Neither would have been caught by any amount of re-running
+the benchmark.
+
+That is not an isolated gap. In the same campaign, **4 of 20 `conv_2d` cases and 2 of 20
+`unsorted_segment_sum` cases are degenerate** -- one has an all-NaN golden, one has a `[0,0]`
+value range, others carry 17.8x accuracy headroom -- so they pass for any kernel that propagates
+NaN or returns zeros. And a generator defect silently replaced every declared numeric range on
+TensorList inputs with uniform `(0,1]`, so **no tensor-list op was ever tested on a negative
+input**.
+
+**Rule: before calling a kernel correct, sweep shapes and dtypes the scored cases do not
+contain.** Chunk counts that force a boundary, sizes that straddle your tiling, every dtype on
+every code path, aliased and non-aliased operands. The scored cases are a *score*; they are
+chosen to exercise a range of shapes cheaply, not to find your bugs.
+
+**Corollary for the campaign's own claims:** "20/20" in a report means the benchmark's gate
+passed, and nothing stronger. Where a run has additionally stress-tested, say so; where it has
+not, the accuracy claim is exactly as strong as the case list.
+
 ### 3.14d REPLICATING A PROTOCOL MEANS ITS INPUT HANDLING TOO, NOT JUST ITS WARMUP
 
 Third protocol defect in one campaign, and the first two were about *when* things run. This one
