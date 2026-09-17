@@ -2498,6 +2498,31 @@ pure copy the kernel still ran **356.68 us against the vendor's complete sigmoid
 **zeroing the transcendental entirely left us slower than the vendor.** `TEXP` + `TRECIP`
 together are 7.2% of the time; the whole arithmetic chain is 11.6%.
 
+### C52a AMENDMENT -- IT IS A CONSTRUCTION RULE, NOT A REPAIR, AND IT DOES NOT BUY 3x TWICE
+
+`level1/gelu`, a longer transcendental chain than sigmoid, written with raw intrinsics **from line
+one** rather than converted:
+
+| | gelu (raw from the start) | sigmoid before C52 |
+|---|---|---|
+| fixed cost vs vendor | **1.2x** | 8.4x |
+| `aiv_icache_miss_rate` | **0.000 on all 20 cases** | 6.1-10.8% |
+| device `.text` per kernel | 3.7-4.7 KB | 21.2 KB |
+| pipe-ratio sum | never below 1.0 | 0.84 |
+
+So the C52 signature was **absent from the start** -- the rule bought its win at construction
+time, and there was no 3x left lying around to collect. **Do not expect C52 to be worth 3x on
+every elementwise op.** Sigmoid's 3.04x was the cost of *repairing* a kernel built on the
+wrappers; a kernel built raw simply never pays it. Where gelu and the vendor compute the **same**
+function (the 9 `tanh` cases) our slope is **1.04x theirs** -- essentially parity.
+
+Corollary worth internalising: once C52 is applied, the remaining gap is **algorithmic**, and you
+should go look for it there. gelu's residual on its other 11 cases is 33 vector cycles per repeat
+against the vendor's 19 -- and the reason turned out to be that the vendor was computing a
+different, cheaper function (see the `level1/gelu` benchmark defect). Two of its largest cases sit
+at a **DMA floor**: a load+store-only probe ran 38.44 and 41.60 us against the vendor's *complete*
+kernel at 39.22 and 37.98, so no arithmetic change could have helped them at all.
+
 **Rules:**
 
 1. **Add `aiv_icache_miss_rate` to every `PipeUtilization` read.** A nonzero value on a small
