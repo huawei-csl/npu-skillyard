@@ -2512,6 +2512,47 @@ together are 7.2% of the time; the whole arithmetic chain is 11.6%.
    us against the vendor's 2.03 us (8.4x)** while the slope was only 3.1x off -- fixed cost,
    not throughput, and that ratio is the signature.
 
+## C53: THE WRONG `--cce-aicore-arch` IS SILENT -- A MIX KERNEL BUILT `-vec` RUNS AND DOES NOTHING
+
+`--cce-aicore-arch` selects which engines exist. Build a kernel that uses Cube with
+`dav-c220-vec` and:
+
+* it **compiles** -- the Cube code is inside `#if defined(__DAV_C220_CUBE__)`, which is simply
+  false, so it vanishes;
+* it **links**;
+* it **launches**;
+* `call_kernel` returns **0**;
+* every Cube instruction is **gone**, and the output is whatever the Vec half alone produced.
+
+This is the same shape as C51 (a guarded `__global__` declaration deleting the launch): the
+guard does its job, the build is clean, and the only evidence is an output that never changed
+or changed wrongly. Here it is worse than C51, because the kernel does *some* work -- a partially
+correct output is harder to spot than an untouched one.
+
+**Where it bites in practice:** any build system with ONE tree-wide arch setting. The cann-bench
+submission trees had exactly that, hard-coded to `dav-c220-vec` because the first four ops
+packaged were vector-only; the first MIX op to go in would have been silently gutted. The fix was
+to make arch **per source** (`register_cce_kernel_arch(<src> <suffix>)`, keyed by
+`MAKE_C_IDENTIFIER` of the source path, family prefix from a variable so the tree stays
+portable), so an op declares its **engine** -- `""` = MIX, `"-vec"`, `"-cube"` -- and sources that
+do not register keep the default.
+
+**Rules:**
+
+1. **Arch is a per-kernel property, never a per-tree one.** The moment a second kernel joins a
+   build, the shared arch flag is a bug waiting for the first kernel that disagrees.
+2. **`static_assert` the engine you require**, so the mistake becomes a compile error instead of
+   a silent one:
+   ```cpp
+   #if !defined(__DAV_C220_CUBE__)
+   #error "this kernel requires Cube: build with --cce-aicore-arch=dav-c220 (MIX) or -cube"
+   #endif
+   ```
+   That one line converts the entire failure mode from "wrong numbers in production" to "build
+   stops". Put it in every kernel that names an engine.
+3. **Verify the engine on device, not from the build log.** The profiler reports `Accelerator
+   Core` per kernel (`AI_CORE` vs `MIX_AIC`); check it says what you intended.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
