@@ -1054,6 +1054,46 @@ two protocols alternated, 2 replicates each (`level2/dynamic_quant`, 20 cases):
 Real, systematic, worth removing -- and **an order of magnitude smaller than what I first
 claimed for it.**
 
+### 3.14d REPLICATING A PROTOCOL MEANS ITS INPUT HANDLING TOO, NOT JUST ITS WARMUP
+
+Third protocol defect in one campaign, and the first two were about *when* things run. This one
+is about *what the kernel reads*.
+
+`kernel_eval/config.py:100` sets `perf_rotate_inputs: bool = True`, and `eval/op_runner.py:100`
+reads it with a `True` fallback, so the default scoring path rotates the input tensors through a
+pool of `warmup + repeat` clones on every step (`eval/input_pool.py`) **specifically to defeat
+`data_ptr` caching**. Our harness re-ran every arm on one resident allocation.
+
+Same binary, rotation added: **2.0-2.7x SLOWER below ~3M elements**, neutral (0.97-1.00x) on the
+largest cases. So it inflated small cases and left big ones alone.
+
+**The confirmation is the part worth copying.** Rather than trusting the report, test the
+hypothesis against data gathered *before* it existed. If the missing rotation is the cause, the
+local-minus-official score delta must shrink as an op's cases get bigger. Across 19 officially
+scored ops:
+
+```
+correlation(log10 median case us, delta) = -0.615
+ops with median case  <20us : mean delta +1.47
+ops with median case >=20us : mean delta +0.49
+the ONE op whose harness had rotation   : -0.08
+```
+
+That last line is a natural control nobody designed: the single op measured *with* rotation is
+the single op whose two harnesses agree. A post-hoc story cannot produce that.
+
+**Rules:**
+
+1. **A measurement protocol includes how inputs are presented, not just warmup, flush and
+   timer.** Cache state across reps is part of the protocol. Read the harness for input handling
+   as carefully as for the timing loop.
+2. **Re-reading a hot buffer measures a cache, not a kernel.** If every rep reads the same
+   allocation, you are measuring the L2-resident case regardless of what the flush does -- which
+   is exactly why the effect vanishes once the working set exceeds cache.
+3. **When you find a protocol bug, predict its signature and check it against old data.** A real
+   cause explains measurements taken before you thought of it. This is 3.14b's lesson applied
+   forwards instead of backwards.
+
 ### 3.14b THE CONTROL IS NOT OPTIONAL WHEN YOU ARE THE ONE WHO FOUND THE BUG
 
 I found the placement defect, fixed it, re-measured, and wrote 1.84x into a skill, a store
