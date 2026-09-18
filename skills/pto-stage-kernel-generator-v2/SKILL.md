@@ -2763,6 +2763,33 @@ diagnostic, `npu-smi` Health OK throughout.
 **Rule: any kernel containing a `SYNCALL<*>` must clamp `block_dim` to 24 host-side**, and should
 `static_assert` or `TORCH_CHECK` it rather than relying on a schedule that happens to stay under.
 
+## C58: A PREPROCESSOR `#if` ON A C++ TEMPLATE PARAMETER IS SILENT AND WRONG -- USE `if constexpr`
+
+The preprocessor runs before templates exist. A template parameter is **not a macro**, so the
+preprocessor reads it as `0`:
+
+```cpp
+#elif MHC_COLBCAST && (MP >= BLK)     // MP and BLK are TEMPLATE PARAMETERS
+```
+
+evaluates as `0 && (0 >= 0)` -- and since `0 >= 0` is **true**, the branch fires for every
+instantiation. Inside it, `MP/BLK` then computes `0`, so a divisor was never written.
+
+**Why it is dangerous rather than merely broken:** it validated **4 of 20**, and the two cases the
+change was written to target showed a clean **1.18x speedup**. A wrong branch that is fast on the
+cases you are looking at, and NaN on the ones you are not, is the worst possible failure shape --
+cases 1-8 came back all-NaN while the change looked like a win.
+
+**Rule: never put a template parameter inside a `#if` / `#elif`. Use `if constexpr`.** If you need
+a compile-time branch on a template value, `if constexpr (MP >= BLK)` is the construct; the
+preprocessor form compiles, links, runs and is silently wrong.
+
+This is a member of the same family as C51 (a guarded `__global__` declaration deletes the launch)
+and C53 (the wrong arch flag deletes every Cube instruction): **a preprocessor condition that is
+false for a reason you did not intend, producing a clean build and wrong output.** When a
+`#if`-guarded change behaves strangely, print the macro's value with `#warning` before debugging
+the code inside it.
+
 ## Generator Workflow
 
 After completing the pre-generation checklist:
