@@ -2726,6 +2726,33 @@ more than most schedule changes: flattening **two call sites** in one shipped ke
 It does not show up as a scalar bottleneck and it does not raise `aiv_icache_miss_rate`. Look for
 it whenever a phase costs far more than its byte count can justify.
 
+**C57b: THE PAYOFF IS BOUNDED -- IT NEEDS SMALL ROWS, CONTIGUOUS ROWS, AND MANY LANES.**
+Flattening is not a general win, and a sweep for 2-D views is not a to-do list. Measured on
+`mha`, which has **more 2-D GM views than any other shipped kernel** (19 across its two shipped
+kernels): flattening every site that is provably contiguous is worth **nothing** -- geomean
+**0.9984**, all 20 cases inside their own 3-replicate null band (median 3.5%, worst 9.6%),
+operator score **-0.01**. Three reasons, and they are the checklist to apply BEFORE bisecting:
+
+1. **Most 2-D views are genuinely strided and cannot be flattened at all.** A BSND attention
+   layout puts consecutive tokens `N*D` apart, and `N` is 8-32 across the whole sweep, so every
+   Q/K/V/y access is a real sub-block of a larger matrix. 16 of `mha`'s 19 sites are like this.
+   The `wqbmm` win came from a **private workspace plane** the kernel laid out itself, which is
+   exactly where contiguous-and-small rows come from.
+2. **The row must be SMALLER THAN A CACHE LINE for the per-request cost to dominate.** The
+   probe's marginal cost is ~6.1 ns per 32-byte request, against ~95 GB/s once a burst is long,
+   so the crossover is around **500-600 bytes per row**. `wqbmm`'s row was **32 bytes** (8
+   floats) -- deep in the pathological regime. Every flattenable `mha` row was **256-1024
+   bytes** -- already at or past the crossover, so one burst per row was near-optimal and there
+   was nothing to recover.
+3. **A runtime `if` to pick the flat path can cost more than the flatten saves.** The three
+   `mha` cases where a conditional flat path fired (`dimSkv == kT`) came out at geomean
+   **0.9844**, against **1.0009** for the 17 cases that took the unconditional flatten only.
+   If contiguity is not a compile-time property, leave it alone.
+
+**So the rule to apply is:** flatten when the region is a kernel-private workspace plane whose
+rows are contiguous AND under ~512 bytes AND read by many lanes at once. Outside that box,
+measure before believing it, and expect zero.
+
 ### C57a: `SYNCALL<*>` DEADLOCKS SILENTLY ABOVE `block_dim = 24`
 
 Separate finding from the same investigation, and it is a correctness hazard rather than a
