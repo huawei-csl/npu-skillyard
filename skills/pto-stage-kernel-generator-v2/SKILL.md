@@ -2483,6 +2483,14 @@ consequence explicit, and that omission cost two separate runs their longest deb
 **Poison every output buffer before every launch** (fill with a sentinel, assert it is gone).
 A zero return code from `call_kernel` means nothing at all here.
 
+> **C51a -- THE POISON DETECTOR ITSELF CAN LIE, for the C60 reason.** `y.fill_(poison)` is a torch
+> op, and a direct `<<<>>>` launch can overtake it through torch_npu's host task queue. Measured:
+> four identical launches, and trial 2 came back **fully poisoned** -- i.e. the detector reported
+> "the kernel wrote nothing" when the kernel had in fact run and the *fill* had landed after it.
+> A false "wrote nothing" is as expensive as the bug it was built to find.
+> **Sync between the poison fill and the launch** (`torch.npu.synchronize()`), the same edge C60
+> requires. A detector built out of torch ops inherits every torch-ordering hazard.
+
 ## C52: FOR A SMALL ELEMENTWISE KERNEL, PTO'S GENERIC WRAPPERS ARE THE BOTTLENECK -- CHECK `aiv_icache_miss_rate`
 
 `level1/sigmoid` was the worst op in our cann-bench campaign for weeks: score 58.40, **0 of 20
@@ -2880,6 +2888,38 @@ zero** output while every fp16/bf16 configuration passed -- because the fp32 pat
 the narrow paths needed a real conversion. No compile error, no fault, output simply never written.
 Use an explicit move/copy when source and destination types are the same, and never let a dtype
 template instantiate a conversion that is an identity.
+
+## C61: MTE2 BURST COST IS A FUNCTION OF **BASE ALIGNMENT AND STRIDE**, NOT JUST LENGTH -- AND THE TERMS INTERACT
+
+Three measured effects on the same operator, and the third is why a naive "round the burst up"
+optimisation can go backwards:
+
+| change | effect |
+|---|---|
+| `stride % 32 != 0` | **2.6x** slower |
+| round `lenBurst` up to 32 B, **over a 32 B-aligned base** | **3.7x** faster |
+| the same rounding, **over a MISALIGNED base** | **2.2x WORSE** |
+
+So length, stride and base alignment are not independent knobs. Rounding the burst length is only
+a win once the base is aligned; applied blind it is a regression.
+
+**Rule: fix base alignment first, then stride, then length.** And when you build a cost model for
+DMA, separate those three terms explicitly -- the run that found this lost an attempt (0.79-0.90x)
+to a first probe that **conflated length with stride**.
+
+**Related hard constraints on the same path:** a misaligned UB base for a Vec op is a **hard
+fault** at 32-byte granularity regardless of dtype, and there is **no `copy_ubuf_to_ubuf_align`** --
+the GM->UB load is the only byte-granular shifter on the part, so a misaligned UB layout cannot be
+repaired in place.
+
+### C61a: `pipe_barrier(PIPE_ALL)` DOES NOT ORDER A VEC/MTE2 UB WRITE AGAINST A SCALAR READ
+
+C19 is stronger than it is written. `pipe_barrier(PIPE_ALL)` is not sufficient for a scalar read of
+a UB location that a Vec or MTE2 instruction wrote: removing the explicit flag sandwich made two
+cases **deterministically** wrong, 3 runs out of 3. Deterministic, not flaky -- so it will survive
+a re-run and look like a logic bug.
+
+Use the explicit `set_flag`/`wait_flag` pair for that edge; do not substitute a barrier.
 
 ## Generator Workflow
 
