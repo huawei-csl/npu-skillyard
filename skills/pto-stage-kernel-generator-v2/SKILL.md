@@ -1131,6 +1131,20 @@ The condition is exact and predictive:
 > a boxed tile with declared `Rows` and valid extent `V` is correct **iff
 > `ceil(V/16) == ceil(Rows/16)`**.
 
+**C33-USE: THE RULE IS PERMISSIVE, AND READING IT CONSERVATIVELY COSTS 3-4x.** The condition says
+`V` may sit **anywhere inside the last 16-row fractal** -- it does NOT say `V` must equal `Rows`.
+So for `Cout = 127`, declare `Rows = align16(127) = 128`: `ceil(127/16) = 8 = ceil(128/16)`, one
+tile, correct. Splitting 127 into four 32-row tiles to "stay safe" is the conservative misreading,
+and it is what `conv_2d` did. Measured cost of the misreading, same op, same data:
+
+| | conservative split | `align16(rem)`, one tile |
+|---|---|---|
+| case 8 GEMM | 645 us | **339 us** |
+| case 7 GEMM | 248 us | **113 us** |
+
+**So: size the last M tile as `align16(remainder)` and pass the true valid extent.** Check the
+condition, do not avoid the situation.
+
 Probed on A2/dav-c220 (`isa_probes/probe_boxvalid.cpp`), `C = A[0:V] @ B`, sweeping
 **every** `V` in `1..Rows` at five declared sizes:
 
@@ -2789,6 +2803,39 @@ and C53 (the wrong arch flag deletes every Cube instruction): **a preprocessor c
 false for a reason you did not intend, producing a clean build and wrong output.** When a
 `#if`-guarded change behaves strangely, print the macro's value with `#warning` before debugging
 the code inside it.
+
+## C59: `TEXTRACT` LAYS L0A OUT AT THE **STATIC** `Cols` UNLESS `CompactMode::Normal` -- AND THE GATE CAN PASS ANYWAY
+
+`TEXTRACT` writes its L0A fractal using the tile's **declared** `Cols`, while `TMATMUL` issues
+`k = GetValidCol()`. If those disagree and the tile is not `CompactMode::Normal`, the contraction
+reads the wrong stride. Silent: no fault, no compile error.
+
+Measured relative error against a CPU reference, by output width:
+
+| `Wo` | rel err |
+|---|---|
+| 16, 32, 48, 64 (multiples of 16) | 2.9e-04 |
+| 17, 20, 30, 31, 33, 61 | **6.8e-02 … 3.8e-01** |
+
+**The part that matters beyond the bug.** On `level3/conv_3d_backprop_filter`, case 8 **PASSED the
+official accuracy gate carrying this defect** -- MERE 2.99e-04 against a 9.77e-04 threshold. With
+the defect fixed the same case reads **6.08e-07: a 490x accuracy improvement entirely invisible to
+pass/fail.**
+
+That is a failure mode beyond rule 3.23's. 3.23 says a scored case may not *reach* your bug. This
+is worse: **the case reaches the bug, computes a materially wrong answer, and still passes**,
+because the threshold is loose enough to absorb it. A green gate is not evidence that the
+contraction is right.
+
+**Rules:**
+
+1. **Put `CompactMode::Normal` on any boxed tile whose `ValidCol` can differ from `Cols`**, and
+   `static_assert` the pairing rather than relying on it.
+2. **Probe with data that can actually fail.** The run's own first probe used **all-ones operands**
+   and could not detect a stride error at all -- every wrong element summed to the same value. Use
+   distinct, position-dependent values (a ramp, or random) so a mislaid fractal shows up.
+3. **When accuracy is comfortably inside threshold but not near machine epsilon, ask why.** A
+   contraction that should be exact to ~1e-7 sitting at 3e-4 is a signal, not a pass.
 
 ## Generator Workflow
 
