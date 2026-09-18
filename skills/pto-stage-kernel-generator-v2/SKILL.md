@@ -445,6 +445,15 @@ the campaign will spend an attempt disproving a technique you never implemented.
 
 ### C33c: A CUBE-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH EITHER -- `dav-c220-cube` exists
 
+> **COMPOSITION CAVEAT, measured on the first multi-stage pipeline run.** C33b and C33c are right
+> about a stage **in isolation** and can be wrong about a **chain**. If three stages take three
+> different arch flags, they cannot be fused into one launch -- so Phase 7's `ffts` single-launch
+> composition, which is the pipeline's own remedy for per-launch overhead and for the C60
+> torch-to-direct-launch ordering hazard, is **forbidden by C33b/C33c**. That is a structural gap in
+> the rule set, not bad luck. When a chain's stages disagree on arch, you must choose between
+> single-engine efficiency per stage and single-launch composition, and the choice should be made
+> and priced explicitly rather than defaulted.
+
 **C33b's mirror, and the generator has been leaving it on the table.** A stage whose StageSpec
 contains no Vec op is `cube_only`, and it must be built with `--cce-aicore-arch=dav-c220-cube`,
 not `dav-c220`.
@@ -2836,6 +2845,41 @@ contraction is right.
    distinct, position-dependent values (a ramp, or random) so a mislaid fractal shows up.
 3. **When accuracy is comfortably inside threshold but not near machine epsilon, ask why.** A
    contraction that should be exact to ~1e-7 sitting at 3e-4 is a signal, not a pass.
+
+## C60: A DIRECT `<<<>>>` LAUNCH CAN OVERTAKE A PRECEDING TORCH OP -- THE HOST TASK QUEUE IS NOT A STREAM
+
+torch_npu dispatches through a **host task queue**. A `ctypes`/direct `<<<blocks, nullptr,
+stream>>>` launch issued after a torch op does **not** reliably observe that op's writes, even on
+the same stream.
+
+Measured on a three-kernel composed operator:
+
+| edge | wrong results |
+|---|---|
+| `torch -> ours` | **40 / 40** |
+| `ours -> ours` | 0 / 40 |
+| `ours -> torch` | 0 / 40 |
+
+It presents as **order-dependent NaN across cases that each pass in isolation**, it survives
+`torch.npu.empty_cache()` and a device change, and it **vanishes under
+`ASCEND_LAUNCH_BLOCKING=1`** -- which is the diagnostic, because that is a host-side serialisation
+knob.
+
+**Rule: put a device sync on every `torch -> direct-launch` edge.** The cost is host-side only, and
+cann-bench scores the sum of kernel `Duration`, so it does not enter the measurement at all.
+
+**Why it went 27 ops without being seen:** every previous operator in this campaign was a single
+kernel, so there was never a torch op between two of our launches. It appears the moment an
+operator is composed from more than one launch -- which is exactly what a staged pipeline
+produces.
+
+### C60a: `TCVT` float -> float IS A SILENT NO-OP
+
+A same-type `TCVT` does not copy. Every fp32 configuration of one operator returned an **exactly
+zero** output while every fp16/bf16 configuration passed -- because the fp32 path used `TCVT` where
+the narrow paths needed a real conversion. No compile error, no fault, output simply never written.
+Use an explicit move/copy when source and destination types are the same, and never let a dtype
+template instantiate a conversion that is an identity.
 
 ## Generator Workflow
 
