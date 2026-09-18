@@ -445,14 +445,47 @@ the campaign will spend an attempt disproving a technique you never implemented.
 
 ### C33c: A CUBE-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH EITHER -- `dav-c220-cube` exists
 
-> **COMPOSITION CAVEAT, measured on the first multi-stage pipeline run.** C33b and C33c are right
-> about a stage **in isolation** and can be wrong about a **chain**. If three stages take three
-> different arch flags, they cannot be fused into one launch -- so Phase 7's `ffts` single-launch
-> composition, which is the pipeline's own remedy for per-launch overhead and for the C60
-> torch-to-direct-launch ordering hazard, is **forbidden by C33b/C33c**. That is a structural gap in
-> the rule set, not bad luck. When a chain's stages disagree on arch, you must choose between
-> single-engine efficiency per stage and single-launch composition, and the choice should be made
-> and priced explicitly rather than defaulted.
+> **C33-CHAIN -- RESOLVED, AND C33b/C33c WERE PRICING THE TOLL ON THE WRONG UNIT.**
+>
+> C33b and C33c say a single-engine stage must not ship as MIX, at a documented ~2.88 us toll. On a
+> **chain** that rule forbids single-launch composition, because an FFTS kernel is one TU with one
+> arch flag and three stages wanting three flags cannot be fused. A first pipeline run duly fell
+> back to host-stream -- and that fallback created the `torch -> direct-launch` edge that exposed
+> C60 (40/40 wrong before a sync was added).
+>
+> **A controlled A/B then settled it.** Same binary, same partitioning, same `block_dim`, driven
+> either as one FFTS launch or one-phase-per-launch -- only the seam mechanism differs:
+>
+> | | host-stream (3 `.so`) | **FFTS (1 launch)** |
+> |---|---|---|
+> | operator score | 52.422 | **54.279** |
+> | total device time, 20 cases | 16,067.8 us | **8,924.6 us** |
+> | controlled A/B | -- | **wins 19/20, geomean 1.259x** |
+> | vs composed vendor primitives | wins 19/20 | **wins 20/20, geomean 4.38x** |
+>
+> **The MIX toll is real and BIGGER than documented -- and that does not matter.** Measured with
+> C33b's own recipe (same source, matched worker count, bit-identical output asserted first, all 8
+> arms identical): vector-only in MIX **+2.95 to +7.51 us/call**, cube-only **+5.40 to +7.30**. Not
+> 2.88, and **not Cube-specific** -- which also supports C33c's open 9-13 us discrepancy.
+>
+> **The error was the unit.** The toll is paid **once per launch**, not once per stage. C33b/C33c
+> priced it per stage, so an N-stage chain appeared to cost N tolls; in fact single-launch pays it
+> **once** while host-stream pays `1+2L` launches at ~5.5-5.8 us each plus the host syncs.
+>
+> **RULE: if the operator is a CHAIN of more than one stage, pick `dav-c220` (MIX) for the whole
+> chain and compose with `SYNCALL<Mix>` seams.** Reserve `-vec`/`-cube` for an operator that
+> genuinely ships as ONE single-engine kernel. Arch is then a **Phase-1 decomposition constraint**:
+> choose it first, and require the decomposition to fit it.
+>
+> Three caveats that come with it: the advantage **narrows as `block_dim` grows** (a seam scales
+> with core count, a launch does not -- the single A/B loss was at bd=24), so pick `block_dim`
+> rather than maximising it; `block_dim <= 24` becomes **architectural** rather than a knob (C57a);
+> and pulling a stage loop in-kernel pushes cost into the contract (that run locked `numLayers <= 3`).
+>
+> Bonus: single-launch removes every `torch -> ours` edge, so C60 cannot arise -- **0 wrong in 400
+> unfenced trials**, including the interleaved-matmul shape that went 40/40 wrong under host-stream.
+
+### C33c: A CUBE-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH EITHER -- `dav-c220-cube` exists
 
 **C33b's mirror, and the generator has been leaving it on the table.** A stage whose StageSpec
 contains no Vec op is `cube_only`, and it must be built with `--cce-aicore-arch=dav-c220-cube`,
@@ -2920,6 +2953,42 @@ cases **deterministically** wrong, 3 runs out of 3. Deterministic, not flaky -- 
 a re-run and look like a logic bug.
 
 Use the explicit `set_flag`/`wait_flag` pair for that edge; do not substitute a barrier.
+
+## C62: TWO TILES `TASSIGN`ED TO THE SAME UB ADDRESS -- THE COMPILER REORDERS THEM, AND `pipe_barrier` DOES NOT STOP IT
+
+`pipe_barrier(PIPE_V)` is a **hardware** barrier. It is not a **compiler** barrier. bisheng's tile
+dependence analysis treats operations naming **different `Tile` objects** as independent -- so if
+two objects are `TASSIGN`ed to the **same UB address** (a sub-tile overlay), the optimiser will
+reorder across them.
+
+Bisected on a real kernel, gate relative error:
+
+| build | result |
+|---|---|
+| `-O0` + `pipe_barrier(PIPE_V)` | exact |
+| `-O1` + `PIPE_V` | **wrong (~1e0)** |
+| `-O2` + `PIPE_V` | **wrong (~1e0)** |
+| `-O2` + `pipe_barrier(PIPE_ALL)` | exact |
+
+**Three things make this worse than an ordinary aliasing bug:**
+
+1. **It survives `-O1`**, so it is not something you find by turning optimisation down one notch.
+2. **It is silent** -- no fault, no warning, just a wrong answer.
+3. **It is LATENT.** The run that found it had a `PIPE_V` build passing 20/20 twice -- but only
+   because an unrelated optimisation attempt had changed *which objects alias*. Passing today is
+   not evidence the kernel is safe tomorrow.
+
+And the construct is not exotic: **sub-tile overlay is an idiom this cookbook actively
+encourages** for UB budgeting.
+
+**Rule: when two `Tile` objects can name the same UB address, use `pipe_barrier(PIPE_ALL)` between
+their uses**, not `PIPE_V`. Cost measured at **1.0-2.4%**. If you want the cheaper barrier, first
+prove the objects cannot overlap -- and re-prove it whenever the UB map changes, because this is
+exactly the kind of invariant a later optimisation attempt breaks without touching the barrier.
+
+**Related but distinct:** C61a says `pipe_barrier(PIPE_ALL)` is *insufficient* for a scalar read of
+a Vec/MTE2 write (use an explicit `set_flag`/`wait_flag`). So `PIPE_ALL` is necessary here and not
+sufficient there -- the two rules constrain different edges and neither substitutes for the other.
 
 ## Generator Workflow
 
