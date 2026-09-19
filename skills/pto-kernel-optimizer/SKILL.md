@@ -928,6 +928,14 @@ applied early. What survives is a discriminator and one number, not a recipe:
 * "Write-only operands should always bypass" is **falsified** (0.915x, replicated 3x).
 * Per-operand aliases do not compose: two that each helped (1.10x, 1.07x) were a **2.03x
   regression** together.
+* **The ~1.9x crossover held out-of-sample (`grouped_matmul`, 78.20) -- the first time it was
+  used as a PREDICTION rather than fitted.** The schedule re-reads the expert weight panel
+  **2-14x**, i.e. above the crossover, so the rule says the alias should lose on every operand.
+  It did: weight **0.696x**, x 0.960x, y 0.989x. This is on an op whose *other* five
+  memory-bound siblings were worth 1.39x-1.70x with the alias on, so the prior from sibling
+  kernels pointed the wrong way and the redundancy number pointed the right way. **Compute the
+  schedule redundancy; do not carry an alias result across kernels.** (Measured one binary, one
+  runtime mask, output bit-identical across all masks.)
 
 **Rule:** ship the alias as a runtime knob defaulted OFF, measure it as your LAST attempt in
 the final configuration, single-arm (§3.8), and record the cache state with every number. An

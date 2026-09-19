@@ -484,6 +484,21 @@ the campaign will spend an attempt disproving a technique you never implemented.
 >
 > Bonus: single-launch removes every `torch -> ours` edge, so C60 cannot arise -- **0 wrong in 400
 > unfenced trials**, including the interleaved-matmul shape that went 40/40 wrong under host-stream.
+>
+> **SECOND DATA POINT, and it is a scoped NEGATIVE that SUPPORTS the rule as written
+> (`grouped_matmul`, 78.20).** The rule is gated on *"if the operator is a CHAIN of more than one
+> stage"*, and that gate earned its keep. `grouped_matmul` ships as **ONE `cube_only` kernel**
+> because both would-be Vec stages disappear into hardware paths: the fp16 bias reaches the Cube
+> bias table through `Mat -> TMOV -> Bias` (half->float converted **in hardware**), and the fp32
+> accumulator reaches GM **already cast** through the FIXPIPE on `TSTORE`. With one stage there is
+> no seam to collapse, so single-launch FFTS saves **zero** launches while MIX still charges the
+> toll: same source built MIX is **bit-identical on 20/20** and **1.071x slower** (+1.40 us/call
+> mean, +7.80 us worst).
+>
+> **So count the stages that survive lowering, not the stages in the StageSpec.** A Vec stage that
+> is only a dtype conversion or a bias add is not a stage -- `TMOV`-to-bias-table and the FIXPIPE
+> cast absorb it, and a StageSpec that still lists it will talk you into a MIX build that costs
+> 7.1% and buys nothing. Check for a real Vec/Cube seam before applying C33-CHAIN.
 
 ### C33c: A CUBE-ONLY STAGE MUST NOT SHIP AS A MIX LAUNCH EITHER -- `dav-c220-cube` exists
 
@@ -1210,6 +1225,24 @@ than declaring one big tile and narrowing it.
 **COOK-§8.9's `TileAcc<float, M, N, DYNAMIC, DYNAMIC>` idiom invites the broken
 form** — it is safe only when the runtime extent lands in the last fractal. This cost
 one run 3 of its 4 repair attempts.
+
+**C33-USE-COL: THE SAME LAST-FRACTAL RULE GOVERNS THE *COLUMN* EXTENT -- AND THERE
+`CompactMode::Normal` DOES FIX IT.** Everything above is about the row extent `V`, where
+`CompactMode` is no help (re-probed and reproduced exactly on `grouped_matmul`: at
+`Rows = 128` only `V = 113..128` are correct at 4.8e-8, every other `V` is wrong by ~4.3e2,
+and `align16(V)` is correct at every `V`). The column extent behaves the same way by
+default and **unlike the row extent it has a fix**:
+
+| tile | declared | valid extents that are CORRECT |
+|---|---|---|
+| plain `NT = 256` | — | only `nv = 255, 256` (everything else wrong, err ~1.3) |
+| **`CompactMode::Normal`, `NT = 256`** | — | **every `nv` from 16 up, exact (4.7e-8)** |
+
+The same holds for the **K extent of the `Left` operand**. So: for a ragged column or K
+extent, declare the tile `CompactMode::Normal` and pass the true extent -- do NOT carry the
+row-extent workaround (`align16` + per-case tile sizes) across to the columns, and do NOT
+assume `CompactMode` rescues the rows. Probed on A2/dav-c220,
+`skillyard-runs-v112/grouped_matmul/probes/run_shapes.py`.
 
 **C22. msprof op simulator validation.**
 Kernels can be validated without NPU hardware using the Ascend simulator:
