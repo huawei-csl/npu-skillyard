@@ -95,7 +95,7 @@ vars: `$PTO_PYTHON`, `$PTO_LIB_PATH` (pto-isa), `$PTO_INCLUDE_DIR`, `$PTO_ISA_RE
 The skills (`torch-algorithm-to-pto-stages`, `pto-stage-artifact-generator-local`,
 `pto-stage-kernel-generator-v2`, `pto-kernel-optimizer`) are the *per-phase* building
 blocks both drivers invoke. `pto-stage-kernel-generator-v2/SKILL.md` is the largest and
-most important file — it defines the C1–C32 critical rules, the archetype decision tree,
+most important file — it defines the C1–C62 critical rules, the archetype decision tree,
 and the C24 compile recipe; its `references/` (`platform_model*.md` = `PLAT-§`,
 `cookbook.md` = `COOK-§`, `cpu_sim_patterns.md` = `BUILD-§`) and `examples.md` (`EX-§`) are
 binding and cited by stable ID throughout.

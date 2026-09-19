@@ -48,7 +48,7 @@ Resolve once and reuse:
 Invoke via the Skill tool:
 
 - `pto-stage-artifact-generator-local` -- validation/benchmark script generation
-- `pto-stage-kernel-generator-v2` -- kernel generation (the C1-C27 critical rules and the C24 compile recipe)
+- `pto-stage-kernel-generator-v2` -- kernel generation (the C1-C62 critical rules and the C24 compile recipe)
 
 ## Provenance boundary (hard rule)
 
@@ -82,7 +82,7 @@ to learn how it computes is not.
 ### Phase 4: Kernel Generation
 
 1. Apply `pto-stage-kernel-generator-v2` to generate `kernel_<stage_name>.cpp`.
-2. Follow ALL CRITICAL rules (C1-C27) -- see the skill. Do not assume a fixed
+2. Follow ALL CRITICAL rules (C1-C62) -- see the skill. Do not assume a fixed
    count; apply every C-rule the skill defines.
 3. Write the kernel source.
 

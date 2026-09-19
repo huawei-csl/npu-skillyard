@@ -50,7 +50,7 @@ Invoke these via the Skill tool when each phase needs them:
 
 - `torch-algorithm-to-pto-stages` -- algorithm decomposition
 - `pto-stage-artifact-generator-local` -- validation/benchmark script generation
-- `pto-stage-kernel-generator-v2` -- kernel generation (defines the C1-C27 critical rules and the C24 compile recipe)
+- `pto-stage-kernel-generator-v2` -- kernel generation (defines the C1-C62 critical rules and the C24 compile recipe)
 
 ## Provenance boundary (hard rule)
 
@@ -209,7 +209,7 @@ LOAD the file <<output_dir>>/spec_<<stage_name>>.json. It contains:
 3. Run Phase 4 (Kernel Generation):
    - Load the `pto-stage-kernel-generator-v2` skill
    - Generate kernel_<<stage_name>>.cpp
-   - Follow ALL CRITICAL rules (C1-C32), UB budget (192KB A2A3 / 256KB A5),
+   - Follow ALL CRITICAL rules (C1-C62), UB budget (192KB A2A3 / 256KB A5),
      single include kernel_common.h, ASCII-only, compile recipe C24
 
 4. Run Phase 5 (Validation Loop) -- up to <<repair_budget>> repair attempts:
@@ -310,7 +310,7 @@ requested AND Phase 6 produced a baseline.
 ### Phase 4: Kernel Generation
 
 1. Apply `pto-stage-kernel-generator-v2` to generate `kernel_<stage_name>.cpp`
-2. Follow ALL CRITICAL rules (C1-C27) -- see the skill for details. Do not assume
+2. Follow ALL CRITICAL rules (C1-C62) -- see the skill for details. Do not assume
    a fixed count; apply every C-rule the skill defines.
 3. Write the kernel source
 
