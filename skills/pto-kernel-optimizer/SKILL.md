@@ -928,14 +928,35 @@ applied early. What survives is a discriminator and one number, not a recipe:
 * "Write-only operands should always bypass" is **falsified** (0.915x, replicated 3x).
 * Per-operand aliases do not compose: two that each helped (1.10x, 1.07x) were a **2.03x
   regression** together.
-* **The ~1.9x crossover held out-of-sample (`grouped_matmul`, 78.20) -- the first time it was
-  used as a PREDICTION rather than fitted.** The schedule re-reads the expert weight panel
-  **2-14x**, i.e. above the crossover, so the rule says the alias should lose on every operand.
-  It did: weight **0.696x**, x 0.960x, y 0.989x. This is on an op whose *other* five
-  memory-bound siblings were worth 1.39x-1.70x with the alias on, so the prior from sibling
-  kernels pointed the wrong way and the redundancy number pointed the right way. **Compute the
-  schedule redundancy; do not carry an alias result across kernels.** (Measured one binary, one
-  runtime mask, output bit-identical across all masks.)
+* **THE REDUNDANCY CROSSOVER DOES NOT PREDICT WINS, AND THE ONE "OUT-OF-SAMPLE
+  CONFIRMATION" IT HAD WAS CONFOUNDED.** I wrote here that `grouped_matmul` confirmed the
+  ~1.9x crossover as a prediction: its schedule re-reads the weight panel 2-14x, above the
+  crossover, and the alias duly lost (weight 0.696x). That was not a clean test -- the same
+  operand's GM burst was capped at **256 bytes** by the `TRESHAPE`/`TEXTRACT` square-tile
+  constraint, which I had recorded in the same report. **Both hypotheses predicted that loss.**
+
+  `softmax` separates them, because there every last-axis operand is read **once**
+  (redundancy 1.0, the crossover's strongest predicted WIN). Measured, one binary, runtime
+  mask, one arm per process, reproduced independently of the run that reported it:
+
+  | case | GM burst | redundancy | alias OFF -> ON |
+  |---|---|---|---|
+  | 14 `[11,13,17,67,67]` fp32 | 268 B | **1.0** | **0.467x** |
+  | 20 `[2,3,17,1024,101]` fp32 | 404 B | -- | **0.510x** |
+  | 3 `[4096,4096]` bf16 | 8192 B | 1.0 | 1.014x (null) |
+  | 1 `[1024,1024]` fp16 | 2048 B | 1.0 | 1.121x |
+
+  Four cases at the same redundancy spanning **0.467x to 1.121x**. Redundancy explains none of
+  it. Across the full 20-case sweep the alias lost on 12.
+
+* **What the evidence actually supports, stated no wider than it goes: a sub-512-byte GM burst
+  loses, heavily, whatever the schedule redundancy.** Both sub-512 B cases measured 0.47-0.51x
+  -- a 2x regression, not a marginal one. Above 512 B the effect is small and **not** ordered by
+  burst size (1.12x at 2 KB, 1.01x at 8 KB), so burst size is a reliable *veto*, not a
+  predictor of gain. **Rule: compute the GM burst first. Below 512 B, do not try the alias at
+  all. Above it, the alias is a coin-flip worth at most ~1.1x and it still has to be measured
+  last, in the final configuration (below).** The ~1.9x redundancy crossover is kept only as a
+  description of the ELEVEN cases it was fitted on; it has never predicted an unseen one.
 
 **Rule:** ship the alias as a runtime knob defaulted OFF, measure it as your LAST attempt in
 the final configuration, single-arm (§3.8), and record the cache state with every number. An

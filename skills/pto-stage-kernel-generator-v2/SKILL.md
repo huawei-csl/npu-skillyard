@@ -2098,6 +2098,37 @@ This separates two constraints that are easy to conflate:
   fp32 `Cols % 8 == 0`, fp16/bf16 `Cols % 16 == 0` (PLAT-Align, COOK alignment section).
 * **`ValidCol`** (the runtime extent) is unconstrained.
 
+**C38a -- THE GUARANTEE IS `TSTORE`-ONLY. `TLOAD` WRITES PAST `ValidCol`.** C38 was probed on
+stores and its conclusion is correct for stores. The load direction is **not** symmetric: the
+UB-side DMA is 32-byte granular, so a load of `validCol` elements deposits
+`ceil(validCol*sizeof(T)/32)*32` bytes -- an overrun of `(-validCol) mod (32/sizeof(T))`
+elements, filled with the **next real data from GM**, not garbage.
+
+Why stores are safe and loads are not: a store rounding up would corrupt GM, so the hardware
+masks the tail; a load has nothing to protect in UB, so it does not. Same 32-byte granularity
+we already probed from the other side in `conv_2d` ("the UB-side address advances by
+`ceil(lenBurst/32)*32 + ubGap*32` bytes per burst ... `rightPadding` does NOT change it").
+`TLoad.hpp:77` passes `lenBurst = validCol * sizeof(DType)` in bytes exactly as the store does
+-- the rounding is in the instruction, not the wrapper, which is why reading the wrapper does
+not warn you.
+
+**This is a silent wrong answer whenever anything downstream consumes the tile by `Cols`
+rather than by `ValidCol`** -- a reduction being the obvious case. On `softmax` it took out
+exactly the two fp32 cases with a ragged last axis: `D = 4097` and `D = 8193`, both
+`D % 8 == 1`, so 7 extra elements entered the sum. The error signature pins it with no
+ambiguity: MERE **1.711e-03** against **7/4097 = 1.709e-03**. Every 16-bit case passed at the
+same time, because there the overrun landed in a staging tile that `TCVT` re-read by
+`ValidCol` -- so a 16-bit-heavy sweep ships this bug.
+
+**Rule: after a `TLOAD` with a ragged `ValidCol`, either overwrite the tail with the
+operation's identity (0 for a sum, `-inf` for a max) before consuming the tile, or make every
+consumer honour `ValidCol`.** Do not assume the tail is zero and do not assume it is garbage:
+it is the neighbouring data, which is exactly the kind of wrong that looks plausible.
+
+*Provenance: 13/13 exact on the overrun formula in the `softmax` run's own probe; I confirmed
+the mechanism from `TLoad.hpp` and our prior `conv_2d` DMA probe and verified the 7/4097 error
+signature arithmetically, but did not re-run the overrun probe myself.*
+
 So the correct pattern for a dynamic length is a fixed, aligned `Cols` with the ragged tail
 carried by a runtime `ValidCol` -- **not** a narrower tile, and **not** an overlapping
 backward-shifted final tile (which breaks the *start* alignment instead).
@@ -2459,23 +2490,57 @@ HIDES THE BUG INSTEAD OF AVOIDING IT.** Re-probed on `rms_norm` over a 137-point
 (tmp rows, src Cols, tmp Cols, validCol), fp32, A2/dav-c220-vec, rebuilt and re-run
 independently. Three results, in order of importance:
 
-1. **The exact requirement uses `floor` twice and has no minimum:**
+1. **The requirement has THREE regimes, and the middle one fails differently.** My first
+   correction here said "`floor` twice, no minimum" -- the `floor` half is right and **the "no
+   minimum" half was wrong**, caught on the next operator (`softmax`) and re-probed:
 
    ```
-   tmp_cols_needed = ElemPerRpt * floor( floor(validCol / ElemPerRpt) / 2 )     // 0 when validCol < 2*ElemPerRpt
+   validCol <= ElemPerRpt            -> tmp unused; any width works (OneRepeatProc branch)
+   ElemPerRpt < validCol < 2*ElemPerRpt -> tmp MUST be >= ElemPerRpt, or the whole reduction is
+                                        a SILENT NO-OP: dst is never written at all
+   validCol >= 2*ElemPerRpt          -> ElemPerRpt * floor(floor(validCol/ElemPerRpt)/2)
    ```
 
-   **0 mispredictions in 117 measurements** with `tmp` rows > 1. The `ceil` + `max(ElemPerRpt, .)`
-   form above over-estimates: at `validCol = 250` it demands 128 where 64 is provably enough,
-   and at `validCol < 128` it demands 64 where **zero** is enough (`FillTmp`'s loop runs zero
-   times, so `tmp` is never written at all).
+   which collapses back to the shipped form, minimum included:
 
-2. **C49 as written is never UNSAFE** -- across all 137 points there is **no case where the
+   ```
+   tmp_cols_needed = 0 if validCol <= ElemPerRpt
+                     else max(ElemPerRpt, ElemPerRpt * floor(floor(validCol/ElemPerRpt)/2))
+   ```
+
+   **The middle regime is the dangerous one and it is not "wrong numbers", it is "no numbers".**
+   `TRowReduceOps.hpp:281-285`: inside the `validCol < 2*elemPerRpt` branch there is an
+   `if constexpr ((srcRptStride < 8) || (tmpRptStride < 8)) return;` -- placed there, by its own
+   comment, to dodge a ccec compile check on `pto_copy_ubuf_to_ubuf`. It returns **before**
+   `FillTmp` and before anything writes `dst`. Measured, fp32, dst poisoned with `-31337` first:
+
+   | tmp Cols | blocks | validCol 67 / 100 / 127 | validCol 64 | validCol 128 | validCol 256 |
+   |---|---|---|---|---|---|
+   | 8 | 1 | **NO-OP, poison intact** | OK | WRONG 9.8e-02 | WRONG 5.8e-02 |
+   | 32 | 4 | **NO-OP, poison intact** | OK | WRONG 3.2e-02 | WRONG 1.7e-02 |
+   | 64 | 8 | OK | OK | OK | WRONG 1.8e-02 |
+   | 128 | 16 | OK | OK | OK | OK |
+
+   Note the `validCol >= 128` columns confirm the `floor` formula exactly (128 needs 64, 256
+   needs 128) -- so both halves of the rule are now measured, not inferred. And because the
+   guard is `if constexpr`, a tmp tile declared narrower than `ElemPerRpt` makes that
+   instantiation **always** no-op. `dst` keeps whatever it held, which in a real kernel is a
+   stale value from the previous iteration -- it reads as plausible data, not as an error.
+
+2. **C49 IS TROWSUM-ONLY.** The binary-tree `FillTmp`/`TmpProc` the formula describes is an
+   **override on `TRowSumOp`**. `TRowMaxOp` (`a2a3/TRowMax.hpp`) does not define `FillTmp` at
+   all -- it inherits `TRowReduceOp`'s base version (`TRowReduceOps.hpp:151`), which writes
+   exactly ONE repeat. So `TROWMAX` / `TROWMIN` / `TROWPROD` need only `ElemPerRpt` columns of
+   scratch whatever `validCol` is, while `TROWSUM` needs the full formula. Sizing a max's
+   scratch by the sum's formula only wastes UB; sizing a **sum's** scratch by the max's rule is
+   silently wrong. Check which op you are emitting.
+
+3. **C49 as written is never UNSAFE** -- across all 137 points there is **no case where the
    rule says "wide enough" and the answer is wrong** (0/137). Every one of its 29
    mispredictions is in the safe direction. So keep using it as the design rule; the exact
    formula is for when you are fighting for UB.
 
-3. **A `tmp` tile with ONE ROW passes every correctness check and is still writing out of
+4. **A `tmp` tile with ONE ROW passes every correctness check and is still writing out of
    bounds.** `FillTmp` addresses `tmp + i * ElemPerRpt` **linearly from the tile base** -- the
    offset does not involve `TileDataTmp::Cols` at all, which is *why* a narrow multi-row tmp
    corrupts row 1. With `Rows == 1` there is no row 1 inside the tile to corrupt, so the
