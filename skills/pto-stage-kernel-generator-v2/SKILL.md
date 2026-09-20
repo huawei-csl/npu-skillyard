@@ -2134,22 +2134,70 @@ never sees the tag. `TROWEXPANDDIV` has the same no-tmp / tmp pair and the same 
    quantization scale) must use the 3-arg form or `TSQRT`+`TDIV`. They measure identically,
    so choose on UB and op count, not accuracy.
 
-## C40: AN fp32 VEC TILE WITH `Cols >= 2048` SILENTLY BREAKS THE ROW REDUCE
+## C40: **RETRACTED.** THE fp32 `Cols >= 2048` ROW-REDUCE CLIFF DOES NOT EXIST -- IT WAS C49
 
-For a multi-row fp32 Vec tile, `Cols >= 2048` puts the row stride beyond the 255-block
-repeat-stride field, and the **row reduction silently returns wrong values**. Found by
-bisection on a fused RMSNorm+quant kernel.
+C40 used to say: a multi-row fp32 Vec tile with `Cols >= 2048` puts the row stride beyond the
+255-block repeat-stride field and the row reduction silently returns wrong values; therefore
+cap chunk width at 1024 elements for any fp32 tile feeding a row reduce, and lock the cap in
+`shape_contract.json`.
 
-What makes it dangerous is that the corruption is **selective**: the reduction-derived output
-was wrong on every affected case while the elementwise output from the *same tile* stayed
-**bit-exact**. A gate that checks only the elementwise output passes, and the symptom reads as
-a numerical accuracy problem rather than an addressing limit.
+**Every part of that is wrong except the symptom, and the cap was costing real width.**
+Re-probed on `rms_norm` over a 137-point sweep varying tmp rows, src `Cols`, tmp `Cols` and
+`validCol` independently (rebuilt and re-run independently of the run that reported it):
 
-**Rules:** cap chunk width at **1024 elements** for fp32 Vec tiles that feed a row reduce
-(`TROWSUM`, `TROWMAX`, `TCOLSUM`, ...), and record the cap as a locked dim in
-`shape_contract.json` with the reason, so a later tile-width sweep cannot quietly undo it.
-When a reduction output is wrong but an elementwise output from the same tile is exact,
-**suspect the stride field before the arithmetic**.
+| tmp rows | src `Cols` | tmp `Cols` | `validCol` | max rel err | |
+|---|---|---|---|---|---|
+| 4 | 2048 | 1024 | 2048 | **1.085e-07** | exact -- C40 predicts silent corruption |
+| 2 | 4096 | 2048 | 4096 | **4.032e-08** | exact, row stride 512 blocks = 2x C40's claimed limit |
+| 1 | 8192 | 4096 | 8192 | **5.119e-08** | exact |
+| 8 | 512 | **64** | 256 | **2.794e-02** | WRONG at `Cols = 512`, nowhere near 2048 |
+
+The threshold is not 2048 and it is not a property of the SRC tile at all. **The first failure
+in fp32 is at `validCol = 256` with a 64-wide `tmp`**, and it moves with the tmp width exactly
+as C49a's formula predicts -- 0 mispredictions in 117 points. C40's own evidence is consistent
+with this: it noted the reduction output was wrong while the elementwise output from the same
+tile stayed bit-exact, which is precisely what an undersized *scratch* tile does and precisely
+what a *source* addressing limit would not do.
+
+**What to do instead:** size the `tmp` tile by C49a and let the src tile be as wide as the UB
+budget allows. Do NOT cap fp32 row-reduce tiles at 1024 -- on this benchmark that cap would
+have halved the tile width on every fp32 case including `D = 8192`, for nothing.
+
+**What survives, and it is the useful half:** *when a reduction output is wrong but an
+elementwise output from the same tile is bit-exact, the fault is in the reduction's scratch,
+not in the arithmetic and not in the source tile.* That is the diagnostic; C40 just named the
+wrong culprit. Same mis-attribution shape as C15.
+
+Related skew from the original C40 run, still valid and independently useful: `TMADD` and
+`TMULA` are served by the npu-coding MCP but have **no a2a3 implementation in pto-isa
+`109c9f72`**, and there is **no `TCVT` path for bf16 -> int8** (stage through fp32). Verify
+against the headers you compile against, not the index.
+
+## C63: `TCVT` WITH THE SAME SRC AND DST ELEMENT TYPE CORRUPTS THE DESTINATION
+
+`TCVT(dst, src, CAST_NONE)` where `DstTile::DType == SrcTile::DType` does **not** degrade to a
+copy and does **not** leave `dst` alone. It writes, and what it writes is neither the source
+nor the previous contents. Probed on A2/dav-c220-vec, fp32, a `[1, 512]` tile poisoned with
+`-777` first:
+
+| call | untouched (still -777) | equals src | first 3 outputs |
+|---|---|---|---|
+| `TCVT(fp32 <- fp32)` | **0 / 512** | **0 / 512** | `[-1.0, -1.0, 0.0]` |
+| `TMULS(dst, src, 1.0f)` (control) | 0 / 512 | **512 / 512** | exact |
+| `TCVT` fp32 -> half -> fp32 (control) | 0 / 512 | 0 / 512 | correct round-trip |
+
+Both controls behave, so this is `TCVT`'s identity case specifically, not the probe.
+
+**Rule: never emit a `TCVT` whose src and dst element types are the same.** This bites when
+the dtype is a template parameter and one instantiation happens to collapse -- an
+`if constexpr (!std::is_same_v<Src, Dst>)` guard around the conversion, with a `TMULS(dst, src,
+1)` or a plain tile copy on the else branch, is the fix. It is a **silent** wrong answer: no
+compile error, no assert.
+
+Note how it was found and why it nearly was not: it made the fp32 `D = 1` and `D = 2` paths
+wrong (MERE 7.2e-01) on an operator where **no scored case reaches that path**. The 20-case
+accuracy gate was green. Only an out-of-contract stress sweep exposed it -- which is the
+argument for running one (C61a).
 
 Related skew, same run: `TMADD` and `TMULA` are served by the npu-coding MCP but have **no
 a2a3 implementation in pto-isa `109c9f72`**, and there is **no `TCVT` path for bf16 -> int8**
@@ -2405,6 +2453,44 @@ tmp_cols_needed = max(ElemPerRpt, (ceil(validCol / ElemPerRpt) / 2) * ElemPerRpt
 `TRowReduceCheck` has five `static_assert`s -- Loc, row-major, dst layout, dtype, dtype
 consistency. **None of them mentions `TileDataTmp::Cols`.** `tmpRptStride` is computed from
 `TileDataTmp::Cols`, so a narrow tmp just walks into the next row's scratch.
+
+**C49a -- THE FORMULA ABOVE IS CONSERVATIVE, THE EXACT ONE USES `floor`, AND A ONE-ROW `tmp`
+HIDES THE BUG INSTEAD OF AVOIDING IT.** Re-probed on `rms_norm` over a 137-point sweep of
+(tmp rows, src Cols, tmp Cols, validCol), fp32, A2/dav-c220-vec, rebuilt and re-run
+independently. Three results, in order of importance:
+
+1. **The exact requirement uses `floor` twice and has no minimum:**
+
+   ```
+   tmp_cols_needed = ElemPerRpt * floor( floor(validCol / ElemPerRpt) / 2 )     // 0 when validCol < 2*ElemPerRpt
+   ```
+
+   **0 mispredictions in 117 measurements** with `tmp` rows > 1. The `ceil` + `max(ElemPerRpt, .)`
+   form above over-estimates: at `validCol = 250` it demands 128 where 64 is provably enough,
+   and at `validCol < 128` it demands 64 where **zero** is enough (`FillTmp`'s loop runs zero
+   times, so `tmp` is never written at all).
+
+2. **C49 as written is never UNSAFE** -- across all 137 points there is **no case where the
+   rule says "wide enough" and the answer is wrong** (0/137). Every one of its 29
+   mispredictions is in the safe direction. So keep using it as the design rule; the exact
+   formula is for when you are fighting for UB.
+
+3. **A `tmp` tile with ONE ROW passes every correctness check and is still writing out of
+   bounds.** `FillTmp` addresses `tmp + i * ElemPerRpt` **linearly from the tile base** -- the
+   offset does not involve `TileDataTmp::Cols` at all, which is *why* a narrow multi-row tmp
+   corrupts row 1. With `Rows == 1` there is no row 1 inside the tile to corrupt, so the
+   reduction reads back what it wrote and the answer comes out right: **20/20 one-row cases
+   correct, including `validCol = 8192` with a 64-wide tmp**, while the same `(Cols, validCol)`
+   at `Rows > 1` is wrong by up to **4.8 relative**. That write is 16 KB past the end of a
+   256-byte tile. It only looked correct because nothing else in the probe owned that UB yet.
+   **`Rows == 1` is not an exemption from C49 -- it is C49 failing silently one level further
+   out.** Size the tmp by the formula whatever its row count.
+
+**This also RETIRES the claim "fp32 Vec tile `Cols >= 2048` breaks row reduce".** It does not.
+The first failure in fp32 is at **`validCol = 256` with a 64-wide tmp**, the threshold moves
+with the tmp width exactly as the formula says, and `validCol = 2048` and `4096` are **exact
+(1.1e-7)** once the tmp is sized correctly. The original observation was a correctly-sized-tile
+/ undersized-scratch confusion -- the same mis-attribution C15 had.
 
 Measured directly (fp32, 16 rows, `reports/probe_rowsum_tmpwidth/` in
 `skillyard-runs-v101/moe_gating_top_k_softmax`), max relative error vs a CPU float64 row sum:
