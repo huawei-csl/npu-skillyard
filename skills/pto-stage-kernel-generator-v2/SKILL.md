@@ -2710,6 +2710,47 @@ A zero return code from `call_kernel` means nothing at all here.
 
 ## C52: FOR A SMALL ELEMENTWISE KERNEL, PTO'S GENERIC WRAPPERS ARE THE BOTTLENECK -- CHECK `aiv_icache_miss_rate`
 
+> **C52-BARRIER -- READ THIS BEFORE YOU APPLY C52. THE WRAPPERS WERE ISSUING YOUR INTRA-PIPE
+> BARRIERS. WHEN YOU REPLACE THEM WITH RAW INTRINSICS YOU OWN THAT ORDERING, AND THE FAILURE IS
+> SIZE-DEPENDENT, SO IT WILL PASS EVERY GATE YOU HAVE.**
+>
+> C52 tells you to drop `TLOAD`/`TSTORE`/`TUnaryOp` for raw intrinsics and shows a 3.04x win. It
+> does **not** follow that the wrappers were doing nothing else. They insert the
+> `pipe_barrier(PIPE_V)` between dependent vector issues that C48 requires. Raw intrinsics do not.
+>
+> On `mish`, a chain of 7 dependent raw vector issues with no barriers **validated 20/20 on the
+> contract sweep AND 72/72 on the out-of-contract stress sweep, and was wrong.** One source, one
+> `-D` flip, re-run independently on a fresh build:
+>
+> | chunk | repeats per issue | barriers ON | barriers OFF |
+> |---|---|---|---|
+> | 7680 (the shipped size) | 120 | 20/20 + 72/72 | **20/20 + 72/72 -- bug invisible** |
+> | 512 | 8 | 20/20 | **0/20** |
+> | 256 | 4 | 20/20 | **0/20** |
+>
+> A long issue hides the hazard: by the time the next instruction reads the destination, the
+> previous one has retired anyway. Shrink the issue and **every case** is wrong -- not a few
+> elements, not a tail.
+>
+> **This is why it is dangerous.** Your contract sweep runs at the production chunk, which is the
+> large one, so it reports green. The out-of-contract stress sweep varies SHAPE, which does not
+> change repeats-per-issue, so it reports green too. Nothing in the pipeline varies the chunk.
+>
+> **Rules:**
+> 1. Every dependent raw-vector pair gets a `pipe_barrier(PIPE_V)`. Budget it: on `mish` the
+>    barriers cost **4.3%**, which is the price of the kernel being right.
+> 2. **Ship the barriers behind a compile-time knob** (`-DMISH_VBAR=0/1`, or `sigmoid`'s
+>    `PTO_BARMASK` bitmask, one bit per barrier) so the claim stays reproducible and so a future
+>    run can bisect rather than remove them all at once.
+> 3. **Validate at a SMALL chunk as well as the production one.** A raw-intrinsic kernel that has
+>    only been validated at its production tile size has not been validated. Add at least one
+>    `chunk <= 512` run to the gate.
+>
+> `sigmoid` already had this right -- `PTO_BARMASK` defaults to `0x3F`, all six on, with
+> "all-off is MEASURED INCORRECT, 25/26" in its source. That knowledge sat in one kernel's
+> comments for the whole campaign instead of in this rule, and `mish` paid to rediscover it.
+
+
 `level1/sigmoid` was the worst op in our cann-bench campaign for weeks: score 58.40, **0 of 20
 cases beating the published baseline**, on the simplest op in the benchmark. The store said
 "scalar-bound, cause unresolved."
