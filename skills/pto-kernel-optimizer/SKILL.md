@@ -962,6 +962,32 @@ applied early. What survives is a discriminator and one number, not a recipe:
 the final configuration, single-arm (§3.8), and record the cache state with every number. An
 alias figure quoted without its cache state is not reproducible.
 
+## 3.9a PRICE THE SUSPECT OP BEFORE REWORKING THE SCHEDULE FOR IT
+
+When a kernel sits above its noop floor and a transcendental is the obvious suspect, **price the
+transcendental with its own arm before paying for a schedule rework**. It is one compile.
+
+Build an arm that replaces ONLY the suspect op with a **same-pipe, same-shape** cheap op
+(`TEXP` -> `TMULS(dst, src, 1.0f)`), leaving traffic, tile shapes, barriers, reduces, divides,
+schedule and `block_dim` byte-for-byte identical. Add a THIRD arm from the same edited file with
+the macro expanding back to the original op, so the edit itself is controlled. The cheap op is not
+free, so the delta is a **lower bound**.
+
+Measured on `softmax`, where six cases sat at 1.7x-2.4x of their traffic floor and `exp` looked
+like the reason: **noexp/ctrl geomean 0.9968, range 0.975-1.061** over 8 cases. Removing `exp`
+made one case 6% SLOWER -- physically impossible, so the spread is noise. The two at-floor
+controls priced `exp` at 0.7% and 0.1%, exactly as they should.
+
+**Report the resolution, not just the ratio.** The identical-code arm-to-arm band there was
+0.956-1.025, i.e. +-4.4%, WIDER than any effect measured -- so the honest claim is
+"`exp` < ~4%", not "`exp` == 0". That is still decisive, because an effect hiding under 4%
+cannot explain a 92% gap.
+
+**The value of the probe is highest when it comes back negative**: it converts "rework the UB
+layout and hope" into "the gap is instruction issue, and the rework targets it". A cheap negative
+that redirects an expensive change is worth more than a positive that confirms what you were
+going to do anyway.
+
 ## 3.10 DECIDE KEEP/REVERT ON THE FULL CONTRACT SWEEP
 
 An attempt measured **1.008x at the production point and 0.952-0.965x** where the kernel's
