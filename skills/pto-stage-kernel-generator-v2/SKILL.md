@@ -2204,6 +2204,52 @@ Related skew from the original C40 run, still valid and independently useful: `T
 `109c9f72`**, and there is **no `TCVT` path for bf16 -> int8** (stage through fp32). Verify
 against the headers you compile against, not the index.
 
+## C64: PTO HAS A HARDWARE img2col PATH FOR CONVOLUTION. CHECK IT BEFORE HAND-ROLLING ONE
+
+`pto-isa` at the pinned commit ships a first-class LOAD3D/img2col route and **the skill did not
+mention it at all** until now -- no reference to `TIMG2COL`, `ConvTile`, `SetFmatrix`, `NC1HWC0`
+or `LOAD3D` anywhere in this file or its `references/`. A conv-family run that does not at least
+PRICE this path is leaving the hardware's own convolution feed unused.
+
+The headers are `a2a3/TImg2col.hpp`, `a2a3/SetFmatrix.hpp`, `a2a3/SetImg2colPadding.hpp`,
+`a2a3/SetImg2colRpt.hpp`, with `ConvTile` in `common/pto_tile.hpp`. `TIMG2COL` applies stride,
+padding and dilation **in hardware** while feeding L0A.
+
+**Its constraints, read from the library's own `static_assert`s (`TImg2col.hpp:65-73`):**
+
+| requirement | value |
+|---|---|
+| source tile `Loc` | `TileType::Mat` (L1) |
+| source `layout` | `NC1HWC0` **or** `NDC1HWC0` |
+| destination `Loc` | `TileType::Left` -- **L0A only, never L0B** |
+| destination fractal | `SLayout::RowMajor` and `isRowMajor` |
+| dtypes | `int8_t`, `half`, ... (src and dst DType must match) |
+
+**The catch, and it is the whole decision.** `TLOAD` into a `ConvTile` accepts only
+`NC1HWC0 -> NC1HWC0`, `FRACTAL_Z -> FRACTAL_Z`, `FRACTAL_Z_3D`, or `NDC1HWC0` (`TLoad.hpp:665`).
+So **the hardware path requires the feature map to already be 5HD in GM**. If the benchmark hands
+you NCHW you must convert first, and PTO gives you the converters as Vec tile ops in
+`a2a3/TTrans.hpp` (`TTransConvNCHW2NC1HWC0`, `TTransConvNC1HWC02C1HWNC0`, and the grouped
+variants). That conversion is not free -- it is exactly the "layout tax" the vendor pays.
+
+**So the rule is: price BOTH routes before committing, and say which you chose and why.**
+1. hardware img2col: layout conversion + `TIMG2COL` + `TMATMUL`;
+2. a channel-major formulation that keeps the activation in its given layout and expresses the
+   convolution as `Kh*Kw` ordinary GEMMs with plain `ND2NZ` `TLOAD`s -- no activation transpose
+   at any point.
+
+Route 2 avoids the layout tax entirely but does more GEMM calls; route 1 gets hardware
+stride/pad/dilation but pays for 5HD. Which wins is a measurement, not a principle, and it will
+depend on how much of the operator's time the conversion actually is. **Measure the vendor's own
+kernel list first** (`Conv2D` alongside `TransData`/`Cast` tells you what the layout tax costs
+*it*), then price your own conversion at the same shapes.
+
+**And note what `t_hw` is for the conv family: a COMPUTE roofline, not a memory one.** Fitted
+across all 20 `level3/conv_2d` cases with **zero** error: `t_hw = FLOPs / 354e12` for 16-bit and
+`FLOPs / 86e12` for fp32, floored at 1.0 us. So **HAP 1.0 is Cube peak** and HAP 0.5 is whatever
+the vendor achieves -- on that benchmark the real baselines sit at 1.2x-2.8x of peak, i.e. the
+vendor runs at 36-83% of the Cube. Budget against Cube utilisation, not bandwidth.
+
 ## C63: `TCVT` WITH THE SAME SRC AND DST ELEMENT TYPE CORRUPTS THE DESTINATION
 
 `TCVT(dst, src, CAST_NONE)` where `DstTile::DType == SrcTile::DType` does **not** degrade to a
