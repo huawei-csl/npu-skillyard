@@ -962,6 +962,30 @@ applied early. What survives is a discriminator and one number, not a recipe:
 the final configuration, single-arm (§3.8), and record the cache state with every number. An
 alias figure quoted without its cache state is not reproducible.
 
+## 3.8a A NOOP FLOOR BOUNDS THE SCHEDULE YOU HAVE, NOT THE PROBLEM
+
+The noop floor -- same loads and stores, arithmetic stripped -- is the right tool for "is the
+arithmetic free?" (it is, nearly always; see 3.9a). It is the WRONG tool for "am I done", and
+used that way it reports finished on a kernel that is orders of magnitude off.
+
+Measured on `swi_glu`: the v1 floor table put cases 9 and 12 at **1.05x and 1.00x of their own
+floors**, which reads as finished. Those floors were **65x and 586x away from the machine**,
+because the v1 schedule was moving the wrong bytes -- a floor computed from the traffic your
+current schedule happens to issue inherits every mistake in it. The next attempt bought
+**+4.09 operator points**.
+
+**Report two columns, not one:**
+
+| column | question it answers |
+|---|---|
+| `ours / noop` | is there overhead inside this schedule? |
+| `noop / machine` | **is this schedule the right one at all?** |
+
+where `machine` = the operator's COMPULSORY bytes (not the bytes your kernel moves) divided by a
+streaming rate you have measured yourself, plus the measured launch cost. Attack the largest
+`noop / machine` first. A case at `ours/noop = 1.00` with `noop/machine = 586` is the single
+biggest opportunity on the board and the one-column view hides it completely.
+
 ## 3.9a PRICE THE SUSPECT OP BEFORE REWORKING THE SCHEDULE FOR IT
 
 When a kernel sits above its noop floor and a transcendental is the obvious suspect, **price the
