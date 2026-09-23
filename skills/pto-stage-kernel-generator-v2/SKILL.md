@@ -2204,6 +2204,55 @@ Related skew from the original C40 run, still valid and independently useful: `T
 `109c9f72`**, and there is **no `TCVT` path for bf16 -> int8** (stage through fp32). Verify
 against the headers you compile against, not the index.
 
+## C65: PTO HAS HARDWARE SORT PRIMITIVES. AN ITERATIVE top-k IS O(k) PASSES AND IT SHOWS
+
+`pto-isa` at the pinned commit ships `a2a3/TSort32.hpp` (`TSORT32`, lowering to **`vbitsort`**)
+and `a2a3/TMrgSort.hpp` (`TMRGSORT`, lowering to **`vmrgsort4`** with `get_vms4_sr()`), and this
+skill mentioned **neither** until now. The sort/select family is the archetype most likely to be
+hand-rolled badly, because the naive form is easy to write and its cost is invisible at small `k`.
+
+**The failure signature to look for in your own per-case table: time that scales with `k`.**
+On `level3/moe_gating_top_k_softmax` the previous attempt (63.69) ran an iterative
+find-max-then-mask, i.e. `k` passes over `E` experts, and the per-case ratio against the baseline
+tracks `k` almost perfectly:
+
+| k | 1 | 8 | 16 | 64 | 128 |
+|---|---|---|---|---|---|
+| ours / baseline | **1.17x** | 0.97x | 0.10x | 0.10x | **0.06x** |
+
+At `k = 1` it wins. At `k = 128` it is 17x slower than a baseline that is itself a clamped proxy.
+A selection algorithm whose cost is `O(E log E)` once -- or a partial/bitonic selection -- does
+not have that shape.
+
+**`TSORT32` (`TSort32.hpp:144-153`):**
+
+| requirement | value |
+|---|---|
+| dst / src DType | `half` or `float` (and they must match) |
+| index DType | **`uint32_t`**, no other |
+| all tiles `Loc` | `TileType::Vec` |
+| layout | all three row-major |
+
+It sorts in blocks of 32 and carries the indices with the values, which is exactly what a top-k
+needs -- you want `(value, original_index)` pairs, and the op's second output is the index.
+
+**`TMRGSORT` (`TMrgSort.hpp:172-201`) merges up to FOUR sorted runs:**
+
+| requirement | value |
+|---|---|
+| dst DType | `half` or `float`; tmp must match |
+| Rows | **every tile must be `ONE_ROW`** |
+| UB | `tmpSize + Src0::Cols*elemSize <= UB_SIZE`, and each further src `Cols*elemSize <= UB_SIZE` -- **`static_assert`ed, so an oversized merge is a compile error, not a silent truncation** |
+
+So the standard shape is `TSORT32` to make 32-element sorted runs, then a `TMRGSORT` tree (4 runs
+at a time) to merge up to the width you need, then take the first `k`. Budget the tmp tile: the
+`static_assert` will tell you if you got it wrong, which is a kindness this library does not
+always extend.
+
+**Rule: for any top-k, arg-max-of-k, sort, median or selection stage, PRICE THE HARDWARE SORT
+against your iterative form before shipping the iterative one, and put the `k`-scaling in the
+report.** If your time grows with `k`, say so and say why you kept it.
+
 ## C64: PTO HAS A HARDWARE img2col PATH FOR CONVOLUTION. CHECK IT BEFORE HAND-ROLLING ONE
 
 `pto-isa` at the pinned commit ships a first-class LOAD3D/img2col route and **the skill did not
