@@ -4270,3 +4270,32 @@ and it is what bounds the work.
 arm scored **8 fail->pass / 7 pass->fail**, the *same* as the maximally accurate arm (8/6) and
 **better** than full fp64 (3/21). When the target is a specific rounding, the outcome is bit-luck --
 see **C115**. Changing **only** the GEMM association cost **23 passes**.
+
+## COOK-26 -- C52 must be probed PER CALL-SITE CLASS, not per library
+
+MEASURED, two independent probes on the same operator, and the second overturned the generalisation
+drawn from the first.
+
+**The arithmetic wrappers are free.** `TADD`/`TMUL`/`TMULS` and friends measured **identical** to the
+raw intrinsics -- 0.1803 vs 0.1799 us/iter across 3 op families x 3 widths. A probe of those call
+sites correctly returns "no wrapper overhead".
+
+**The DMA wrappers are not, and the cost is in the call COUNT, not the call.** A `load_as_f32` helper
+chunked every load into 512-element pieces, each one a full `TLOAD` wrapper invocation carrying a
+runtime triple loop over `gShape0/1/2` (~1.3 us each). A single 64 KB weight block therefore cost
+**32 wrapper calls**. Replacing that with one bulk raw DMA was **+44% on the whole kernel** -- the
+single decisive change in a six-build optimisation sequence (0.06398 -> 0.09199 avg_speedup), larger
+than every other arm combined.
+
+**Rule:** "the wrappers are free" is a claim about a *call-site class*, never about the library. Probe
+arithmetic and DMA separately, and for DMA probe the **number of wrapper invocations per logical
+transfer** rather than the per-call cost -- a helper that silently fragments one transfer into N calls
+is invisible to a per-call benchmark. Related: **C52**, and the barrier-ownership transfer that a raw
+intrinsic swap brings with it.
+
+**Companion machine constants from the same session** (card 6, 1800 MHz), useful for any latency-bound
+kernel: a dependent Vec op costs **20-25 cycles with a barrier and 0.0000 us/op without one** -- the
+barrier IS the cost, shown by a null arm, not argued. Two independent chains sharing one barrier per
+pair measure **2.0-2.4x** against a control that barriers after each. Launch floor is **1.08 us** for
+a `dav-c220-vec` noop against **3.49 us** for a MIX noop, i.e. a **+2.41 us MIX toll** -- so a
+single-engine launch is worth real time before any arithmetic runs.

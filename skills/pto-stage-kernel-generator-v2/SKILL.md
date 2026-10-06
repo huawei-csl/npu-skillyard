@@ -6474,11 +6474,21 @@ bit-identical on the small-argument path by construction (`d == 0` exactly there
 ```cpp
 TSUB(w, z, zs);          // d = z - zs : EXACTLY 0 where zs == z
 TMUL(w, w, w);
-TMULS(w, w, -1.0e6f);
+TMULS(w, w, -1.0e16f);   // SIZE THIS CONSTANT -- see below; 1e6 is too soft
 TADDS(w, w, 1.0f);
-TMAXS(w, w, 0.0f);       // 1.0 at |d|==0, exactly 0.0 for |d| >= 1e-3
+TMAXS(w, w, 0.0f);       // 1.0 at |d|==0, exactly 0.0 once kM*d^2 >= 1
 TMUL(dst, dst, w);       // d^2 overflowing to inf still yields gate 0
 ```
+
+**Size the gate multiplier `kM` deliberately -- `1e6` leaks.** The gate is `max(0, 1 - kM*d^2)`, so it
+only reaches 0 once `|d| >= 1/sqrt(kM)`: that is **1e-3 at kM=1e6** but **1e-8 at kM=1e16**. With
+`kM=1e6` the correction is still applied at ~99% strength at `|d| = 1e-4`, so the full ~6e-08 leak
+survives across `|z| in (0.25, ~0.251]` -- narrow, but exactly the band the gate exists to kill.
+MEASURED on a second independent implementation of this same operator: at `1e6` a **select**-form gate
+returns `tanh(0.25)` instead of `tanh(z)` for `|d|` up to 1e-3, worth **~9e-04** -- four orders worse
+than the leak being fixed. **Use `1e16`**, and note the error is worse for a *select* gate (which
+blends two different formulas) than for an *additive* one (which merely scales a small correction),
+so a select form needs the larger constant more urgently.
 
 **And the limit of the whole exercise, measured -- read this before budgeting accuracy work.** At a
 **catastrophic-cancellation position** (`c = f*c_prev + i*g` where two O(1) terms cancel to a few
