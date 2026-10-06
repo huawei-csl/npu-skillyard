@@ -4211,3 +4211,62 @@ Check the dtype decision and the residency decision together.
 **The L1-eviction half of this is a HYPOTHESIS, not a measurement.** That re-loading the weight
 actually evicts it, rather than hitting in L1, has not been measured on our part -- do not quote a
 cost for it without a two-arm probe.
+
+## COOK-§25: A `torch.nn.*` REFERENCE MAY BE A **FUSED oneDNN PRIMITIVE**, NOT THE OP COMPOSITION ITS SOURCE SHOWS
+
+**Before treating a read of PyTorch's source as the specification, check which backend actually ran.**
+`torch.nn.LSTM` on CPU **with mkldnn enabled (the default)** dispatches to **oneDNN's fused RNN
+primitive**. The Python/ATen composition in `RNN.cpp` is the *fallback*, and reading it gives a
+specification the reference never executes.
+
+Measured, five shapes:
+
+| `torch.backends.mkldnn.flags` | op-for-op transcription of `RNN.cpp` vs the golden |
+|---|---|
+| **disabled** | **bit-identical** -- 0/256, 0/32, 0/12, 0/1024, 0/4096 differ |
+| **enabled (default)** | **41-68% of elements differ** |
+
+**The check is one line:** run the reference under
+`with torch.backends.mkldnn.flags(enabled=False):` and compare against the default. If they differ,
+the source is not the spec.
+
+**And a clean way to isolate WHICH part differs:** choose weights that make the linear algebra an
+identity. With `Wi = I, Wh = 0, b = 0` the preactivation is `z == x` **exactly under any accumulation
+order**, so no GEMM is involved -- any remaining mismatch is purely the activations. That isolation
+showed `at::sigmoid`/`at::tanh` differing from the golden on **43%** of elements, i.e. the fused
+primitive uses its own activations.
+
+### Reading a fused reference's internals out, bit-for-bit
+
+Two techniques that worked and are reusable whenever a reference is a black box:
+
+1. **Force a gate to exactly 0 or 1 with a +/-200 preactivation.** A saturated gate makes one term of
+   the recurrence vanish exactly, which exposes a single internal activation's output bit-for-bit
+   even though the primitive is fused.
+2. **Use `float128` to emulate exact fp32 FMA chains** when identifying an accumulation order. It
+   lets you enumerate candidate orders and test each for bit-equality against the reference.
+
+### What this cost, and the bound it produced
+
+oneDNN's LSTM turned out to use **one continuous strictly sequential fp32 FMA chain** over `[x ; h]`,
+with the recurrent GEMM **continuing the input projection's accumulator** (`beta=1`), the **summed**
+bias added once after the chain, the logistic as exactly `1/(1 + expf(-z))` with glibc `expf`
+(bit-equal, 0/8192), the cell update as a **single-rounding** `FMA(f, c_prev, i*g)`, and a **tanh that
+could not be identified at all** -- not libm `tanhf`, not `at::tanh`, not correctly-rounded, not
+`2L(2z)-1`, no exp form, no classic Pade; +/-2 ulp, 90% exact, deviation concentrated at `|z| < 1`
+and **exactly zero for `|z| >= 4`**.
+
+Assembling the identified pieces with the tanh supplied from a probe **reproduced the golden
+bit-identically end-to-end at B <= 4** (0/512, 0/1536, 0/768). **But at B = 8 and B = 10 no candidate
+order matched** (best 28/256) -- oneDNN switches microkernel above B = 4.
+
+**The lesson for deciding whether to chase bit-exactness at all: split the failing set by the axis the
+reference changes implementation on.** Here failures by batch size were **B=4: 1 of 85; B=6: 0;
+B=8: 67; B=10: 17** -- so **99% sat in the regime where the order was NOT identified**, and unlimited
+effort on the identified regime would have addressed **one** failure. That split is cheap to compute
+and it is what bounds the work.
+
+**And a negative control that settles the "be more accurate" instinct:** a deliberately **1-ulp-wrong**
+arm scored **8 fail->pass / 7 pass->fail**, the *same* as the maximally accurate arm (8/6) and
+**better** than full fp64 (3/21). When the target is a specific rounding, the outcome is bit-luck --
+see **C115**. Changing **only** the GEMM association cost **23 passes**.
