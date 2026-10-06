@@ -271,6 +271,47 @@ smaller footprint goes far faster:
 |---|---|---|---|---|
 | GB/s | 4600 | 3393 | 1659 | **919** |
 
+### BEFORE THE DECISION RULE: PROVE THE ALIAS ACTUALLY APPLIED  🔴
+
+**`rtGetL2CacheOffset` returns `rc = 0` (SUCCESS) with `*offset = 0` for any device that is not
+the caller's current one.** Probed from a process on device 4:
+
+```
+rtGetL2CacheOffset(0) rc=0 off=0x0              <- SUCCESS, and USELESS
+rtGetL2CacheOffset(4) rc=0 off=0x80000000000    <- only the CURRENT device
+```
+
+So a kernel that passes a **literal device id** gets 0 back on every device but that one, the
+`if (off)` guard falls through to the cached path, and **the whole lever silently does nothing --
+with no error and no diagnostic.**
+
+**Measured consequence, 2026-09-28.** `sigmoid` shipped this lever **off** on the strength of a
+source comment reading *"PTO_L2ALIAS MEASURED neutral in the FINAL config (optimizer 3.9)"* -- a
+measurement taken on device 6, where the knob did not exist. Wiring it correctly and gating it at
+64 MiB moved the operator's **hidden score from 68.04 to 89.06 (+21.0)**; `gelu`, the same fix,
+**67.53 to 86.36 (+18.8)**.
+
+**Three more trees carry the identical literal** and their alias defaults are therefore unvalidated
+in BOTH directions: `foreach_addcdiv_scalar` (`kernel_fa.cpp:419`),
+`dequant_swiglu_quant` (`kernel_dsq.cpp:904`), `rms_norm` (`kernel_rms_norm.cpp:1085`).
+
+**The sting that hides it from a scored run:** the evaluator runs **logical device 0**, so the
+literal *works there*. What it breaks is **your own measurement** on devices 1-7 -- which is exactly
+where every A/B in this campaign is run.
+
+**How to verify, and it is not optional.** Query the runtime for the **current** device and assert a
+non-zero offset; or probe `rtGetL2CacheOffset(cur)` directly and print it. **A knob that measures
+EXACTLY neutral is a reason to check whether it ran**, not evidence that it does not help. Same
+family as the `PTO_DBUF` finding (a lever that only reserved memory, hiding a 1.94x fix behind
+"double buffering rejected") and the `moe_gating` C66 fix that scored +0.12 because the Python
+wrapper was never called.
+
+**And the local score understates it when the visible cases are small.** With a size gate, the cases
+below it take a byte-identical path and contribute nothing: 14 of `sigmoid`'s 20 visible cases sit
+under 64 MiB, so the local evaluator moved only **+0.73** while the 80-case hidden set -- which skews
+larger -- moved **+21.0**. Do not price a size-gated lever on a case set that is mostly below the
+gate; price it per case above the gate, or on the distribution that will actually score it.
+
 **When to apply the bypass alias — the decision rule is measured.** Bypass pins the read
 rate at ~1530 GB/s *regardless of footprint*; the cached path is faster than that only
 while the working set fits L2. Same code, same 469.8 MB of load traffic, varying only the

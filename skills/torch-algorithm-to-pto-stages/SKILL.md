@@ -73,6 +73,67 @@ length, batch, head count). Record `locked_reason` when known. Downstream genera
 may DISCOVER a new constraint and amend the contract -- that feedback must be
 preserved, never used to silently override a user-supplied value.
 
+### A CORRECTNESS SHAPE IS NOT A DOMAIN -- the tier certifies the VALUE, never the RANGE
+
+This is the twin of the section below, it has the same root cause, and it was missed for longer.
+
+**Tier 1 means "this value is evidenced in the provided material." It says NOTHING about whether
+the provided material covers the operator's domain.** When the material is a test file or a case
+table, the evidenced values ARE the sample -- so a contract can be Tier 1 on every dim, pass the
+autonomy gate at `confidence: high`, and still describe a domain far narrower than the operator's.
+The gate meant to prevent guessing then **certifies the fitted set**.
+
+Every downstream gate inherits the error. The coverage gate checks the validated dims against *the
+contract*; if the contract is fitted, the gate passes on a kernel that refuses most of its declared
+input space. **A gate cannot detect an error in its own reference.**
+
+**Measured cost across one campaign: seven operators, up to 71% of the declared surface refused.**
+
+| operator | spec declares | the kernel accepted | refused |
+|---|---|---|---|
+| `mha` | `D` 64~256 (64-aligned), `S` 1~2048, `S_kv` 1~4096 | `D` in {64,128,256}, `S` in {1,2} or %128, `S_kv` %128 | **476 of 673** |
+| `softmax` | last axis 1~2097152 | `R <= 12288` | 8 hidden cases |
+| `rms_norm` | `D` 1~16384 | `D <= 8192` | latent, caught pre-submission |
+| `adaptive_avg_pool_3d` | `W` 1~256, `output_size` 1~128 | `W` in {16,32,64,128,144}, `OH/OW <= 64` | 3 hidden cases |
+| `engram_gate_fusion` | `D` 64~2048, `K` 1~16 | refuses `D` 192/100/255, `K` 9/12/16 | 8 of 41 |
+| `conv_2d` | `K_h` 1~16 | `khkw` in {1,9,25} | 3 hidden cases |
+| `grouped_matmul` | bias dtypes incl. bf16 | bf16 bias unimplemented | 23 hidden cases |
+
+#### The rule
+
+**Where the material DECLARES a range, that range is the contract. The exercised values are a
+sample OF it, never a substitute FOR it.**
+
+1. Record a dim's **range** with its own tier, separately from its benchmark value. A range is
+   Tier 1 only when the range itself is stated -- a support-range table, a docstring bound, a
+   dtype's limits. **Enumerating the values a test happens to use is Tier 3 for the range**, no
+   matter how solidly each value is evidenced.
+2. Read the spec for a column that names what the cases exercise. `desc.md` often carries
+   `cases.csv 实测` beside each declared bound -- the gap between those two columns is precisely
+   the domain the sample omits, handed over for free.
+3. When the declared range is wider than anything you can validate, the contract still takes the
+   **declared** range. The untested part becomes an explicit evidence gap in the report -- not a
+   narrower contract, and not a rejection path.
+
+#### The stopping condition, which already existed
+
+`agents/stage-pipeline.md` already says: *"Discovered constraint -> amend the contract, do not
+silently work around it,"* and Phase 0 says to STOP if a user-confirmed dim is infeasible.
+**Emitting `rc=-2` for a shape the spec declares IS silently working around it.** It was done seven
+times and nothing stopped, because the rejection looked like a guard rather than a contract change.
+
+So, explicitly: **a rejection path for a DECLARED shape is a contract amendment. Surface it and
+STOP.** A loud rejection is better than a wrong answer, and that is exactly why it is easy to
+mistake for diligence -- it is the correct handling of an *undeclared* input and a silent narrowing
+of a *declared* one. Which it is depends on the spec, not on the code.
+
+#### And "it would risk the passing cases" is not a reason to ship it
+
+The honest framing: the visible cases are a sample. A kernel that passes the sample and refuses most
+of the declared domain has not banked a safe result -- it has moved the risk somewhere nobody is
+measuring. If widening the domain genuinely endangers a validated schedule, that is a **reason to
+report the conflict and stop**, not a reason to ship the narrow kernel and record a pass.
+
 ### A CORRECTNESS SHAPE IS NOT A BENCHMARK SHAPE -- the sweep must be able to discriminate
 
 Tier 1 is the gold standard for CORRECTNESS, and it is a **trap for PERFORMANCE**. The

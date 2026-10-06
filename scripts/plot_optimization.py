@@ -55,21 +55,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-BUDGET_DEFAULT = 25
-
-
 def _budget(doc, att):
     """Budget comes from the JSON, never from a constant in this file.
 
     A hard-coded budget silently CLIPS a campaign that ran longer: one run made 24
-    attempts against a nominal 15 and lost attempts 11-24 off the chart. And the
-    constant goes stale every time the mandate changes. Take the declared budget if
-    the campaign wrote one, and always stretch to cover the attempts actually made,
-    so nothing measured is ever dropped.
+    attempts against a nominal 15 and lost attempts 11-24 off the chart. Always
+    stretch to cover the attempts actually made, so nothing measured is dropped.
+
+    The other direction was just as wrong. A stale default (25) let a campaign whose
+    mandate was 40 render "budget not used (11 of 25)" -- a shortfall measured against
+    a number NOBODY DECLARED, and understating the real one. There is no safe default,
+    because the mandate moves every time the brief does. So when the campaign declares
+    no budget we plot the slots it used and SAY the budget is undeclared, rather than
+    inventing empty ones. Returns (budget, declared).
     """
-    declared = doc.get("budget") or doc.get("attempt_budget") or BUDGET_DEFAULT
+    declared = doc.get("budget") or doc.get("attempt_budget")
     highest = max((a.get("n") or 0) for a in att) if att else 0
-    return max(int(declared), int(highest))
+    if not declared:
+        return max(1, int(highest)), False
+    return max(int(declared), int(highest)), True
+
+
 KEPT_C, DROP_C, LINE_C = "#2f5d3a", "#a33", "#4a6fa5"
 BAD_C, DIAG_C = "#c1121f", "#888"
 
@@ -126,7 +132,7 @@ def plot(doc, out_png):
               % (out_png, len(unmeasured)), file=sys.stderr)
         return False
 
-    budget = _budget(doc, att + unmeasured)
+    budget, declared = _budget(doc, att + unmeasured)
     stage = doc.get("stage", "stage")
     arch = doc.get("archetype", "?")
     xs = [a["n"] for a in att]
@@ -176,8 +182,12 @@ def plot(doc, out_png):
 
     if base is not None:
         ax.axhline(base, color="#888", ls=":", lw=1.2, zorder=1)
-        ax.annotate("baseline %.3f" % base, xy=(0.015, base),
-                    xycoords=("axes fraction", "data"), va="bottom", ha="left",
+        # Anchored to the RIGHT edge because the parity label owns the left one.
+        # A baseline AT parity (nms: baseline 1.000) overprinted "vendor parity"
+        # into unreadable mush -- and that is exactly the case a reader most needs
+        # to read, since it says the campaign started level with the vendor.
+        ax.annotate("baseline %.3f" % base, xy=(0.985, base),
+                    xycoords=("axes fraction", "data"), va="bottom", ha="right",
                     fontsize=8.5, color="#666")
 
     for a, k, c, dg in zip(att, kept, ok, diag):
@@ -197,7 +207,7 @@ def plot(doc, out_png):
     ax.annotate("vendor parity", xy=(0.015, 1.0), xycoords=("axes fraction", "data"),
                 va="bottom", ha="left", fontsize=9, color="#333")
 
-    # Always show all 25 slots: an early stop should be VISIBLE as unused budget.
+    # Show every declared slot: an early stop must be VISIBLE as unused budget.
     ax.set_xlim(0.4, budget + 0.6)
     ax.set_xticks(range(1, budget + 1))
     # SKILL 3.5 defines an attempt as "a change WITH a paired re-measurement", and a
@@ -208,7 +218,7 @@ def plot(doc, out_png):
     # occupied, so take the highest attempt index present rather than a count -- that
     # also keeps the shading right when indices are sparse.
     used = max([a["n"] for a in att] + [a["n"] for a in unmeasured] + [0])
-    if used < budget:
+    if used < budget and declared:
         ax.axvspan(used + 0.5, budget + 0.6, color="#bbb", alpha=.14, zorder=0)
         ax.annotate("budget not used (%d of %d)" % (used, budget),
                     xy=((used + 0.5 + budget + 0.6) / 2, 0.965),
@@ -220,13 +230,14 @@ def plot(doc, out_png):
         for a in unmeasured:
             ax.plot(a["n"], top, marker="$?$", ms=11, color="#777", zorder=3)
         warn.append("? = attempt produced no measurement (build or validation aborted)")
-    ax.set_xlabel("optimization attempt  (budget %d)" % budget)
+    ax.set_xlabel("optimization attempt  (budget %d)" % budget if declared
+                  else "optimization attempt  (budget undeclared -- %d used)" % budget)
     ax.set_ylabel("latency ratio  ours / vendor   (lower is better)")
     stop = doc.get("stop_reason", "unspecified")
     sub = "stop: %s" % stop
     if stop == "hardware_limit":
         sub += "  --  gate %s: %s" % (doc.get("gate", "?"), doc.get("gate_value", "?"))
-    elif used < budget and arch == "mixed":
+    elif used < budget and declared and arch == "mixed":
         warn.append("PROCESS FAILURE: a mixed stage must run all %d attempts" % budget)
     lines = textwrap.wrap(sub, 110)
 

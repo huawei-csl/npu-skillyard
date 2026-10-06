@@ -86,6 +86,11 @@ variant; do not bake in any one algorithm's dimension names.
 2. **Otherwise research and propose.** Apply the `torch-algorithm-to-pto-stages`
    skill's "Shape & Precision Contract" process: assign every dimension and the dtype
    a **value + source tier**:
+   **A dim has TWO tiers: one for its benchmark VALUE and one for its RANGE.** A range is
+   Tier 1 only when the range itself is stated; enumerating the values a test happens to use is
+   **Tier 3 for the range** however well each value is evidenced. Fitting a contract to the
+   exercised values is the single most expensive defect this pipeline has produced -- see
+   "A CORRECTNESS SHAPE IS NOT A DOMAIN" in `torch-algorithm-to-pto-stages`.
    - Tier 1 (high): explicit in the source -- arg defaults, docstrings, `__main__`,
      shape literals in adjacent test/benchmark files, a config the source reads.
    - Tier 2 (medium): the algorithm is a recognizable family member and the value
@@ -372,6 +377,64 @@ requested AND Phase 6 produced a baseline.
    the contract's top size, WIDEN its case list and re-run before recording PASS.
    A "passed" stage whose top contract size was never executed is a silent
    coverage hole, not a pass.
+   **And the contract is not self-certifying.** This gate compares the validated dims to the
+   CONTRACT; if the contract was fitted to the shapes the source happened to exercise, the gate
+   passes on a kernel that refuses most of its declared input space -- a gate cannot detect an
+   error in its own reference. So before recording PASS, compare the contract's ranges to the
+   ranges the SPEC DECLARES (a support-range table, a docstring bound, a dtype's limits). If the
+   contract is narrower, the contract is wrong, not the spec. Measured: seven operators shipped
+   this way, one refusing 476 of 673 declared combinations.
+   **Robustness gate (C67-C76): the contract sweep is a sample, and the external
+   scorer runs a hidden case set 4x its size that deliberately probes the edges the
+   sweep omits.** Twelve operators have been through it; six failed, and every
+   failure was one of five classes. Before recording PASS, answer all five in the
+   report -- each is a 5-point-per-case loss because the score scales by the pass
+   fraction, `(20+30)*k/N + 50*sum(HAP)/N`:
+   0a. **RUN THE C76 STATIC CAP AUDIT FIRST.** No device, no execution, no credit: put
+      `desc.md`'s support-range table beside every numeric constant in your own source, and
+      justify each cap that sits BELOW a declared maximum. A cap that selects a TILE is fine; a
+      cap that gates a REJECTION is a fitted contract and a defect. This single check would have
+      caught `softmax` (R 12288 vs a declared 2097152), `adaptive_avg_pool_3d` (W 144 vs 256),
+      `conv_2d` (khkw enumerated) and `grouped_matmul` (bf16 bias) before any of them cost a
+      credit -- the C72 probe below missed all four because it varies dtypes, and these live on
+      the shape and attr axes. `skillyard-cannbench/tools/declared_vs_cap_audit.py` mechanises
+      the triage; you still read each hit. Prefer a runtime-tiled path to a longer
+      instantiation list, and if you keep a ladder, put a general fallback beneath it.
+   0b. **RUN THE C72 DECLARED-SURFACE GATE.** This is mechanical and costs nothing, and it
+      catches the dtype axis that 0a does not:
+      `python3 skillyard-cannbench/tools/declared_surface_probe.py <task_dir> <op> --install <dir>`
+      It forms the cross product of every dtype and attr enum `proto.yaml`/`desc.md` DECLARE and
+      asserts the operator ACCEPTS each one. Report the combination count and the rejection
+      count. Zero rejections, or a written justification per rejection citing the spec. A
+      declared dtype you have not implemented is a MISSING FEATURE, not an unsupported input.
+   1. **Is the SUPPORTED set derived, or enumerated?** A lookup table of shapes is
+      not a dynamic-shape kernel. Every bound must trace to the declared family in
+      `desc.md`/`proto.yaml`, not to an observed case -- including the bound's
+      GRANULARITY (a "64-aligned" bound fitted to cases that happened to be
+      64-aligned is the same defect one level down). C44's clean-rejection probe
+      does NOT answer this; it verifies boundary behaviour, not boundary location.
+   2. **Does any torch compute op sit on the kernel path?** The evaluation image
+      does not serve every aclnn op (`ZerosLike`, `aclnnCast`, `aclnnMuls`,
+      `aclnnInplaceCopy_1_Broadcast` all missing). Use `torch.empty` + one H2D
+      `.copy_()` from CPU, or pad-and-slice. Never a broadcast copy. And if the
+      plugin registers a `TORCH_LIBRARY` op, the Python driver is DEAD CODE -- the
+      fix has to be in C++.
+   3. **What does each folded constant evaluate to at every scalar attr endpoint?**
+      `beta1/beta2 in {0,1}`, `epsilon=0`, `step=0`, `lr=0`, `scale=0`. The
+      signature of this bug is `MERE = MARE = 0.000000` with a NaN-POSITION
+      mismatch: every finite element bit-exact.
+   4. **Has every input been swept to the limits of its DECLARED dtype**, not the
+      observed data's range? "No case in the sweep reaches it" has now cost five
+      operators. Build a local probe over the benchmark's own `DataGenerator` +
+      `compare_tensors` at those limits -- it costs no credits and has found
+      defects a paid hidden run did not reveal.
+   5. **If the kernel writes a status word, does the driver READ it?** An unread
+      sticky flag turns a detectable rejection into a silent wrong answer.
+   Record the answers next to the contract sweep. A device fault inside an ACCEPTED
+   shape (`507035`/`507015`, surfaced by torch_npu with misleading "timeout"
+   wording) is not an out-of-contract rejection -- and one fault cascades: 6 real
+   faults became 35 reported failures once 29 later cases were skipped, so count
+   real faults before sizing a defect.
    **Reference precision:** the metric is only as good as its reference. The NPU
    has no float64 -- `.double()` on an NPU tensor silently downcasts to fp32 -- so
    the authoritative gate must compute the numerical reference on CPU in float64
@@ -409,6 +472,13 @@ requested AND Phase 6 produced a baseline.
      also REQUIRES the DCCI flush (COOK-§8.6). Run-to-run variance is a coherency
      race, not a logic bug -- surgical edits to the same handshake will not fix it.
    - **Discovered constraint -> amend the contract, do not silently work around it.**
+     **A rejection path for a DECLARED shape IS working around it.** Returning `rc=-2` for an
+     input the spec allows is a contract amendment wearing the costume of a guard: it is the
+     correct handling of an UNDECLARED input and a silent narrowing of a DECLARED one, and which
+     one it is depends on the spec, not on the code. Surface it and STOP. "Widening it would risk
+     the cases that pass" is a reason to report the conflict, never a reason to ship the narrow
+     kernel and record a pass -- the passing cases are a sample, so that trade does not remove the
+     risk, it relocates it to where nobody is measuring.
      If a repair reveals that a contract dimension cannot be honored (a chunk/tile
      size that will not compile, a layout fixed to one width), record it: set that
      dim `locked: true` with a `locked_reason` in `stage_plan.json`'s `shape_contract`

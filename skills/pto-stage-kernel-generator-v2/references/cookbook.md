@@ -1961,6 +1961,23 @@ A run reported the table as "backwards" on the theory that the library selects
 do differ on that path (RowMajor vs ColMajor) and no transpose occurs. Do not
 "fix" this table.
 
+> **CORRECTION, 2026-09-24 -- branch (b)'s SHAPES were wrong too, found independently
+> by two runs with hardware probes.** The old text reshaped an `L1Mat<half,K,N>` into an
+> `L1MatZN<half,K,N>` -- the SAME extents -- which transposes nothing unless K == N.
+> The rule is `L1Mat<T,R,C>` -TRESHAPE-> `L1MatZN<T,C,R>` -> `TileRight<T,C,R>`:
+>
+> * v123 `gqa`, dav-c220-cube vs an fp64 reference:
+>   `L1Mat<T,K,N> -> TileRight<T,K,N>` = `A @ B` at 5.33e-08 (fp16) / 5.09e-08 (bf16);
+>   `L1Mat<T,R,C> -TRESHAPE-> L1MatZN<T,C,R> -> TileRight<T,C,R>` = `A @ src^T` at
+>   4.71e-08 / 6.04e-08. Without the exchange `Q @ K^T` is not expressible at all.
+> * v122 `gru`, independently: `A[M,K] @ W[N,K]^T` with W row-major `[N,K]` is
+>   `L1Mat<T,N,K>` -> `L1MatZN<T,K,N>` -> `TileRight<T,K,N>`, exact to 2.75e-07.
+>   It noted the same-shape spelling "is what a reader tries first and it does not
+>   type-check against the load".
+>
+> The (a)/(b) branch split below is unchanged and still correct; only branch (b)'s
+> declared shapes were wrong.
+
 **What that run actually hit is the SNIPPET BELOW, which is wrong.** It performs
 the *transposed* feed (`TRESHAPE` to `L1MatZN`, then `TEXTRACT`) unconditionally,
 in a section whose table is about the untransposed case. Follow the snippet blindly
@@ -1987,10 +2004,15 @@ for a plain `C = A @ B` and you get `B^T`. Pick the branch that matches your mat
     //     L1Mat. No TRESHAPE, no L1MatZN. Hardware-verified above.
     TEXTRACT(_l0b, b_l1, 0, 0);
     //
-    // (b) C = A @ B^T -- only when your maths actually wants B transposed:
-    //     L1MatZN<half, K, N> _bzn;
-    //     TRESHAPE(_bzn, b_l1);
-    //     TEXTRACT(_l0b, _bzn, 0, 0);
+    // (b) C = A @ B^T -- only when your maths actually wants B transposed.
+    //     THE EXTENTS MUST BE EXCHANGED BY THE RESHAPE. Feeding the SAME
+    //     shape through TRESHAPE is a transpose only when R == C, which is
+    //     what the earlier wording here said and it was wrong.
+    //     B stored row-major as [N, K]:
+    //       L1Mat<half, N, K>   b_l1;      // note: [N,K], not [K,N]
+    //       L1MatZN<half, K, N> _bzn;      // extents EXCHANGED vs b_l1
+    //       TRESHAPE(_bzn, b_l1);
+    //       TEXTRACT(_l0b, _bzn, 0, 0);    // -> TileRight<half, K, N>
 
     set_flag(PIPE_MTE1, PIPE_M, _we);
     wait_flag(PIPE_MTE1, PIPE_M, _we);
@@ -2689,6 +2711,19 @@ is misleading here (see the "why not one TROWSUM" note).
 > | 512 | 2.62e-07 | **2.29e-07** |
 >
 > Every lane is correct at every width tested. **Use `TCOLSUM` at full width without the
+
+> **BUT PRICE IT FIRST: `TCOLSUM` LOWERS TO A SERIAL DEPENDENT CHAIN (verified 2026-09-24).**
+> `a2a3/TColReduceOps.hpp::ColReduceInstrByMode` is literally
+> `for (i = 1; i < validRow; i++) { ReduceInstr(dst, dst, src + i*stride, ...); pipe_barrier(PIPE_V); }`
+> -- every vadd reads the `dst` the previous one wrote, with a barrier between. A 64-row
+> reduce is a **63-long serially dependent vector chain**, not a 6-level tree. I read this
+> in the pinned headers myself after the v122 `gru` run reported it.
+>
+> Replacing it with an in-place binary tree (log2(validRow) levels, independent adds within
+> a level) measured **1.43x on gru case 2 and 1.36x on case 14** -- the largest single win of
+> that campaign. So: `TCOLSUM` is CORRECT at full width (the truncation claim above stays
+> retracted) but it is not fast for a tall reduce. Use it for short `validRow`; write the
+> tree when the row count is large enough for log2 to pay, and say which you chose and why.
 > manual 64-lane fold.** Direction (A) -- pick `TROWSUM` vs `TCOLSUM` by which axis you are
 > reducing and which output shape you want -- still stands; only the truncation claim is
 > withdrawn.
@@ -4117,3 +4152,34 @@ kernel recovered 1.23-1.29x from the same class of change.
   Sweep the distance; do not assume more is better.
 * Do not reach for granularity or barrier-count first. On the two kernels where both were
   tried, overlap/slack was worth 1.16-1.29x while barrier reduction was worth 1.03-1.07x.
+
+---
+
+## A NARROW DMA BURST ROUNDS ITS **WRITE** UP TO A 32-BYTE GRANULE
+
+Measured on `engram_gate_fusion`, 2026-09-28. A **769-element bf16 row load** does not write 769
+elements -- it drags the next row's GM data into destination columns **769-783**, rounding the write
+up to the granule.
+
+Consequence: the landing buffer's pad is **not** yours, even though you sized the transfer narrowly.
+Reading it back gives the neighbouring row. The first build that hit this was 19/20 with case 13 at
+`mare = 4.8e+02`.
+
+**Rule: zero the destination at FULL width and make the CONVERT narrow.** Never trust the pad of a
+buffer a narrow burst landed in.
+
+Related: C74a (`TRowSumOp` has a wide `FillTmp`), C77 (a partial Cube extent is only honoured at the
+fractal-rounded declaration) -- all three are the same family: **an operation writes more than the
+valid extent you asked for.**
+
+## A WITHIN-PIPE WAR HAZARD IS SHAPE-DEPENDENT AND INVISIBLE ON THE CASE SET
+
+Same campaign. **One missing `pipe_barrier(PIPE_V)`** passed all 20 scored cases *and* 50 of 51
+out-of-contract shapes, then faulted on exactly one -- `B1 L3 HC4 D512 K4 dil8` -- with a UB
+out-of-bounds from a corrupted gather index.
+
+A 20-case suite cannot find this. Sweep out-of-contract shapes for **faults** (not just accuracy)
+whenever you touch barriers, and treat a single fault in fifty as a real defect rather than a flake.
+
+Related: C52 (raw intrinsics own the barriers), C78 (an aliased `tmp` is a race that passes every
+gate we have).

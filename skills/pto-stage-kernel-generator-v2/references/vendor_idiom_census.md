@@ -57,7 +57,29 @@ and `deep_norm_backward` D6 found that a per-item `PIPE_ALL` was silently protec
 **replace each barrier with the correctly scoped flag class**, not delete barriers, and
 every step needs re-validation.
 
-Treat this as the highest-value open optimizer hypothesis for the suite, not as a result.
+### FIRST MEASUREMENT (2026-09-27, `engram_gate_fusion`) -- NEGATIVE in a vec-only kernel
+
+The hypothesis above has now been measured once, and it lost. Replacing a
+`pipe_barrier(PIPE_ALL)` with a correctly scoped `V->MTE2` flag pair at a chunk seam measured
+**0.977 geomean (case 17: 0.918)**, and the same scoped pair cost **4.5%** in a second attempt.
+
+**Mechanism, and it is the part that generalises: a vec-only kernel's seam has no second engine
+to overlap with.** The whole value of a scoped barrier is letting another pipe keep running
+through it. Under `dav-c220-vec` there is no Cube to keep running, so the scoped form buys no
+overlap and you pay the flag pair's own issue cost on top. The wide barrier is not merely
+acceptable there -- it is *cheaper*.
+
+**So scope the guidance: "PIPE_ALL destroys overlap" applies to TWO-ENGINE (Mix) kernels.**
+In a single-engine kernel, treat barrier scoping as a correctness tool, not a performance one,
+and measure before spending attempts on it.
+
+One measurement, one kernel, one seam -- it does not close the hypothesis for Mix kernels, where
+it remains untested and plausible. But it does mean the suite-wide framing above was wrong: the
+105-of-111 divergence is not 105 opportunities, because an unknown fraction of those kernels are
+vec-only.
+
+Treat this as a partially-resolved hypothesis: **open for Mix kernels, measured and rejected for
+vec-only ones.**
 
 ## 4. INCONCLUSIVE -- recorded so it is not mistaken for evidence
 

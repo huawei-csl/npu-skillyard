@@ -479,7 +479,8 @@ the campaign will spend an attempt disproving a technique you never implemented.
 >
 > Three caveats that come with it: the advantage **narrows as `block_dim` grows** (a seam scales
 > with core count, a launch does not -- the single A/B loss was at bd=24), so pick `block_dim`
-> rather than maximising it; `block_dim <= 24` becomes **architectural** rather than a knob (C57a);
+> rather than maximising it; `block_dim` becomes a **correctness** bound rather than a knob, capped
+> by the DEVICE's queried core count and not by the literal 24 this was measured at (C57a, C66);
 > and pulling a stage loop in-kernel pushes cost into the contract (that run locked `numLayers <= 3`).
 >
 > Bonus: single-launch removes every `torch -> ours` edge, so C60 cannot arise -- **0 wrong in 400
@@ -2482,10 +2483,19 @@ This is cheap (a handful of launches) and it is the only thing that finds this c
 probed shapes and their results next to the contract sweep, and treat a *narrower* validated
 range than the declared contract as a contract amendment, not a footnote.
 
+> **C44 IS NECESSARY AND NOT SUFFICIENT -- see C67.** This probe answers "do unsupported
+> shapes fail cleanly?". It does NOT answer "is the supported set wide enough?".
+> `sparse_flash_attention` passed this probe (`6/6 out-of-contract shapes rejected with a
+> negative rc`), shipped, and scored **0.00 on all 80 hidden cases** because its supported set
+> was a ten-entry lookup table. A clean rejection is the right behaviour for a genuinely
+> unsupported shape and worthless when the unsupported set is everything the scorer tests.
+> Run C44 for the boundary behaviour, C67 for the boundary's *location*, and **C72 to prove
+> mechanically that the supported set is as wide as `proto.yaml`/`desc.md` declare**.
+
 ## C45: THE MCP CATALOGUES INSTRUCTIONS THAT DO NOT EXIST IN THE COMPILED LIBRARY
 
 The npu-coding MCP indexes a **different** pto-isa than the one we compile against
-(`/home/endrix/git/pto-isa`, github/hw-native-sys). Instructions it lists and describes may
+(`$PTO_LIB_PATH`, github/hw-native-sys). Instructions it lists and describes may
 have **no implementation at all** in your checkout. Verified absent so far:
 
 | instruction | MCP | pto-isa `109c9f72` |
@@ -3137,15 +3147,582 @@ operator score **-0.01**. Three reasons, and they are the checklist to apply BEF
 rows are contiguous AND under ~512 bytes AND read by many lanes at once. Outside that box,
 measure before believing it, and expect zero.
 
-### C57a: `SYNCALL<*>` DEADLOCKS SILENTLY ABOVE `block_dim = 24`
+### C66 vs C57a: A `SYNCALL` KERNEL IS EXACTLY WHERE QUERYING THE CORE CAP IS **MANDATORY**  🔴 **CRITICAL**
+
+> **CORRECTED 2026-09-30, and the previous version of this section is what cost a real run.** It said
+> *"if a kernel contains `SYNCALL<*>`, `block_dim <= 24` is a correctness guard and querying the cap is
+> a REGRESSION."* **That is backwards.** `SYNCALL` is precisely the case where the query is
+> **mandatory**, because over-subscribing a barrier is a **deadlock**, not merely idle cores.
+>
+> **The real rule: `SYNCALL` deadlocks when `block_dim > the part's cube core count`** -- and **24 was
+> never architectural. It is the A2's core count.** C57a was measured on a 24-core A2 and the number
+> got generalised into a constant.
+>
+> ```
+> Ascend910B2.ini    (A2, local)   ai_core 24   cube 24   vector 48
+> Ascend910_9362.ini (A3, RUNNER)  ai_core 20   cube 20   vector 40
+> ```
+>
+> Both files are under
+> `/usr/local/Ascend/cann-*/aarch64-linux/data/platform_config/` and readable **with no device at
+> all** -- so this is a Preflight check, not an experiment.
+>
+> **What it cost:** an operator shipped `block_dim = 24` into an all-core `SYNCALL<Mix>` on an A3 die
+> with 20 cube cores. Twenty blocks arrive, wait for twenty-four, never retire; blocks 20-23 can never
+> be scheduled. Guaranteed deadlock -> `retCode=0x25 [aicore timeout]`, 507014, on **two shared A3
+> dies**. **13 of its 20 cases launch above 20.** Measured: `bd = 8, 10` PASS; `bd = 24` FAULT, twice,
+> on two different dies.
+>
+> **`24` is a ceiling to clamp WITH the query, never INSTEAD of it:**
+> ```python
+> cap = 20                                    # A3 FLOOR, not 24 -- a failed query must not re-hang
+> try:  cap = int(torch.npu.get_device_limit(dev).get("cube_core_num", 0)) or 20
+> except Exception: pass
+> block_dim = max(2, min(24, cap, need))      # query AND ceiling
+> ```
+> **The fallback must be 20, not 24** -- every remote runner is an A3, so a failed query on the default
+> path is the same hang. Seven other trees in this fleet query correctly but fall back to **24**; that
+> is A3-unsafe and should be 20.
+>
+> **And it is consistent with the neighbouring record rather than contradicting it:** an operator that
+> over-subscribed `block_dim` to 2x the physical count "launched and computed correctly" -- because it
+> has **no `SYNCALL`**, so its blocks simply serialise. The hazard is the barrier, not the grid.
+>
+> **What the old verdict got right, and keep:** do not **delete** the `return -N` guard. Clamping
+> downward is safe; removing the refusal is not, because a workspace sized `NBLK` and indexed by
+> `get_block_idx()` still needs its own bound.
+
+**The two rules do not actually conflict once the cap is queried rather than assumed.** C66 says never hardcode a core count -- query it, keep the
+literal only as a fallback. But in a kernel containing `SYNCALL<*>`, `block_dim <= 24` is a
+**correctness guard**, and replacing it with a queried cap is a **regression from a clean rejection to a
+silent hang** on any part that reports more than 24 cube cores.
+
+This was nearly landed on a real operator. Its `call_kernel` had
+`if (block_dim == 0 || block_dim > 24) return -6;`, a C66 pass deleted it, and the change tested
+*clean* -- `block_dim` 25 / 64 / 1024 / 4096 all "accepted" with bit-identical outputs. **The test was
+vacuous:** the patched `call_kernel` clamps to `min(queried, maxBlk)` and the measuring card reports
+`cube_core_num = 24`, so every one of those runs executed with **24** blocks. It proved the clamp
+works; it never ran `SYNCALL` above 24, which is the only regime that matters.
+
+**And there was nothing to fix.** The rejection was unreachable from the scored path, because the host
+`pick_block_dim` already returned `min(24, need)`. The change removed a correct guard to address a
+rejection nothing could trigger.
+
+**The discriminator, and it is the general form of this trap:** an **architectural** cap and a
+**fitted** cap look identical in a grep. Ask what exceeding it produces:
+
+| exceeding it yields | class | action |
+|---|---|---|
+| a smaller tile and a correct answer | fitted / tuning | **widen, or add a general path** |
+| idle cores and a slower run | portability (C66) | **query the cap** |
+| a wrong answer, a hang, or a device fault | **architectural** | **keep the guard, in BOTH layers** |
+
+So before applying C66 to any kernel: **grep for `SYNCALL`**. If it is present, the core cap stays,
+guarded host-side *and* refused device-side with a negative code -- neither layer being the only guard.
+The same question applies to any cap whose comment claims an architectural reason: verify the claim
+against measured evidence (C57a's is measured -- with one barrier, `block_dim` 25 and 32 never return),
+then leave it alone.
+
+### C57a: `SYNCALL<*>` DEADLOCKS SILENTLY ABOVE THE DEVICE'S CORE COUNT
 
 Separate finding from the same investigation, and it is a correctness hazard rather than a
 performance one. With **0** barriers, `block_dim` 25 / 32 / 48 all launch and all 75 / 96 / 144
 participants report. With **1** barrier, `block_dim` 25 and 32 **never return** -- no error, no
 diagnostic, `npu-smi` Health OK throughout.
 
-**Rule: any kernel containing a `SYNCALL<*>` must clamp `block_dim` to 24 host-side**, and should
-`static_assert` or `TORCH_CHECK` it rather than relying on a schedule that happens to stay under.
+**The threshold in that measurement was 24 because the part was a 24-cube-core A2 -- it is NOT the
+number 24.** A barrier waits for every participant, so the bound is whatever the device actually
+has. Shipping a literal `24` to a 20-cube-core A3 hung two shared dies (`retCode=0x25
+[aicore timeout]`, 2026-09-29).
+
+**Rule: any kernel containing a `SYNCALL<*>` must clamp `block_dim` host-side to the QUERIED core
+count** (C66), and should `TORCH_CHECK` it rather than relying on a schedule that happens to stay
+under. The kernel-side literal is a ceiling, not the guard -- keep it, but it cannot be the only
+layer. Three details that have each cost a run:
+
+- **Match the fallback to the barrier's core type.** A `Mix` or Cube barrier falls back to the A3's
+  **20**, a Vec-only one to **40**. Setting a vector cap to 20 needlessly halves a grid; leaving it
+  at 48 keeps the over-subscription.
+- **Never cache a FAILED query.** `cached = 0` (or `cached = fallback`) with no retry freezes the
+  A2-era value for the whole process and hands the decision back to the kernel's literal.
+- **A `SYNCALL` grep is not an audit until you confirm the hits are code.** One tree's three hits
+  were comments explaining why it *avoids* a barrier; its cap is a plain grid cap, where
+  over-subscription is perf-only.
+
+### C114: A 16-BIT STRIDE DESCRIPTOR **TRUNCATES SILENTLY** -- NO FAULT, WRONG ROWS  🔴 **CRITICAL**
+
+`TLOAD` Mat ND->NZ requires `1 <= Stride3 <= 65535` because the descriptor field is **16 bits**.
+Exceed it and the hardware does **not** fault -- it takes the value **mod 65536** and reads the wrong
+rows. Measured: a GM row stride of `Nh*(D+Dr) = 128*576 = 73728` becomes `73728 mod 65536 = 8192`,
+and the GEMM returned **16,355,107 of 16,776,905 output elements over the gate** (`mare 1.37e5`,
+normal band `16355107/0`) while **the kernel exited cleanly**.
+
+**Attribution was clean because the switch was host-side:** both arms' `.aicore_binary` were
+**byte-identical**, so the same device bytes produced right and wrong answers depending only on a
+runtime branch. A control at a legal stride (`40960`) passed in the same build, and the outputs that
+never read the oversized operand passed in every arm.
+
+**So a stride guard of this kind is LOAD-BEARING, and "we have never seen the hardware fail here"
+is not evidence that it would not** -- our own guard was refusing the shape first, which is exactly
+why the hardware had never been asked. **Falsify a guard by forcing the hardware past it before
+concluding the guard is unnecessary.** Removing this one would have shipped silent wrong answers on
+a declared shape with no diagnostic anywhere.
+
+**How to handle an operand whose row stride can exceed 65535:** a one-time GM->GM repack into a
+layout whose stride fits (here `[Nh][Hcq][D+Dr]`, stride 576), or single-row ND->NZ loads where
+`Shape3 = 1` means no second row is addressed and `Stride3` becomes irrelevant. Gate the repack on
+the stride actually exceeding the limit so the common path is untouched -- and then **force the
+repack's own unexercised branches** (multi-block, ragged tail), because the shape that triggers it
+in practice usually lands on the easiest one.
+
+### C119: A `PIPE_S` INSTRUCTION NEEDS AN EXPLICIT `PIPE_S -> PIPE_V` SYNC -- `pipe_barrier(PIPE_V)` IS NOT IT  🔴 **CRITICAL**
+
+**`pto-isa`'s own event table assigns `TCI` to the SCALAR pipe.** `pto/common/event.hpp:154` reads
+`PIPE_S /* TCI */`; the only other `PIPE_S` entries are `SCALAR`, `TRESHAPE`, `SETFMATRIX`,
+`SET_IMG2COL_RPT` and `SET_IMG2COL_PADDING`.
+
+**And it depends on which overload you call:**
+
+| form | template / runtime args | implementation |
+|---|---|---|
+| `TCI<Tile, T, desc>(dst, start)` | 3 / 2 | **scalar store loop** -- `for (i < validCol) *(dstPtr+i) = start +/- i;` (the source even comments it `// scalar`) |
+| `TCI<Tile, Tmp, T, desc>(dst, start, tmp)` | 4 / 3 | the **vector** path (`TCI_b32_repeat`) |
+
+`pipe_barrier(PIPE_V)` orders V against V. **It does not order the scalar pipe's UB writes against
+the vector pipe's reads.** So the 2-argument form followed only by `pipe_barrier(PIPE_V)` is a
+**race**, and it is worst when `validCol` is large (a 256-iteration scalar fill).
+
+**It cost a device fault, and the fault blamed the wrong thing.** On `cross_entropy_loss` the filled
+tile was the byte-offset operand of a `TGATHER`; a stale lane became an out-of-range offset and the
+device reported:
+
+```
+errorStr: The address for the VEC instruction to read/write UB is out of bounds.   (507035)
+```
+
+3 faults in 6 evaluator runs, against an **interleaved control at 0 of 6 on the same card**. A
+mechanical slot-overlap audit of every instantiation was **clean**, and the gather index was provably
+in range -- so the layout audit cannot find this. **And a stale lane that happens to land IN range is
+a silent wrong value, not a fault**, which makes this a live candidate for accuracy failures in a
+build that is already scoring.
+
+**The sanctioned fix** -- once per kernel, never inside a loop:
+
+```c
+AICORE inline void scalar_to_vec()        // after any PIPE_S instruction whose result a Vec op reads
+{
+    pipe_barrier(PIPE_ALL);
+    set_flag(PIPE_S, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_S, PIPE_V, EVENT_ID0);
+}
+```
+
+`PtoSetWaitFlag<PIPE_S, PIPE_V>()` is the library equivalent and is what a correct kernel in this
+repo already uses. Verified: 0 faults in 9 consecutive runs against a measured 50% null (p = 0.2%).
+
+**Why it survives every normal gate:** it is **launch-history dependent** -- invisible in a fresh
+process and invisible to single-shot sweeps (1463 configs missed a sibling instance of the same class
+of bug). Catching it needs an **allocator-interleaving determinism probe**: many reps in one process,
+no `del` between them, hashing the output bits each rep.
+
+**Audit recipe.** Grep for a `PIPE_S` instruction followed only by a `PIPE_V` barrier:
+
+```bash
+grep -rnE '(^|[^A-Za-z_])(TCI|TRESHAPE|SETFMATRIX|SET_IMG2COL[A-Z_]*) *[<(]' --include='*.cpp' --include='*.h' .
+```
+
+then **check the overload** (a 2-argument `TCI` is scalar; a 3-argument one is not) and **check what
+reads the tile**. A `TRESHAPE` whose result is consumed by a Cube/MTE1 op is a different pipe pair and
+is not covered by this rule -- confirm the consumer before converting anything.
+
+### C122: PTO's **b32 index gather** ALIASES ITS OFFSET TABLE ONTO THE DESTINATION  🔴 **CRITICAL**
+
+`pto/npu/a2a3/TGather.hpp` has two paths, and **only one of them is safe**:
+
+```c
+// b32 (lines 58-61): offset table written INTO dst, then gathered FROM dst -- SAME ADDRESS
+vmuls  ((__ubuf__ int32_t  *)(dstPtr + i*TShape1), ...);   pipe_barrier(PIPE_V);
+vgather((__ubuf__ uint32_t *)(dstPtr + i*TShape1), (__ubuf__ uint32_t *)(dstPtr + i*TShape1), ...);
+
+// b16 (lines 73-76): offset table written into tmpPtr, gathered FROM tmpPtr -- distinct buffers
+vmuls  ((__ubuf__ int32_t  *)(tmpPtr + i*TShape1), ...);   pipe_barrier(PIPE_V);
+vgather((__ubuf__ uint16_t *)(dstPtr + i*TShape1), (__ubuf__ uint32_t *)(tmpPtr + i*TShape1), ...);
+```
+
+**`pipe_barrier(PIPE_V)` is not sufficient on the b32 path**, and it fails two ways:
+
+1. An **intermittent** `"The address for the VEC instruction to read/write UB is out of bounds"`
+   vector-core trap (`subErrType:4`).
+2. **SILENTLY WRONG ANSWERS.** On `engram_gate_fusion` the decode path was wrong on every item
+   carrying more than one hyper-connection channel: at `HG=2` exactly `hc in {1,3}`, at `HG=4`
+   exactly `hc in {1,2,3}` -- **never `h == 0`**. A shape the kernel *accepted* returned
+   `MERE 1.60 / MARE 7.2e2`, and at `B=256`, `MARE 2.2e4`.
+
+**CORRECTED 2026-10-06 by direct measurement on A2. Two things I had wrong:**
+
+**(a) The BARRIER is the main effect, not the aliasing.** 2x2 arms, `validCol=64`, `validRow=1`,
+40 launches each, bit-exact against an fp64 oracle with positive and negative controls:
+
+| | `pipe_barrier(PIPE_V)` | `pipe_barrier(PIPE_ALL)` |
+|---|---|---|
+| **aliased dst** (the library's b32 path) | **37/40 wrong** | 0/40 |
+| **distinct buffer** | **8/40 wrong** | 0/40 |
+
+`PIPE_V` is insufficient **even to a distinct buffer**; aliasing only amplifies it. **So the b16
+branch is NOT proven safe** -- it uses a distinct `tmpPtr` but still only `PIPE_V`, and remains
+**unmeasured**.
+
+**(b) `PIPE_ALL` ALONE HAS A WIDTH CLIFF.** Aliased + `PIPE_ALL`, `validRow=1`, 30 launches per width:
+
+| validCol | 128 | 192 | 256 | 320 | 384 | 512 | 640 | 768 | 1024 |
+|---|---|---|---|---|---|---|---|---|---|
+| wrong launches | 0 | 0 | 0 | 1 | 1 | 0 | 4 | **17** | **30/30** |
+
+**Banding restores it**: band-to-256 and band-to-64 are **0/30** at 640, 768 **and** 1024. And the
+library shows banding was intended and abandoned -- `TGather.hpp:45-48` computes `numRepeatPerLine`,
+`numLoop` and `remainAfterLoop`, then **never uses them**.
+
+**THE VALIDATED RECIPE** (for `validRow == 1`; measured **0 wrong in 490 launches, widths 1-1024**):
+
+```c
+set_mask_count();
+for (each band of <= 256 b32 elements) {
+    vmuls  (dst_band, idx_band, elem_bytes);   // offset table into dst
+    pipe_barrier(PIPE_ALL);
+    vgather(dst_band, dst_band, src);
+    pipe_barrier(PIPE_ALL);                    // after EACH band
+}
+set_mask_norm(); set_vector_mask(-1, -1);
+```
+
+plus a **2 KB zeroed tail** past the end of the UB map, zeroed **once at kernel entry before the work
+loop** and never written after. **Both halves are necessary**: band256 + `PIPE_ALL` with the tail
+ablated gives **9/200 wrong** (first failure at `validCol=31`) against **0/200** with it.
+`dst`, `src` and `idx` must be **three distinct regions** -- `dst` is destroyed mid-call.
+
+**Residual failures above the band trace ENTIRELY to `validRow > 1`** (widths >=64 at vr 1-4 give
+26/200; the same widths at vr=1 give 0/200). A `validRow > 1` gather is a separate, unmitigated
+hazard.
+
+**Caveats:** the 256 threshold is measured at vr=1 on A2/910B2 only and the boundary is
+**probabilistic, not a hard cliff** (512 read 0/30 while 384 read 1/30) -- treat 256 as a
+measured-safe working value. A barrier-only fix suffices **only** where every gather is <= 256 b32
+elements wide.
+
+**NO CALLER-SIDE STATIC CHECK CAN FIND THIS CLASS**, because the aliasing lives inside the library:
+`tools/scan_tile_aliasing.py` reports **0 sites across all of `submissions/`** while 48 exist. The
+only static signal is **"Form A call + b32 payload"**. Note Form A branches on the **payload** width
+(`src0`/`dst`), never the index width -- `src1` is b32 by `static_assert` -- and on the b32 branch
+`tmpPtr` is computed and **never dereferenced**, so passing a distinct tmp buys nothing.
+
+**THE TEST THAT FINDS IT, because every normal gate misses it:** a **same-shape repeat loop cannot
+see this class** -- the stale residue must come from a *different* address map. A 150x repeat of the
+faulting shape ran clean while the wheel faulted on its first call. **Use an INTERLEAVED multi-shape
+soak** (many distinct shapes, cycled, in one process) and poison/zero-check the tail. It also passes
+every single-shot sweep, which is why it survived three scored 20/20 runs.
+
+**When writing a gather:** prefer the **tmp-taking overload with a tile you own** so the offset table
+never aliases the destination, verify the tmp is actually distinct from `dst`, and treat any b32
+in-place gather as requiring the `PIPE_ALL` + zeroed-tail treatment above. Related: **C119** (the
+other `PIPE_V`-is-not-enough case, there a `PIPE_S` producer) and **C121** (an aliasing hazard whose
+"disjoint" claim was really about timing). The pinned pto-isa has now produced **three**
+silent-wrong-answer defects -- see also **C113** and **C118** -- so **read the header for any
+library op you rely on.**
+
+### C121: A UB MAP'S "DISJOINT" COMMENT IS A **TIMING** CLAIM, NOT AN ADDRESS CLAIM  🔴 **CRITICAL**
+
+Two UB slot `#define`s can hold the **same address** and still work -- for as long as no single
+kernel has both live at once. The source comment then records a *timing* invariant while reading
+like an *address* invariant, and the next edit silently breaks it.
+
+Measured on `unique`: `FA_S1` and `FA_OGW` are **both 131072**. The UB map's own comment said a tile
+was "disjoint from FA_S1/FA_S2 users" -- **false of `bst`**, which is both an `FA_S1` user (the
+`m > F32CAP` single-valued probe) and a tail-block user in phase E. They had only ever avoided each
+other because the two phases never overlapped. Widening a cap made them overlap, and the device
+reported:
+
+```
+MTE accesses an invalid GM address        (aivec core 20)
+```
+
+**It faulted only because one visible case happened to drive the oversized branch. With a different
+case mix it would have shipped as a silent wrong answer.**
+
+**The guard: tie every aliased slot to the extent that must not reach it, with a `static_assert`**,
+so a later edit cannot re-create the overlap:
+
+```c
+// FA_OGW aliases FA_S1 at 131072.  Anything living in FA_S1 while a tail block is live
+// must fit below the alias point -- assert it rather than asserting it in a comment.
+static_assert(FA_S1_OFFSET + BST_BYTES <= FA_OGW_OFFSET,
+              "bst in FA_S1 would overlap the FA_OGW tail block");
+```
+
+**And when you widen any cap, re-derive which slots are simultaneously live** -- a cap increase is
+exactly the edit that turns a timing-safe alias into an overlap. Related: **C119** (the other class
+of bug a static audit cannot see -- there a synchronisation gap, here an aliasing gap that only a
+*liveness* analysis finds). Note a mechanical slot-overlap audit **passes** both: it compares
+declared extents, and these are declared not to overlap.
+
+### C120: A PRECISION-RECOVERY **SPLIT** BREAKS NON-FINITE SEMANTICS  🔴 **CRITICAL**
+
+**`TAXPY` binds its scalar to the SOURCE TILE's dtype** -- `pto/npu/a2a3/TAxpy.hpp` declares
+`TAXPY_IMPL(..., typename TileDataSrc::DType)`, so a `half` source **forces a `half` scalar** and you
+cannot pass an fp32 weight against an fp16 tile.
+
+The standard workaround is to recover the lost precision by **splitting the scalar and accumulating
+twice**: `w = wh + wl`, then `acc += wh*v; acc += wl*v`. **That is algebraically equal for finite `v`
+and WRONG for `v = +/-Inf`:**
+
+| golden | ours (split) | |
+|---|---|---|
+| `w*Inf` = `Inf` | `wh*Inf + wl*Inf` | |
+| | **NaN when `wl < 0`** | `Inf + -Inf` |
+| | **NaN when `wl == 0`** | `0*Inf` |
+
+Measured on `roi_align`: a minimal `[2,16,16,16]`, `oh=ow=1`, `samp=1`, single grid point, no
+merging -- golden **0 NaN / 14 Inf**, ours **14 NaN / 0 Inf**. *Every* position where the reference
+returns a signed Inf returns NaN instead. The class is **fp16 x any Inf**, independent of
+`sampling_ratio` and `aligned`: on a 144-config non-finite surface, `[-inf,inf]` 36/36 DIFF,
+`[0,inf]` 36/36, `[-inf,0]` 36/36, and `[nan,nan]` **0/36** (NaN absorbs, so a NaN-only probe
+cannot see it).
+
+**Guarding only `wl == 0` is NOT the fix** -- built and measured, still failing, because `wl < 0` is
+the larger half. Either handle the non-finite case before the split, or do not split.
+
+**Why it hides.** It needs a **16-bit** tile AND an **Inf** input AND a split-accumulate path. A
+visible case with fp32+Inf never splits; a visible case with fp16+NaN absorbs. **So check any
+split/compensated accumulation (Kahan, Veltkamp, two-pass, `wh+wl`) against +/-Inf explicitly** --
+`static_assert`s and finite-data batteries are all blind to it. Related: **C106** (the Vec pipe does
+not fuse, which is *why* these splits get written) and **C115** (judge the fix by whether its failure
+set is a strict subset).
+
+### C118: `TSUBS` ON AN int32 TILE ROUNDS ITS SCALAR THROUGH fp32 -- A LIBRARY BUG  🔴 **CRITICAL**
+
+`pto/npu/a2a3/TSubS.hpp:22` implements scalar subtract as an **add of the negated scalar, negated
+through `float`**, regardless of `T`:
+
+```cpp
+vadds(dst, src0, (T)(-(float)src1), repeats, 1, 1, 8, 8);   // (T) == int32_t here
+```
+
+So on an `int32_t` tile **any `|scalar| > 2^24` is silently rounded to fp32 precision**. No error, no
+fault. The threshold is exact and was measured: a scalar of **16777217 subtracts 16777216**.
+
+| scalar | `(int32)(-(float)s)` | error |
+|---|---|---|
+| 16777216 | exact | 0 |
+| **16777217** | -16777216 | **+1** |
+| 1294967298 | -1294967296 | **+2** |
+| 1294934303 | -1294934272 | **+31** |
+
+**`TADDS` is EXACT** -- `TAddS.hpp:22` passes `src1` straight through (`vadds(dst, src0, src1, ...)`).
+**The two are therefore NOT interchangeable on integer tiles**, which is the whole trap: the obvious
+reformulation is the fix.
+
+**The sanctioned fix -- add the WRAPPING negation:**
+
+```c
+// EXACT int32 scalar subtract.  Never TSUBS on an int32 tile.
+AICORE inline void subs_i32_exact(/*tile*/ dst, /*tile*/ src, int32_t s)
+{
+    // unsigned so INT32_MIN is not signed-overflow UB; modulo-2^32 is what a key map wants
+    TADDS(dst, src, (int32_t)(0u - (uint32_t)s));
+}
+```
+
+**Carry it as a kernel-wide invariant -- "no `TSUBS` on an int32 tile"** -- and state it at every call
+site, because a later reader will "simplify" it back.
+
+**Why this hides.** It needs an integer input whose **minimum exceeds 2^24**, which no low-magnitude
+test range reaches, and its signature is a **uniformly shifted result** (every value off by the same
+small amount) rather than noise -- which reads like an indexing-base bug, not an arithmetic one. On
+`unique` it also produced a **device fault**: the shifted value became a negative index into an
+unclamped gather, giving `"The address for the VEC instruction to read/write UB is out of bounds"`
+plus a vector-core exception. **A silent arithmetic defect can present as a hardware fault.**
+
+**How it was localised, which is the reusable method:** instrument the kernel to **publish its own
+measured key space** and compare across passes. Both passes reported identical, correct bases
+(`fin_vmin == p1_vmin`), which ruled out the measurement and left the subtraction itself; host
+arithmetic then reproduced both observed shifts (+2 and +31) exactly from the measured bases.
+
+**`TDIVS` is NOT the same bug.** `TDivS.hpp:104,132` does contain
+`T inv = (T)((float)1 / (float)src1)`, but it sits inside
+`if constexpr (std::is_same<T, float> || std::is_same<T, half>)`, so it never applies to an integer
+tile and going through `float` there is correct. Checked first-hand against the pinned library; do
+not propagate it as a suspect. Related: **C113** (`SetContinuousMask`) -- the pto-isa library has now
+produced two silent-wrong-answer defects, so **read the library source for any scalar-taking op you
+use on an integer tile.**
+
+### C116: THE SORT FAMILY IS ONLY **POSITIONALLY STABLE** -- THE COMPANION IS **INERT** IN THE COMPARE  🔴 **CRITICAL**
+
+**The PTO doc for `TSORT32` states "ties broken by smaller index first". Measured with positive and
+negative controls: FALSE as stated.** The whole chain -- `vbitsort` **and** the batched 4-way
+`vmrgsort4` merge tree -- is merely **positionally stable**, and the uint32 companion **takes no part
+in the comparison**:
+
+- 32 tied keys carrying **descending** companions come back in **input order**, not companion order.
+- A 4-way merge of four all-tied runs **drains list 0 entirely before list 1**.
+
+The doc's claim is an artifact of the companion normally being an **ascending iota**, which makes
+positional stability *look* like an index tie-break. (8 tests.)
+
+**Consequence for design: a tie-break rank cannot be PACKED into the companion -- it can only be
+CARRIED.** Any ordering you need among equal keys must be imposed by your own pass after the sort
+(e.g. adjacent compare-exchange to convergence on `(key DESC, companion ASC)`), not delegated to the
+sort. A kernel that relies on the documented tie-break is wrong on every tied key, and tied keys are
+exactly what a `top_k`-style hidden set probes.
+
+**Verify a tie-break claim before building on it**: feed tied keys with *descending* companions and
+check the output order, and keep a negative control that proves your own re-order pass actually fired
+(an `#ifdef` that leaves the object byte-identical proves the guard is inert).
+
+### C117: `TAND` / `TANDS` ARE **1- AND 2-BYTE ONLY** ON A2/A3 -- A 32-BIT MASK WILL NOT COMPILE  🟡
+
+A 32-bit bitwise AND has no vector form on `dav-c220`: `TAND`/`TANDS` **`static_assert` on 1- or
+2-byte element types**. To extract a low bit-field from a b32 lane, use shift arithmetic instead:
+
+```c
+// low b bits of x, without a 32-bit AND
+x - ((x >> b) << b)
+```
+
+Related shape-of-problem: an **arithmetic** right shift (`TSHRS` by 31) yields a lane-wise sign mask,
+which is how to turn a non-overflowing int32 difference into a `>` predicate without `TCMP` and
+without any mask register.
+
+### C115: A **PARTIAL** ROUNDING MATCH IS NOT MONOTONE -- JUDGE BY **SUBSET**, NOT BY COUNT  🔴 **CRITICAL**
+
+When a case is scored against a **lossy** reference on a near-zero denominator, passing it means
+**reproducing the reference's exact rounding sequence**. That makes the match **all-or-nothing per
+output**: fix one rounding and leave a second mismatched, and the result lands on a **third** value
+that can be **further** from the reference than the original was.
+
+So a candidate arm with **fewer** failures can be the **worse** arm. Measured on `grid_sampler_3d`
+over 2016 configurations:
+
+| arm | failures | failure set vs control | **new** |
+|---|---:|---|---:|
+| control | 40 | -- | -- |
+| **one rounding matched (SHIPPED)** | **21** | strict **subset** | **0** |
+| + a second rounding matched | **4** | **not** a subset | **4** |
+
+The 4-failure arm introduced four failures that did not previously exist, all in the parameter
+region where the first rounding was *already* exact. The same shape appeared on `roi_align`.
+
+**The acceptance test is a CENSUS, not a total.** For every candidate, emit `fail->pass` and
+`pass->fail` counts against the full prior battery. **Ship only an arm whose failure set is a strict
+subset of the current one.** `pass->fail > 0` rejects the arm even if its total fell.
+
+**Two corollaries that cost real sessions:**
+
+1. **Enumerate every rounding the reference performs before matching any of them, from its SOURCE.**
+   Include roundings the *compiler* introduces: `aarch64` **contracts** `a*b - c` into a single
+   `fmadd`, so `((coord+1)*size - 1)/2` is **one** rounding in the reference and **two** in a
+   `TMULS`-then-`TADDS` kernel. The formula is identical; the rounding count is not.
+2. **Look for an exactness CONDITION, not an exactness LIST.** Here the 2-rounding chain equals the
+   true fma **iff `size` is a power of two** -- 0 mismatches at sizes 1,2,4..4096 and 0.24% of
+   coordinates otherwise, over 3.69e9 evaluations. A list of observed-good values would have hidden
+   that and mispredicted every unlisted size.
+
+**Being MORE accurate is not the axis.** An exactly-rounded sum with the wrong unnormalize still
+failed ~4%. See **C106** -- the Vec pipe has no FMA (`vmla`/`TMULA` is byte-identical to a separate
+`vmul` then `vadd` and rounds the product first), so an exactly-rounded fma must be **emulated**: a
+Veltkamp split plus a **Knuth 2Sum**, 17 vector ops, 0 mismatches in 3.77e9 evaluations. Dropping
+the 2Sum fails 965 of 3.69e9 -- rare enough to read as clean on any small probe.
+
+### C113: `pto::SetContinuousMask(128)` RETURNS A **64-LANE** MASK -- A LIBRARY BUG  🔴 **CRITICAL**
+
+`pto-isa/include/pto/common/utils.hpp:32` builds the high mask word as
+
+```c
+(n > MASK_LEN) ? (((uint64_t)1 << (uint32_t)(n - MASK_LEN)) - 1) : 0      // MASK_LEN == 64
+```
+
+At `n == 128` the shift amount is **64** -- undefined behaviour -- and AArch64's variable shift takes
+the amount **mod 64**, so it evaluates `1ULL << 0 == 1`, subtracts 1, and the high word is **0**.
+**`SetContinuousMask(128)` enables only lanes 0..63.** Measured: every `n` in 1..127 is correct and
+`n == 128` **alone** is wrong.
+
+**Where it bites:** any op that asks for 128 lanes. On one kernel a duplicate-index gather broadcast
+used `lanes = (sizeof(T)==2) ? 128 : 64`, so only **fp16** reached the bug; lanes 64..127 of every
+128-lane group were never written, the broadcast left **stale UB**, and the consumer read it. Silent
+wrong answers, no fault, 72 of 1116 configs.
+
+**The boundaries are a function of the REPLICATE WIDTH, not of a single constant** -- on that kernel
+they were `C >= 17` for the bilinear path (width `4*CPT >= 128`) and `C >= 65` for nearest (width
+`CPT`). Two different boundaries, and `C=17`/`C=32` had been called clean by every prior sweep.
+
+**Rule: never pass 128 to `SetContinuousMask`.** Use a UB-free local setter for any `n` that can
+reach it:
+
+```c
+AICORE inline void safe_mask(int n)          // n in 1..128
+{
+    const uint64_t all = 0xffffffffffffffffULL;
+    if (n >= 128)      set_vector_mask(all, all);
+    else if (n > 64)   set_vector_mask((static_cast<uint64_t>(1) << (n - 64)) - 1, all);
+    else if (n == 64)  set_vector_mask(static_cast<uint64_t>(0), all);
+    else               set_vector_mask(static_cast<uint64_t>(0), (static_cast<uint64_t>(1) << n) - 1);
+}
+```
+
+**Audit every call site for its reachable maximum `n`, and do NOT patch the library.** ~10 other PTO
+ops call `SetContinuousMask`, so a library edit widens the blast radius and breaks every per-kernel
+bit-identity proof. A local setter at the one exposed site is the sanctioned fix. For reference,
+`TCvt` can never reach 128: `ComputeTCvtRepeatConfig` gives `elementsPerRepeat <= 128` and
+`TCVT_IMPL` passes `validCol % elementsPerRepeat <= 127`.
+
+**The signature to recognise:** element 0 of each sub-block correct and 1..n-1 wrong is a *broadcast*
+signature, and a defect that tracks a **replicate width** rather than a tile size or a cost-model
+branch points at the mask, not the arithmetic.
+
+### C111: A MASK TILE'S WRITE GRANULE IS A **64-LANE REPEAT**, NOT `ceil(validCol/8)` BYTES  🔴 **CRITICAL**
+
+A compare writes its mask LSB-first per byte, so the naive size for `validCol` lanes is
+`ceil(validCol/8)` bytes. **That is wrong and it silently overruns.** Measured over an `0xAA` poison:
+
+| validCol | bytes actually written |
+|---|---|
+| 8 / 16 / 32 / 63 / 64 | **8** |
+| 65 / 128 | **16** |
+| 192 | 24 |
+| 256 | 32 |
+
+So the requirement is **`8 * ceil(validCol/64)` bytes** -- up to **8x** the naive figure at small
+widths. A mask tile sized `ceil(validCol/8)` leaves whatever follows it in UB to be overwritten,
+with no fault and no diagnostic. Size every mask slot by the 64-lane rule, and keep the mask's GM
+transfer on a raw `*_align_b8` so exactly one Tile names that address (C62).
+
+**The dst dtype is not free either:** `vcmp_dispatch`'s destination is `__ubuf__ uint8_t*`
+(`TCmps.hpp:23`), so a mask tile **must** have `DType uint8_t` -- a `uint16` view does not compile.
+That one is a compile error rather than a silent bug, which is the only reason it is cheap.
+
+**Worked error worth repeating:** the first probe of this asserted `ceil(n/8)` and reported a
+"FAILURE" at n=8 and n=16. **The probe was at fault, not the hardware** -- the third time in one
+campaign that a probe rather than a mechanism was wrong. A probe is an instrument; validate it with
+a poison pattern and a known-size control before believing a negative.
+
+### C112: COMPARES ARE **ORDERED** (NaN -> FALSE IN EVERY MODE), AND `TSELS` SELECTS SRC ON A SET BIT
+
+Both measured with positive and negative controls, on two unrelated operators, and they agree.
+
+**`vcmpvs_*` is ordered.** On `[nan,1,-1,inf,-inf,0,nan,2]` vs `0.0`, **every** mode -- EQ, NE, LT,
+LE, GT, GE -- returns **FALSE** for the NaN lanes. Controls: `finite GE 0.0` alternates as expected,
+`GE +INF` is all-0, `GE -INF` is all-1. This reproduces the independently measured top_k result that
+**`CmpMode::NE` returns FALSE for NaN**, so `mask = (x != x)` **detects nothing** and is never a NaN
+test on this part.
+
+Two idioms that follow, both verified:
+- **`GE -INFINITY` is 1 for every finite value AND both infinities, 0 for NaN only** -- the NaN test.
+- **`(GT -INF) AND (LT +INF)` is 1 iff finite** -- the finite test.
+
+**`TSELS(dst, mask, src, tmp, scalar)` is `dst[i] = maskbit(i) ? src[i] : scalar`** -- the mask
+selects true-lanes from the **first source**, confirmed from a host-built mask (so the test is not
+circular), with all-0 -> all scalar, all-1 -> all src, and a single set bit selecting exactly its one
+lane. **In-place `TSELS(c, mask, c, tmp, k)` is SAFE** -- identical to out-of-place. Do not
+generalise from `TRECIP`, which IS silently wrong in place; aliasing has to be probed per
+instruction, not assumed either way.
 
 ## C58: A PREPROCESSOR `#if` ON A C++ TEMPLATE PARAMETER IS SILENT AND WRONG -- USE `if constexpr`
 
@@ -3807,3 +4384,1972 @@ another case: the alias regressed at 2.56x reuse and only helped once reuse fell
 **So: report SCHEDULE REDUNDANCY with every alias measurement** (burst length remains worth
 recording, but it is not what decides the sign). And probe the alias **per operand** -- in the
 kernel above the correct answer was to alias exactly one of four.
+
+### C66 -- NEVER HARDCODE A CORE COUNT IN A HOST PLANNER; QUERY THE DEVICE
+
+`torch.npu.get_device_limit(dev)` is a public torch_npu export (backed by
+`_npu_get_device_res_limit`) returning the part's core counts. On the A2 910B2 these
+kernels are developed against it returns:
+
+    {'cube_core_num': 24, 'vector_core_num': 48}
+
+Those two numbers are **exactly** the literals that host planners keep hardcoding -- a
+block_dim capped at `min(48, ...)` for Vec work, `min(24, ...)` for Cube work. They were
+never chosen by measurement; they are the development part, written down.
+
+**What it costs.** `masked_scale`, kernel object byte-identical
+(`035b3f9268c1df84d8144289cbf25712`), submitted twice to cannbench's A3 910c:
+
+| planner cap | score | geomean speedup |
+|---|---|---|
+| hardcoded `48`            | 83.35, 83.45 | 1.771 |
+| `get_device_limit(...)`   | **87.95**    | **2.340** |
+
+**+4.50 points from one constant.** The A3-vs-A2 slowdown fell 1.434x -> 1.089x and 9 of
+20 cases became FASTER on A3 than on the part the kernel was tuned for. Three operators
+had each lost ~5 points on A3 (masked_scale -5.20, exp -4.77, moe_gating -5.25) and that
+suspicious uniformity across a memory-bound elementwise op, a transcendental one and a
+sort/selection op was the tell: a shared constant, not three schedule artifacts.
+
+**The rule.** Derive the cap from the device, cache it once per process, and fall back to
+the historical constant if the API is unavailable so a missing query is never worse than
+hardcoding:
+
+```python
+_CORES = {}
+def _vector_cores(fallback=48):
+    n = _CORES.get("v")
+    if n is None:
+        n = fallback
+        try:
+            v = int(torch.npu.get_device_limit(
+                torch.npu.current_device()).get("vector_core_num", 0))
+            if v > 0:
+                n = v
+        except Exception:
+            pass
+        _CORES["v"] = n
+    return n
+```
+
+Use `cube_core_num` for Cube-side caps and `vector_core_num` for Vec-side ones. A MIX or
+multi-stage operator needs BOTH -- `conv_2d` caps its Cube stage at 24 and its two Vec
+stages at 48, and all three are this property.
+
+On the development part the query returns the constant it replaces, so the change is
+provably a no-op there: same cap, same block_dim, same measurements. It only ever differs
+where the constant was already wrong.
+
+**THREE WAYS THE QUERY SILENTLY DOES NOTHING.** Rolling C66 across 13 operators found three
+distinct failure modes, and a correct query defeated by any of them looks identical to "C66
+does not help for this operator":
+
+1. **Dead code (the entry-point trap).** A `TORCH_LIBRARY` registration makes the Python
+   driver unreachable -- cann-bench's `load_ai_operator` tries `torch.ops.cann_bench` FIRST.
+   A Python-side query on such an operator never runs. Caught by a null result:
+   `moe_gating_top_k_softmax` moved **+0.12** while module-path operators moved +3.29 and
+   +4.50. Decide per operator which path is live and put the query there.
+2. **Unreachable (compiled into device code).** A `#define` baked into the kernel object,
+   used inside the in-binary planner, cannot be reached from any driver. That was `gather`'s
+   **-3.61**: `#define GK_MAXBLK 48` used four times inside `gather_plan()`, with the driver
+   passing `block_dim = 0`. Requires a kernel rebuild, not a host patch.
+3. **CLAMPED AWAY (the one that looks most like success).** The host query runs, returns the
+   right number, passes it in -- and an unconditional clamp inside `call_kernel` reverts it:
+
+       if (blocks > 24) blocks = 24;      // silently undoes any larger host value
+
+   `grouped_matmul` and `grouped_matmul_swiglu_quant` both had this. Even an explicit
+   `block_dim = 32` came back as 24. A driver-only fix is invisible here **and leaves no
+   trace** -- no error, no warning, correct results, unchanged score.
+
+**The fix for (3) is a named setter, not a repurposed hint slot:** keep
+`static uint32_t <op>_core_cap = <historical>;` in the kernel TU, export
+`extern "C" void <op>_set_cube_cores(uint32_t)` that ignores 0, have every clamp site read
+the variable, and push the queried value once from the live path (`std::call_once` in the
+plugin, or lazily in the Python driver's kernel-wrapper constructor).
+
+**And every clamp site must read it, including the workspace sizer.** `kernel_gmsq.cpp` held
+the cap TWICE -- once in `call_kernel` and once in `kernel_workspace_bytes`, which sizes
+`bd * per-core scratch`. Raising only the launch clamp would overrun the workspace on a part
+with more AIC cores: a memory-safety bug, not a performance miss. Push the value BEFORE the
+workspace is sized, from a single query authority, so host and device agree by construction.
+
+**Verify the query is actually linked, not just written.** `nm -D --defined-only` on the built
+`_C.abi3.so` should show your setter as `T`, and the object that queries should show
+`U c10_npu::GetDeviceResLimit(int, int)`. One tree's "ABI anchor" TU compiled to a 768-byte
+object with **no symbols at all** -- its anchor pointers had internal linkage and were
+discarded -- so the exports came from elsewhere and the anchor was decorative.
+
+**A host-only change must leave the kernel object byte-identical; a CCE-TU change will not,
+and that is not evidence of a device-code change.** `call_kernel` is host code living inside
+the CCE translation unit, so editing it changes the object. Compare the embedded
+`.aicore_binary` section instead -- it was byte-identical across all three operators here.
+(Recompiling a reconstructed source under a DIFFERENT filename shifts that section by 8 bytes,
+because the device ELF embeds the source name; compare under the original filename.)
+
+## C67-C71: SURVIVING THE CASES YOU WERE NOT SHOWN  🔴 **CRITICAL**
+
+These five rules all come from one discovery: the scorer runs a **hidden case set 4x the
+size of the visible one**, and it deliberately probes the edges the visible set omits.
+Twelve operators have now been through it. Six passed cleanly; six failed, and **every
+failure was one of the five classes below** -- none was a novel numerical problem.
+
+**Why any of this matters enough to be a rule: the scoring is multiplicative in the pass
+fraction.** It is not "19 of 20 cases score and one scores zero". Every term scales:
+
+    score = (20 + 30) * k/N + 50 * (sum HAP_i)/N
+
+So a single case that REJECTS or faults costs up to **5 points**, and `strided_slice` shows
+the compounding: 6 real faults cascaded into 29 skipped cases and took an 84.32 operator
+to **49.94**. Conversely `conv_2d` sits at 33.09 because 43 of 80 cases never produced a
+number. Correctness robustness is not hygiene here; it is the largest available score lever.
+
+**Read the failure prefix FIRST -- it says whose fault it is:**
+
+| prefix | meaning |
+|---|---|
+| `Golden执行失败` | the BENCHMARK's reference crashed. Not your bug. |
+| `AI算子执行失败` | your kernel or driver failed. |
+| `精度不达标` | both ran; the comparison rejected. |
+
+`moe_finalize_routing` lost 6 cases to the first kind (the hidden generator shaped
+`skip1`/`skip2`/`bias` for a different `num_rows` than `expanded_permuted_rows`, so our
+kernel was never invoked) and it is worth ~87 rather than 80.72 for reasons nobody can fix
+from the kernel side. Diagnosing that as our defect would have burned a whole repair budget.
+
+### C67 -- DERIVE THE SUPPORTED SET; NEVER ENUMERATE IT, AND NEVER FIT ITS GRANULARITY
+
+A kernel whose supported shapes are a **lookup table** is not a dynamic-shape kernel, it is
+a shape-specialised one with a rejection path -- and it will reject almost everything the
+hidden set asks for.
+
+`sparse_flash_attention` scored **70.66 on the visible 20 and 0.00 on the hidden 80.** All
+80 failed identically: `shape out of kernel contract`, raised by our own driver. The cause
+was `sfa_config()`, a hardcoded table of exactly ten `(dk, dv, g, topk, bf16)` tuples
+returning -1 for anything else. The visible 20 contain exactly ten distinct configs. The
+contract had been **fitted to the cases it was shown**. Deriving the tiling from the dims
+instead moved it 0.00 -> 51.77 for 1.35 points of visible score.
+
+`conv_2d` is the same class one size down: `if (khkw != 1 && khkw != 9 && khkw != 25)
+return -1;` -- only 1x1, 3x3 and 5x5 kernels exist as far as that kernel is concerned.
+
+**And deriving a bound is not sufficient -- the bound's own granularity must be derived
+too.** After the sfa rewrite, `Dk=96` still rejected with rc=-6, because the agent had
+bounded Dk to "64-aligned, in [64,768]" and probe-confirmed that 96 rejects, recording that
+as correct behaviour. The 64-alignment was itself fitted: every visible case happened to use
+a multiple of 64. The hidden set uses 96. Same mistake, one level down, after the lesson.
+
+> **C67 IS THE PRINCIPLE; C72 IS THE CHECK.** This rule has been violated *after being
+> followed* -- sfa derived its tiling and then fitted the very next bound (`Dk` 64-aligned) from
+> the visible cases. Do not rely on remembering C67: run the C72 declared-surface gate and put
+> its combination/rejection counts in the report.
+
+**The test that catches this is not "do out-of-contract shapes reject cleanly".** sfa's
+generating run verified exactly that and reported `6/6 out-of-contract shapes rejected with
+a negative rc`. Rejecting cleanly is correct behaviour for a genuinely unsupported shape and
+worthless when the unsupported set is everything the scorer will test. **Ask instead: is the
+SUPPORTED set wide enough, and does every bound in it trace to the declared family in
+`desc.md`/`proto.yaml` rather than to an observed case?** Enumerate the declared family, not
+the cases.
+
+**Corollary for performance switches.** `strided_slice` picked its DMA mode on
+`s_in*esize <= 64`. That constant was not a correctness bound, it was a fitted performance
+cutoff -- measured crossover is 256-512 B, so it was 4-8x too low and cost 1.18x-2.9x across
+the whole 66-256 B band. When a cutoff must exist, derive it from a cost model
+(`nburst*A + rbytes*B`, argmin) so the boundary is a **consequence** of measured constants,
+and prefer the form whose error is symmetric: a better-FITTING model was rejected there
+because one grid step early cost 9-97% while one step late cost 1-17%.
+
+### C68 -- NO TORCH COMPUTE OP ON THE KERNEL PATH; THE IMAGE DOES NOT SERVE EVERY aclnn OP
+
+The evaluation image is not your dev box. These calls each returned
+`JSON configuration file ... cannot be found` (error 561103) on the runner while working
+locally: `ZerosLike`/`aclnnInplaceZero`, `aclnnCast`, `aclnnMuls`,
+`aclnnInplaceCopy_1_Broadcast`.
+
+Confirmed cost: `nms` and `foreach_norm` each scored **0/20** on a `torch.zeros(device='npu')`
+in the driver. `exp` lost 3 of 80 hidden cases to a tiny-tensor fallback that used
+`torch.exp`/`.to(dtype)`/`*scale`. `gcd` lost hidden case 100 to a `.contiguous()` that
+lowered to a broadcast copy. `grouped_matmul` had `gl.to(torch.int64)` on a device tensor.
+
+**The safe pattern** is `torch.empty` plus one H2D `.copy_()` from a CPU tensor, or padding
+to a legal size and slicing the result. Never a broadcast copy -- `copy_(x.expand(...))`
+lowers to the very op that killed gcd, so an obvious-looking fix can trade one missing-op
+failure for another.
+
+**Two traps around this rule:**
+
+1. **A `TORCH_LIBRARY` registration makes your Python driver dead code.** cann-bench's
+   `load_ai_operator` tries `torch.ops.cann_bench` FIRST. If the plugin registers a torch op,
+   everything in `cann_bench/__init__.py` never executes, so a Python-side fix is invisible.
+   Decide per operator which path is live, and put host logic in C++ when the torch op wins.
+   This is why a ZerosLike sweep of the Python drivers came back clean while three operators
+   still had the bug in their C++ plugins.
+2. **"No visible case reaches it" is not a reason to leave a fragile fallback.** exp's
+   fallback carried the comment *"never reached by any benchmark case -- the smallest is
+   1 MB"*, true of the visible 20 and false of the hidden set. That exact reasoning, written
+   as an operator property, has now cost five separate operators.
+
+### C69 -- DEGENERATE SCALAR ATTRS: A FOLDED CONSTANT CAN BE NaN WHERE THE GOLDEN IS FINITE
+
+Hidden cases vary the **scalar attributes** too, not just tensor shapes and magnitudes, and a
+degenerate scalar puts algebraically-valid folding in an IEEE corner.
+
+`apply_adam_w` folded the AdamW update into `k1*m + k2*g`. Valid while the bias correction
+is finite. At `beta1 == 1.0` the correction `1 - beta1^step` is **exactly zero**, so
+`ihat1 = +Inf` and `(1 - beta1) = 0`, giving `k2 = 0 * Inf = NaN` -- and one NaN constant
+poisons every output element. The golden never distributes: it forms the numerator first
+(`m + 0*g == m`, finite) and divides once, yielding +-Inf.
+
+**The signature is unmistakable and invisible to any magnitude-based gate:**
+`MERE = MARE = 0.000000` with the comparator failing on `NaN位置不匹配` (NaN positions).
+
+> **CORRECTED 2026-09-26 -- do NOT read those zeros as "every finite element is bit-exact".**
+> `compare.py:390-398` returns a `CompareResult` carrying the DATACLASS DEFAULTS the moment the
+> NaN masks differ; the metrics are never computed. So `MERE = MARE = 0.000000` here means
+> *"the comparison exited before measuring"*, not *"the error was zero"*. The same applies to
+> `total_count: 0` on that output -- it is an artifact of the early exit, NOT an empty tensor.
+> I misread both on `dequant_swiglu_quant` and briefly concluded its `scale` output was empty.
+> (Inf-position mismatches behave differently: they are saturated to max-finite and the
+> comparison continues, so only a NaN mismatch produces this hard early exit.)
+> The practical consequence is that this signature tells you the non-finite PATTERN differs and
+> tells you NOTHING about the finite values -- you must measure those separately before claiming
+> the arithmetic is fine.
+
+`sparse_flash_attention` and `conv_2d` each have a case in this class too.
+
+**NOT EVERY INSTANCE IS A FOLD.** `conv_2d`'s bf16 NaN cases were a silent RANGE loss: prep
+re-encoded bf16 as fp16 on the reasoning that bf16's 8-bit significand fits fp16's 11. The
+significand fits; **the exponent does not** -- bf16 carries fp32's 8-bit exponent (max ~3.4e38)
+against fp16's 5-bit (max 65504). Every `|value| > 65504` became an fp16 Inf, and `Inf + -Inf`
+is NaN where the golden is finite. The measured threshold sat between 1e4 and 1e5, i.e. exactly
+65504. Running bf16 natively (`(float, bfloat16_t, bfloat16_t)` is a documented a2a3 TMATMUL
+triple, and TIMG2COL takes `bfloat16_t`) fixed it -- and the original "exact re-encode" premise
+was falsified outright: the two paths are BIT-IDENTICAL on in-range data and the native path is
+also faster, because it deletes an fp32 staging pass. So when you see this signature, check for
+a narrowing conversion as well as a fold.
+
+**So: before folding a constant, ask what it evaluates to at each endpoint of every scalar
+attribute's declared range** -- `beta1/beta2 in {0,1}`, `epsilon = 0`, `step = 0`, `lr = 0`,
+`scale = 0`. Where the folded coefficient is an indeterminate form, the correct value is
+whatever the UNFOLDED expression gives (here the gradient term is absent from the golden's
+numerator, so the coefficient is 0, not NaN):
+
+```c
+const double g_coef = (1.0 - beta1);
+c.k2 = (g_coef == 0.0 || !std::isfinite(ihat1))
+           ? 0.0f
+           : static_cast<float>(u * g_coef * ihat1 / s2);
+```
+
+### C70 -- A DEVICE FAULT INSIDE AN ACCEPTED SHAPE IS NOT A REJECTION, AND IT COSTS ~30 CASES
+
+`507035` is `ACL_ERROR_RT_VECTOR_CORE_EXCEPTION` and `507015` is its neighbour; torch_npu
+surfaces them with **"timeout" wording, which is not what they are** -- they are an AIV
+exception, not a hang. The device names the real cause if you ask it: *"The UB address
+accessed by the VEC instruction is not aligned"*, subErrType 4.
+
+**Two structural facts about how this appears in a hidden report:**
+
+- **A cluster of 3 consecutive failing cases means a shape FAMILY, not scattered numerical
+  error.** strided_slice faulted at 32-34 and again at 95-97; conv_2d at 52-54 and 72-74.
+- **Everything after a fault is collateral.** strided_slice reported 35 failures of which
+  only **6** were real; the other 29 read `device unrecoverable, case skipped` and never
+  executed. Count the real faults before sizing the defect, and never report a cascade
+  length as a failure count.
+
+The concrete ISA cause found here, previously undocumented: **`vreducev2` requires a
+32-byte-aligned UB destination.** Its compaction loop chunked the repeat at 255 (the hardware
+field is 8 bits) and re-based the destination by `done*outper` UNITS per chunk; with
+`outper == 1` and b16, `done = 255` lands 510 bytes past a 32 B base. Note the fix is NOT a
+255 cap -- that is a fitted bound (C67). Chunk in quanta that keep the destination aligned
+for ANY mode and repeat:
+
+```c
+const int q    = 32 / gcd(outper * ubytes, 32);
+const int rmax = (255 / q) * q;
+```
+
+Also: `vreducev2`'s repeat is declared `uint16_t` in the headers but the hardware field is
+**8 bits**. A wide declaration is not a licence to pass > 255.
+
+### C71 -- PROBE THE DECLARED DTYPE'S EXTREMES, NOT THE OBSERVED DATA'S
+
+`gcd` concluded that an int32 overflow path was unreachable because *"INT32_MIN occurs zero
+times in the generated data for all eight int32 cases"*. True of the visible 20. The hidden
+set drove it to ~1e18 and to INT_MIN, and the operator went 20/20 -> 70/80.
+
+Two distinct findings there, both worth carrying:
+
+- **Magnitude.** int64 was computed in 32-bit lanes because `vconv_s642s32` saturates.
+  Visible cases top out at |value| 100000; hidden cases reach 1e18. Supporting the declared
+  dtype means real 64-bit arithmetic -- and note `int32 TADDS` **saturates** rather than
+  wrapping, which kills the unsigned-compare-via-bias idiom, so 4x16-bit limbs in int32
+  lanes is the practical representation.
+- **The golden can be wrong at the extreme and it is still the spec.** `torch.gcd(INT_MIN, b)`
+  returns the correct magnitude with a sometimes-NEGATIVE sign, an overflow artifact of its
+  Euclid loop. Our kernel returned the mathematically correct non-negative value and FAILED.
+  Reproducing an artifact is legitimate work when the artifact is the scored reference;
+  verify it is deterministic first (C-Euclid emulation matched it exactly for b=1..128).
+
+**Operationally:** sweep each input to the limits of its **declared** dtype, and each scalar
+attr to the endpoints of its declared range, before claiming any path unreachable. A local
+probe driving cann-bench's own `DataGenerator` and `compare_tensors` at those limits
+reproduced all three gcd families for **zero credits**, and found two the paid hidden run did
+not reveal. Build the probe before spending a submission.
+
+**Finally, if your kernel writes a status word, your driver MUST read it.** gcd's kernel set
+a sticky GM flag when a tile exceeded INT32_MAX and neither the harness nor the wheel driver
+ever looked, so it returned silently wrong answers instead of rejecting -- the exact class
+C51/C53 exist to prevent. Reading it is three lines and converts silent-wrong into loud-fail.
+
+## C72: THE DECLARED-SURFACE GATE -- ASSERT YOU ACCEPT EVERYTHING THE SPEC DECLARES  🔴 **CRITICAL**
+
+C67 tells you to derive the supported set instead of enumerating it. That is a *principle*, and
+a principle is something a run has to remember. **C72 is the mechanical check**, and it exists
+because C67 alone did not hold: `sparse_flash_attention` was rewritten to derive its tiling and
+its very next bound (`Dk` "64-aligned") was fitted again, one level down.
+
+**Every hidden-set failure in this campaign that was OUR fault has had the same shape: the
+implementation covers the VISIBLE cases, and the scorer tests the DECLARED surface.**
+
+| operator | narrowed to | the spec declares | hidden result |
+|---|---|---|---|
+| `sparse_flash_attention` | a 10-tuple config lookup | derived from dims | **0 / 80** |
+| `conv_2d` | `khkw in {1,9,25}` | general convolution | 37 / 80 |
+| `cross_entropy_loss` | `target` int64 only | int32, int64, fp32, fp16, bf16 | 63 / 80 |
+| `gcd` | 32-bit lanes | int64 | 70 / 80 |
+
+### None of the other gates can see this class
+
+- A **contract sweep** samples the cases the benchmark happens to ship. It cannot know what the
+  document allows.
+- **C44's out-of-contract probe asks the wrong question.** It verifies that *unsupported* shapes
+  reject cleanly. `sparse_flash_attention` passed it **6/6** and scored **0.00** on all 80
+  hidden cases. Rejecting cleanly is correct behaviour for a genuinely unsupported shape and
+  worthless when the unsupported set is everything the scorer will test.
+- **C67 is judgement.** It has already been violated *after being followed*, in the same run.
+
+### The gate
+
+`skillyard-cannbench/tools/declared_surface_probe.py`. It parses `proto.yaml`'s per-input
+`dtype` lists and attr enums/defaults (plus `desc.md`'s dtype matrix, which is often stricter
+and more explicit), forms the **declared cross product**, and calls the operator once per
+combination on minimal tensors. It checks only one thing:
+
+> **does the operator ACCEPT every combination its own spec declares?**
+
+No golden, no accuracy comparison, no benchmark run, no credits -- so it is cheap enough to be
+unconditional. A combination that RAISES is a finding with exactly two legitimate outcomes:
+implement it, or write down why the spec is wrong. "No visible case uses it" is not one of them.
+
+    python3 declared_surface_probe.py <task_dir> <op_name> --install <isolated_install_dir>
+
+**IT MUST VARY ONE AXIS OFF A KNOWN-GOOD BASELINE, AND THE FIRST VERSION OF THIS TOOL DID NOT.**
+That version synthesised minimal tensors (a fixed 4x8) and passed only the attrs that declare an
+enum or default. Swept across 45 operators it reported **~100% rejection**, and every one was an
+artifact: `TypeError: missing 1 required positional argument` for attrs like `dim`, `strides`,
+`perm`, `num_groups`, or a rank error from the invented shapes. A 100% rejection rate reads like
+a catastrophic finding and was pure noise.
+
+The working design takes a **real case from the task's own `cases.yaml`** -- valid shapes, every
+required attr present -- builds its tensors with cann-bench's own `DataGenerator`, **asserts that
+baseline is ACCEPTED first** (printing `SETUP_FAILED` and claiming nothing if not), and then
+varies ONLY the declared dtype axis on top of it. Every rejection is then attributable to the
+dtype, because everything else is held at a configuration the operator demonstrably accepts.
+
+**Both controls, on the rewritten tool:**
+
+    POSITIVE  cross_entropy_loss  baseline case 1 ['float16','int64'] ACCEPTED
+                                  15 combinations, 12 REJECTED
+                                  -> target must be int64 hard labels, got Int
+    NEGATIVE  softmax             baseline case 1 ['float16'] ACCEPTED
+                                  3 combinations, 0 REJECTED
+
+**Never trust a gate you have not run against a known positive AND a known negative.** Three
+scans in this campaign returned falsely clean results for want of a positive control, and this
+tool's first version returned falsely alarming ones for want of a valid baseline.
+
+### The dtype lists are allowed SETS, not independent axes
+
+`proto.yaml` gives a dtype list per input. Cross-producting them independently generates
+combinations **the spec forbids**, and their rejection is correct behaviour. Most operators
+additionally require the float inputs to share one dtype, stated only in `desc.md` prose:
+
+    apply_adam_w   "var、grad、m、v 四个张量的 shape 和 dtype 必须完全一致"
+    maximum        "两个输入张量的 dtype 必须一致"
+    rms_norm       "gamma 的 dtype 需与 x 一致"
+
+The first fleet sweep reported **16 operators with rejections and 15 of them were this** --
+`apply_adam_w` alone showed 78/81 "rejected", every one a mixed-dtype combination the spec never
+declared. The probe now reads `desc.md` for that constraint and skips mixed-float combinations
+when it is present, while still varying INTEGER inputs independently -- which is what keeps
+`cross_entropy_loss`'s int32/soft-label hole visible (its matrix deliberately mixes
+`float32 | int32`). After the fix: `apply_adam_w` 3 combinations, **0 rejected**, 78 skipped;
+`cross_entropy_loss` unchanged at 12/15.
+
+**The lesson generalises past this tool: a "declared" surface is the DOCUMENT'S cross product,
+not the one your parser finds easiest to build.** Read the prose constraints and the dtype
+matrix, not just the per-field lists.
+
+### What the corrected fleet sweep actually found
+
+45 operators, credit-free: **26 CLEAN**, **3 could not establish a baseline** (claim nothing --
+`foreach_addcdiv_scalar`, `foreach_norm`, `lstm`), and **one confirmed finding**,
+`cross_entropy_loss`. The remaining rejections were spec-conformant mixed-dtype combinations or
+artifacts of the probe's own data generation (out-of-range values for `int8`/`uint8`, an
+optional-scale argument the int32 path requires). So the class is real and expensive but it is
+NOT widespread -- worth knowing before a fleet-wide rewrite is proposed on the strength of a
+scary-looking table.
+
+**Its positive control is the failure that motivated it.** On `cross_entropy_loss`, seconds of
+runtime, zero credits:
+
+    declared: input {float32,float16,bfloat16} x target {int32,int64,float32,float16,bfloat16}
+    15 declared combinations tried, 12 REJECTED
+      {'input': 'float32', 'target': 'int32'}
+         -> RuntimeError: target must be int64 hard labels, got Int
+
+That is verbatim the message four hidden cases returned in `job_349a3591d562`. The paid run
+found it at a cost of one credit and a 62.62; the gate finds it before packaging.
+
+### The rule
+
+1. **Run the gate before shipping, and again after any change to a dispatch, a `TORCH_CHECK`, or
+   a supported-set predicate.** Record the combination count and the rejection count next to the
+   contract sweep.
+2. **Zero rejections, or a written justification per rejection citing `desc.md`/`proto.yaml`.**
+   A `TORCH_CHECK` that refuses a dtype the spec allows is a self-inflicted zero, not a safety
+   check: every scoring term scales by the pass fraction, so each rejected case costs up to 5
+   points.
+3. **A declared dtype you have not implemented is a MISSING FEATURE, not an unsupported input.**
+   `cross_entropy_loss` never implemented soft labels (`target` float = a probability
+   distribution, `-sum(p * log_softmax(x))` rather than a gather) because no visible case used
+   them. Read the dtype matrix in `desc.md` as a feature list.
+4. **Widen the gate wherever the spec enumerates anything** -- reduction modes, layouts,
+   `approximate`, padding modes, `is_causal`. Any attr with a declared enum belongs in the cross
+   product, not just dtypes.
+5. **Casting a declared integer dtype is not free.** `int32 -> int64` on a device tensor lowers
+   to `aclnnCast`, which the evaluation image does not serve (C68). Round-trip through the host.
+
+**Why this is CRITICAL and not STANDARD:** the failure mode is a total or near-total loss on an
+operator that passes every local gate at 20/20, and it has now cost this campaign four
+operators, one of them entirely.
+
+## C73: A LEGAL NO-OP MUST STILL LAUNCH -- ZERO KERNELS ZEROES THE OPERATOR  🔴 **CRITICAL**
+
+**An operator can be numerically perfect on every case and still score exactly 0.**
+
+`strided_slice` v127, hidden set: `accuracy_passed_cases: 80` of 80, `genuine_pass_rate: 1`,
+`result_contract.valid: true`, geomean speedup **2.85x** -- final score **0**. One case did it:
+
+    case 96   status: success          accuracy.passed: true
+              total_count: 0           <- the output has ZERO elements
+              elapsed_us: 0            op_times: {}
+              failure_type: anti_cheat anti_cheat_invalidated: True
+              performance_error_msg: 未检测到 NPU 算子执行，疑似 CPU fallback，反作弊触发
+                                     ("no NPU operator execution detected, suspected
+                                      CPU fallback, anti-cheat triggered")
+
+Hidden case 96 has an **empty output**, so the driver did the obviously correct thing:
+
+```python
+y = torch.empty(oshape, dtype=x.dtype, device=x.device)
+if y.numel() == 0:
+    return y            # nothing to compute -> nothing launched
+```
+
+No launch means no NPU kernel in the profile, which the anti-cheat reads as CPU fallback. It
+does not merely void that case -- `score_error_code: no_npu_kernel_detected` zeroes
+**compilation_score, function_score AND performance_score for the whole operator**. An ~86-point
+operator became 0 because one degenerate case correctly did nothing.
+
+### The rule
+
+**Never return from the host without launching.** If the work is empty, launch anyway with
+`block_dim = 1` and let the kernel return immediately on-device. One ~4 us launch on a case that
+computes nothing is the entire cost, and it is the difference between ~86 and 0.
+
+```python
+y = torch.empty(oshape, dtype=x.dtype, device=x.device)
+# C73: do NOT early-return on an empty output. A profiled window with no NPU kernel trips
+# cann-bench's anti-cheat (no_npu_kernel_detected) and zeroes EVERY score for the operator,
+# even though accuracy passes trivially. Launch with a degenerate grid instead.
+rc = lib.call_kernel(0 if y.numel() else 1, stream, ...)
+```
+
+and on the device side, make the no-work path a launched no-op rather than a skipped launch:
+
+```c
+    if (nelem_out == 0) { /* launched, writes nothing */ return 0; }   // NOT a host-side skip
+```
+
+### Why no existing gate catches it, and why "it passed" is not evidence of safety
+
+- **Accuracy gates pass it trivially.** `mismatch_count: 0` of `total_count: 0`. The case is
+  recorded as `passed: true`; only the *performance* stage flags it.
+- **Our own out-of-contract probes treat a clean empty-output return as CORRECT** -- the
+  generating run documented "call_kernel returns 0 on success (including the legal empty-output
+  case)" as a feature. By every standard except the scorer's, it was.
+- **The visible 20 contain no zero-element case,** so this is invisible until a hidden run. Same
+  shape as C67/C72: the declared surface includes degenerate extents that the shipped cases omit.
+- **A passing score is luck, not safety.** TEN operators in this collection had a
+  launch-skipping path -- and the two most exposed are the two BEST results in the campaign:
+
+      exp/cann_bench/_exp.py:149              if n == 0: return torch.empty_like(x)
+      masked_scale/_masked_scale.py:141       if n == 0: return torch.empty_like(x)
+      gather/_gather.py:80                    if y.numel() == 0: return y
+      transpose/_transpose.py:71              if y.numel() == 0: return y
+      mish/_mish.py:118 + kernel_mish.cpp     (BOTH layers)
+      strided_slice driver + call_kernel x2   (BOTH layers)
+      gcd kernel_gcd.cpp:1529                 (via pl.rc == 1)
+      foreach_addcdiv_scalar kernel_fa.cpp:441  if (ntot == 0) return 0;
+      maximum kernel_maximum.cpp:760            if (n <= 0) return 0;
+      arg_max argmax_plugin.cpp:131             rank-0 input returns with no launch
+
+  `exp` is the campaign's only rank-1 operator (93.38, 80/80 hidden) and `masked_scale` its
+  highest hidden score (94.55, 80/80). Both passed only because no hidden case had a
+  zero-element input. **Fix it in every operator, including the ones that are passing.**
+
+- **A LEADERBOARD ENTRY ALREADY BANKED IS SAFE; A RE-RUN IS NOT.** Because an entry is the best
+  FULLY-PASSING run, a later anti-cheat zero cannot displace a posted score. What the defect
+  costs is the ability to ever re-run or resubmit that operator, which is exactly what you must
+  do to improve it.
+
+- **FIX AT EVERY LAYER.** A driver-side fix alone is usually insufficient: `mish` and
+  `strided_slice` each skipped the launch a SECOND time inside `call_kernel`, which is host code
+  living in the CCE TU. Removing only the Python early-return leaves the bug.
+
+- **Grep for this pattern across two lines, and use a control.** The condition and the `return`
+  sit on separate lines, so a single-line `grep ... | grep return` finds nothing and reports a
+  clean fleet. Two scans of mine did exactly that and reported 3 operators instead of 10; one of
+  them additionally lost operators to a zsh `nomatch` glob that kills the whole `grep`. Verify any
+  such scan against a site you already know exists.
+
+### How to check it locally, for free
+
+Add a zero-element configuration to the contract sweep for **every** operator, and assert that a
+kernel actually launched -- not that the result was correct. Profile it, or read back a
+launch counter the kernel increments; a correct empty output proves nothing. Any degenerate
+extent the declared shape space allows (a zero dim, an empty slice, `k = 0`, an empty segment)
+belongs in that sweep.
+
+**Related:** [C51/C53] a status word nobody reads; [C72] the declared surface includes degenerate
+extents. The common thread is that **the scorer measures what ran, not only what was returned.**
+
+### Measuring "no regression": the stored baseline is not a control
+
+When you claim a fix does not regress an operator, compare against the **old artifact re-measured
+in the same session**, not against a number in the campaign store. Cross-session drift on this
+host is ~0.4 points -- comparable to or larger than most effects, and larger than several
+operators' own replicate spreads.
+
+The C73 batch is the worked example. Six operators got a change that is provably inert on every
+visible case (a guard on a degenerate path no scored case reaches). Five came back **0.16-0.37
+below their recorded baselines**, reading as five regressions. A matched same-session control on
+`masked_scale`, backed-up pre-fix wheel against the fixed one, three replicates each:
+
+    pre-fix  88.24, 88.25, 88.30   median 88.25
+    fixed    88.14, 88.28, 88.60   median 88.28      matched delta +0.02
+    recorded baseline (earlier session)   88.65
+
+The old wheel scores 88.25 today as well. So: **back up the pre-change artifact before editing,
+and score it beside the new one, serialized, same device, same session.** Report the matched
+delta. And when several independent changes all move the same direction by a similar small
+amount, suspect one shared cause before believing N separate regressions.
+
+## C74: `TQUANT` GUARDS ITS ALIASING ON THE STATIC WIDTH, NOT THE RUNTIME ONE  🔴 **CRITICAL**
+
+`pto/npu/a2a3/TQuant.hpp` reuses **one buffer** for the fp32 source, the s32 intermediate and the
+fp16 intermediate (`TASSIGN_IMPL(src_f16, src.data()); TASSIGN_IMPL(src_s32, src.data())`). The
+s32 -> fp16 step therefore aliases a 4-byte-per-element array onto a 2-byte-per-element one **with
+different row strides**. The library knows this is dangerous and guards it:
+
+```cpp
+constexpr bool kHasTail = (TileDataCvtS32::Cols % kS32ElemsPerRepeat != 0);   // STATIC Cols
+if constexpr (kHasTail) { if (TQuantBuffersOverlap(...)) { /* safe row-by-row path */ } }
+else { TCVT_IMPL(src_f16, src_s32, ...); }                                     // fast, aliased
+```
+
+**`Cols` is the TEMPLATE width. `validCol` is never consulted.** So a tile with a 64-aligned
+static width and a non-aligned RUNTIME width takes the unsafe fast path, and the write of one
+fp16 block overlaps the s32 read of another.
+
+**Predicate, derived from the stride arithmetic and then confirmed 60/60 on device:**
+
+    corrupt  iff  vc > 128  AND  vc % 64 != 0
+    bad columns: [64*floor(vc/64), +32)      i.e. the first 32 of the last partial 64-block
+    bad rows:    the LOWER HALF of each row tile
+
+Worked example: `N = 2018 -> N/2 = 1009 -> chunks 256, 256, 256, 241`. Bad columns are exactly
+global 960-991 on rows 0-15 and 32-47. This was predicted analytically *before* it was measured,
+which is why the predicate is trustworthy rather than curve-fitted.
+
+**Fix at the call site** (do not wait for the library): round the valid column count up to a
+multiple of 64, quantise the rounded width, and `TSTORE` only the real columns.
+
+```c
+const int vq = ((vc + 63) / 64) * 64;      // static tile width must be 64-aligned
+TQUANT(q8, tile(vr, vq), scale);
+TSTORE(..., vc);                           // pad lanes are stale UB and are discarded
+static_assert(kWC % 64 == 0, "TQUANT aliasing guard needs a 64-aligned static width");
+```
+
+**Do NOT pre-zero the pad lanes with a sub-tile `TASSIGN` at `base + vc*esize`.** A `TASSIGN`
+byte offset that is not 32-byte aligned faults the Vec: at `vc = 1` that is offset 4 and the
+kernel dies with `507015 ... The UB address accessed by the VEC instruction is not aligned`.
+The 32-byte requirement applies to the **TASSIGN offset**, not only to tile geometry. The pad
+lanes are discarded by the store, so they never need zeroing.
+
+**Why this is CRITICAL:** it is silently wrong on a shape the contract accepts, it hides in the
+last partial chunk, and it only touches half the rows -- so a spot check of row 0 passes. It cost
+`grouped_matmul_swiglu_quant` 62 of 260 randomised in-contract shapes.
+
+## C74a: `TRowSumOp` HAS A WIDE `FillTmp`; `TRowMaxOp` DOES NOT -- SO ONLY THE SUM OVER-RUNS
+
+The row-reduce scratch rule (scratch width scales with `validCol`, and a ONE-ROW tmp hides the
+bug as an out-of-bounds write rather than a wrong answer) has a specific and non-obvious shape:
+
+* `pto/npu/a2a3/TRowSum.hpp :: TRowSumOp::FillTmp` writes `floor(k/2)` repeats at
+  `tmp + i*ElemPerRpt`, i.e. it needs `64*floor(floor(validCol/64)/2)` floats -- **not 64**.
+* `TRowMaxOp` inherits the **generic** `FillTmp`, which writes one repeat only.
+
+So an identical `[1,64]` scratch tile is safe for `TROWMAX` and overflows for `TROWSUM`. On
+`add_rms_norm_dynamic_quant` the fold exits at `64*k` with **k odd** (`sw=7168 -> 448, k=7`;
+`sw=8064 -> 4032, k=63`), and the over-run of `(floor(k/2)-1)*256` bytes walked past the scratch
+into the per-row accumulators:
+
+    <= 1280 B (k <= 11)   lands in unused space          harmless
+    1281-2304 B (k 13-19) lands in the SUM accumulator   scale wrong, y still passes
+    > 2304 B (k >= 21)    lands in SUM + MAX accumulators scale AND y wrong, max_diff 255
+
+**41% of the declared width range carried this at every M**, and all 20 visible cases missed it
+because only one of them reaches that path at all. The fix that adds no UB: after the log-fold
+`len` is a multiple of 64 by construction, so view the remainder as `[len/64, 64]` and reduce in
+two `OneRepeatProc` levels -- `OneRepeatProc` does not touch the scratch at all.
+
+**And never hand the library a `validCol > 64` on a one-row scratch tile without checking which
+`FillTmp` that operation resolves to.**
+
+## C75: A RETURN CODE READ AFTER AN ENQUEUE IS ALWAYS ZERO  🔴 **CRITICAL**
+
+```cpp
+int launch_rc = 0;
+at_npu::native::OpCommand::RunOpApi("op", [&]{ launch_rc = call_kernel(...); });
+TORCH_CHECK(launch_rc == 0, "...");     // <-- ALWAYS PASSES. RunOpApi ENQUEUES the lambda.
+```
+
+`RunOpApi` **enqueues** the lambda onto the task queue and returns; the body has not run when
+`TORCH_CHECK` evaluates, so `launch_rc` is still the host-stack initialiser. **Every rejection the
+kernel can raise is silently discarded**, and the operator returns whatever was in the output
+buffer -- uninitialised memory, not an error.
+
+Measured on `add_rms_norm_dynamic_quant`: out-of-contract `D = 16385 / 20000 / 65536` gave
+**15/15 silent accepts, no raise**, returning uninitialised buffers. It raised only
+*intermittently*, when scheduling happened to let the lambda run first -- which is worse than
+never raising, because it looks like a working guard.
+
+**This defeats C51/C53 entirely.** Those rules exist so an out-of-contract shape fails loudly
+instead of returning a wrong answer; an rc checked after an enqueue re-opens exactly that hole,
+and it is invisible in review because the code *looks* like a correct guard.
+
+**The fix: validate synchronously on the host, BEFORE the enqueue.**
+
+```cpp
+TORCH_CHECK(D >= 1 && D <= 16384, "op: D out of contract, got ", D);   // host-side, synchronous
+at_npu::native::OpCommand::RunOpApi("op", [&]{ (void)call_kernel(...); });
+```
+
+Anything the host can decide -- shape, rank, dtype, declared ranges -- belongs in a synchronous
+`TORCH_CHECK`. If a condition can only be known on device, it needs a status word the driver
+reads back **after a sync**, not an rc captured by reference across an enqueue boundary.
+
+**How to test it.** Feed a shape you know the kernel rejects and assert the call RAISES. Do not
+assert on the returned rc, and do not accept "it raised once". The measured procedure, from an
+audit of 14 operators:
+
+1. **Prime the output with a poison sentinel** before the call (e.g. fill with `0xA5`).
+2. **Assert it raises over >= 10 attempts.** The race is real and its rate is unstable: measured
+   raise rates were `0/12`, `1/12` and `2/12` for different shapes of the same operator, and one
+   operator raised `0/12` in the raise probe and then raised on the *first* call of the next
+   probe. A single observation in either direction is worthless.
+3. **For any attempt that did NOT raise, assert the output is bit-identical across >= 6 repeat
+   calls.** A non-deterministic output is the proof the kernel never ran.
+
+**Step 3 is the one that matters**, and it is the one you would skip. In that audit **8 of the 11
+exposures left no surviving sentinel at all** -- the caching allocator handed out fresh blocks --
+so a poison check alone would have reported "it returns *something*, probably fine". A surviving
+sentinel is a bonus, not the primary signal. When it does survive it is damning: one operator came
+back with `poison_frac = 1.0` (the entire output was still the sentinel) and another at 0.844.
+
+**And the regression surface of this fix is small**, which makes it cheap to verify: moving a
+check to the host can only ADD raises, so screening every published case shape for acceptance is
+the whole test. All nine operators fixed in that audit kept 20/20 acceptance, and because
+`*_launch.h` is host-only, all nine device binaries stayed **byte-identical**.
+
+---
+
+## C76: EVERY NUMERIC CAP MUST BE JUSTIFIED AGAINST THE **DECLARED** MAXIMUM  🔴 **CRITICAL**
+
+**Rule.** Before packaging, take every numeric constant in your kernel and driver that can cause
+a *rejection*, and check it against the maximum the operator's own specification declares. A cap
+strictly below a declared maximum is a defect unless you can name the hardware limit that forces
+it. "No case I was shown needs more" is not a justification -- it is the definition of the bug.
+
+**Why this rule exists.** C67 says *derive the supported set, never enumerate it*, and C72 gives a
+runtime probe for it. Both were in force, and this class still cost four operators, because the
+C72 probe varies the **dtype** axis and every one of these failures lives on the **shape and attr**
+axes. The measured bill:
+
+| operator | spec declares | our source caps | cost |
+|---|---|---|---|
+| `softmax` | last axis `1 ~ 2097152` | bucket table ending `(12288, 1)` | 8 cases, **-9.28** |
+| `adaptive_avg_pool_3d` | `W 1 ~ 256` | `LAUNCH(SUF,TY,128) LAUNCH(SUF,TY,144)` | 3 cases, **-4.23** |
+| `conv_2d` | `K_h 1 ~ 16` | `khkw in {1, 9, 25}` | 3 cases |
+| `grouped_matmul` | bias dtypes incl. bf16 | bf16 bias unimplemented | 23 cases |
+| `mla_prolog` | an 8-value `n_heads` enum | rejects `n_heads` 1 and 2 | -- |
+
+Five different operators, five different mechanisms -- a template instantiation list, a bucket
+table, a lookup table, an unimplemented dtype branch, a hard cap chosen for headroom over the
+largest visible case -- and **one shape**: a supported set fitted to the cases that happened to be
+visible. The hidden set is 4x the visible set and probes exactly the edges you did not see.
+
+**This is the cheapest rule in this document to obey.** The declared maxima are written in
+`desc.md`'s support-range table and the caps are constants in your own source, so the check is
+**static**: no device, no execution, no credit. Every failure in that table was findable before
+submission by reading two files side by side. `tools/declared_vs_cap_audit.py` in the campaign repo
+mechanises it, but the audit is a triage list, not a verdict -- you still have to read each hit.
+
+### THE DECLARED MAXIMUM IS A FLOOR, NOT A CEILING (measured 2026-09-28)
+
+**The hidden set can contain shapes OUTSIDE the operator's own published range.** Matching
+`desc.md` exactly is NECESSARY but NOT SUFFICIENT.
+
+`add_rms_norm_dynamic_quant`, hidden case 86:
+```
+desc.md declares   N (last dim)  1 ~ 16384     annotated "cases.csv 实测 128 ~ 16384"
+largest visible                     16384
+hidden case 86     D =             28672       1.75x ABOVE the declared maximum
+```
+Our kernel refused it **citing desc.md** -- a `compile_runtime_error`, the expensive kind, costing
+the compile term as well as function and performance. One case, **-4.42**.
+
+So the audit has two halves, and the second one is new:
+1. **A cap BELOW the declared maximum is a defect.** Unchanged, and still the class that has cost
+   the most -- five operators and counting.
+2. **A cap exactly AT the declared maximum is a RISK.** Where headroom is cheap, take it: a
+   runtime-tiled path with no fixed ceiling costs nothing extra and cannot be surprised. Where a
+   ceiling is genuinely forced by UB, L1 or a workspace bound, write the number and the reason
+   down so the next run prices it instead of rediscovering it.
+
+**And do not fit the new constant to the case that bit you.** Raising the cap to exactly 28672 would
+repeat the fitted-contract mistake one notch further out -- the same error `conv_2d` made when its
+`khkw` set went from `{1,9,25}` to `<= 160` while the declared maximum was 256.
+
+**The discriminator, and it is the whole skill in applying this rule:** a constant is *fine* if it
+selects a **tile** and *fatal* if it gates a **rejection**. `wWant = 224` picking a vector width is
+correct engineering. `if (R > 12288) return -2;` is a fitted contract. Trace each constant to
+whether a value above it produces a *smaller tile and a correct answer*, or an *error return*.
+Report both classes; only the second is a defect.
+
+**And prefer a runtime-tiled path to a longer list.** Adding `256` to an instantiation list fixes
+the three cases you were just billed for and leaves the next unlisted width just as broken, at the
+cost of more compile time and a bigger binary. If you keep a static ladder for speed, put a general
+runtime fallback beneath it so that **no declared shape can reach a rejection**. A ladder with a
+fallback is an optimization; a ladder without one is C76.
+
+**Two traps when you widen a cap:**
+- **A newly reachable shape is newly reachable for the device too.** Lifting `W` to 256 at `C=512`
+  may be the first allocation of that size the kernel has ever made -- see **C70**, and stop rather
+  than retry if a shape faults the card.
+- **A dimension that is prime factors into nothing.** One `softmax` hidden case is `R = 1000003`.
+  Any widened path that assumes the extent divides by a tile width fails it. Handle the ragged tail.
+
+Related: **C67** (derive, never enumerate -- C76 is its static, pre-submission check), **C68**,
+**C69**, **C70**, **C71**, **C72** (the dtype-axis runtime probe this rule complements).
+
+---
+
+## C77: A CUBE TILE'S PARTIAL EXTENT IS HONOURED ONLY AT THE FRACTAL-ROUNDED DECLARATION  🔴 **CRITICAL**
+
+**Rule.** A Cube tile's runtime valid extent is respected **if and only if** the declared dimension
+equals the fractal-rounded valid extent:
+
+```
+Rows == ceil(ValidRow / 16) * 16        and        Cols == ceil(ValidCol / 16) * 16
+```
+
+Declare a tile wider than that and the result is **silently wrong from output column 16 onwards**,
+and a mismatched **transposing (ZN) feed hangs the AI core** (`aicore timeout 507014`).
+
+**Why this is the worst possible failure shape: the first 16 columns are CORRECT.** Any smoke test
+that checks a corner, a first row, or a narrow slice passes. The error begins exactly where a
+quick check stops looking.
+
+**Probed, with a positive control on a known-bad case:**
+
+| declared `Rows` | `ValidRow` | result |
+|---|---|---|
+| 128 | 128 | exact, 1.4e-07 |
+| 128 | 16, 32, 37, 64 | **WRONG**, rel 8.5-10.7 |
+| 48 | 33, 37, 48 | exact |
+| 48 | **16** | **WRONG** |
+| 16 | 1, 5, 16 | exact |
+| 16x16 matched partials | -- | exact, 4.6e-08, on both the ZN and the non-transposing feed |
+
+Note row 4: `Rows=48, ValidRow=16` fails while `Rows=48, ValidRow=33` passes. The rule is not "small
+valid extents are fine" -- it is the equality above, and nothing else.
+
+**What to do with a ragged extent.** Two correct options, and the choice is forced by tile width:
+1. **Tile is 16 wide** -> use a runtime `DYNAMIC` valid dim; the equality holds automatically.
+2. **Tile is wider** (e.g. a 64-wide fast geometry) -> **shift the last chunk back** so the tile
+   stays full, and zero the `ov = ceil(N/kT)*kT - N` duplicated columns afterwards on the Vec side
+   through an alias at **column offset 0**.
+
+For (2), a companion Vec rule was probed the same way: **an aliased Vec tile at column offset 0 is
+exact for every width 1..64**, including non-multiples of 8 floats -- but at a **non-32-byte-aligned
+column offset it FAULTS the device**. So the zeroing alias must start at offset 0.
+
+**Shifting back makes two cores write the same output rows.** That they write the same *bytes* is a
+claim you must MEASURE, not argue: 5 repeats bit-identical across every shift-back shape, including
+a causal `S=2047 / S_kv=2048` and `S=300 / S_kv=1001`. Determinism under a deliberate write overlap
+is exactly the kind of thing that is usually fine and occasionally is not.
+
+**And a rejection can be hiding a real bug, not merely narrowing the domain.** The `mha` kernel
+refused `D=192` (148 declared combinations) via an explicit `D != 64 && != 128 && != 256` check --
+but the guard was not about `D` at all. `kT = (kD <= 128) ? kD : 128` made `kNK = kD / kT` equal
+**1** for `kD=192` by integer division, so the contraction silently covered 128 of 192 columns.
+`D=192` needs `kT=64`. **Before deleting a rejection, find out what it was protecting** -- widening a
+guard that sits on top of an arithmetic bug converts a loud refusal into a wrong answer.
+
+### LIMIT OF THIS RULE: it does NOT extend to the K axis of a transposing `Mat->Right` TEXTRACT
+
+Measured on `conv_2d`, 2026-09-27. Declaring the tiles at the 16-rounded K with a **partial valid K**
+(8 or 24) let the Cube consume the surplus rows anyway:
+
+| dtype | gw | result |
+|---|---|---|
+| fp32 | 1 | **MERE 261 / MARE 77121** |
+| fp32 | 3 | **MERE 113 / MARE 108943** |
+| every 16-exact K | -- | PASS |
+| every fp16 `gw` | -- | PASS |
+
+So on the contraction axis of a transposing feed, **K must be a TRUE multiple of 16** -- the
+fractal-rounded declaration is not enough. This is why an odd `Kw` needs a dedicated permute kernel
+on fp32: an odd `Kw` has no even divisor, so the parity has to come from the C1 axis, which forces
+that axis inner in the filter layout.
+
+**Read C77 as: the equality is NECESSARY everywhere and SUFFICIENT only off the transposing K axis.**
+
+Related: **C76** (the fitted-contract class this guard belonged to), **C52** (barrier ownership),
+**C70** (device faults on newly reachable shapes), **C79** (a silently-dropped kernel body).
+
+---
+
+## C78: A `tmp` TILE MUST BE DISTINCT FROM **BOTH** src AND dst  🔴 **CRITICAL**
+
+**Rule.** For any PTO op whose 3-argument form takes a **scratch tile**, that scratch must alias
+neither the source nor the destination. `TRSQRT(dst, src, src)` is a **race**; `TRSQRT(dst, src, dst)`
+is **deterministically wrong**.
+
+**Mechanism**, from `pto-isa` `109c9f72`, `include/pto/npu/a2a3/TUnaryOp.hpp:281`
+(`TRsqrtHighPrecision`):
+
+```
+set_mask_count(); set_vector_mask(0, blockSizeElem);
+vector_dup(tmp, (T)1.0, ...);              // writes ONE 32-byte block
+set_vector_mask(0, validCol);
+for r: vsqrt(dst + r*ds, src + r*ss);      // <-- reads src.  NO BARRIER SINCE THE DUP.
+pipe_barrier(PIPE_V);
+for r: vdiv (dst + r*ds, tmp, dst + r*ds);
+```
+
+There is a barrier between the `vsqrt` and the `vdiv`, and **none between the dup and the `vsqrt`**.
+So with `tmp == src`, the dup overwrites **8 fp32 lanes** of the source with `1.0` and whichever op
+lands first decides the answer.
+
+**WHICH OPS.** Only the families that actually declare a `TmpTile`. In `a2a3` those are
+`TUnaryOp` (**TABS TEXP TLOG TMULS TNEG TNOT TRELU TRSQRT TSQRT**), `TCvt` (**TCVT**),
+`TGather` (**TGATHER**), `TSel` (**TSEL**), `TSels` (**TSELS**), `TPow` (**TPOW TPOWS**),
+`TSort32` (**TSORT32**), `TMrgSort` (**TMRGSORT**).
+
+**A BINARY OP IS NOT THIS BUG, and confusing the two produces a flood of false alarms.**
+`TMUL(dst, src0, src1)` lowers to `vmul(dst, src0, src1, ...)` -- its third argument is a **second
+source**, so `TMUL(p, p, p)` is squaring in place and is correct. The same holds for `TADD`, `TMAX`,
+`TDIV`, `TSUB`, `TOR`. A first sweep of this campaign reported **30 sites; 29 were binary ops and
+only 1 was real.** Scan by the op-name list above, and carry a **negative control**
+(`TMUL(p,p,p)` must NOT be flagged) alongside the positive one
+(`TRSQRT(ptmp, pall, pall)` must be flagged).
+`skillyard-cannbench/tools/scan_tile_aliasing.py` does this; a full-fleet sweep of 49 operators found
+**zero** further instances.
+
+**Why it survives every gate we have.** The measured case (`rms_norm`, small-D path):
+
+- It corrupts a whole output row -- `1/rms` becomes exactly `1.0`, so the row emerges scaled by
+  `rms` -- but only a few hundred elements out of ~10^6, so **MERE stays inside tolerance** and only
+  `MARE` fails. See **C69**.
+- It is **nondeterministic**: 15 failures over 88 process-runs, and 1 in 6 repeats at a fixed shape.
+- The visible cases missed it because the only visible small-path case used a **different dtype**
+  (bf16, whose tolerance is 10x looser) **and** a `D` that never lost the race.
+- 675 shape points, 5184 dtype-range points, 72 natural draws at 33M elements and **816 planted
+  near-zero probes all passed.** Input conditioning was the wrong axis entirely.
+
+**Its fingerprint, which identifies it from a score report alone: `MARE < 1` strictly.** For a
+corrupted row `rel = |1 - rms|` at every element, so `MARE = |1 - rms|`, always below 1. A dropped or
+stale element instead gives `rel -> 1.0` exactly. Two reported failures at `MARE` 0.609 and 0.852
+back-solved to `rms` 0.391 and 0.148.
+
+### The detection technique -- add it to the standard regression set
+
+A pass/fail tolerance gate cannot see this. **Ask a sensitivity question instead:** per row, recover
+the implied scale factor `c = ours / (reference without the normalisation)` and flag `|c - 1| > 1e-3`.
+That catches a whole-row scale error at 1e-3 where a tensor-wide MARE gate needs 1e-2, and it fired
+on the first sweep after 1500+ conventional probes had found nothing.
+
+**And run ONE SHAPE PER PROCESS in a shape sweep.** 15 of the 88 observed failures needed a *cold
+launch*; a single-process sweep systematically under-counts a startup-sensitive race.
+
+Related: **C69** (a tiny MERE with a large MARE), **C52** (barrier ownership), the TRECIP
+aliased-destination finding (same family: an aliased destination returns 1.0 with no error), and
+**C74a** (`TRowSumOp` has a wide `FillTmp`, `TRowMaxOp` does not).
+
+
+---
+
+## C79: A CAPACITY GUARD CAN DROP THE KERNEL BODY AND STILL RETURN SUCCESS  🔴 **CRITICAL**
+
+**Rule.** An `if constexpr` (or any compile-time) capacity guard around a kernel body can compile the
+body **away entirely** while `call_kernel_*` still returns **0**. The operator then reports success,
+writes nothing, and scores against whatever happened to be in the workspace.
+
+Measured on `conv_2d`, 2026-09-27: a host slip produced `gw=5 -> KT=80`, past the L0A budget. The
+guard dropped the body, the return code stayed 0, and the accuracy gate read **MERE 1.6-3.3** off an
+untouched workspace. A second, independent route to the identical signature: a mechanical edit that
+left the dtype-dispatch macro **defined but never invoked**.
+
+**This is the same failure family as C73 and C75** -- a kernel that does nothing and reports success --
+and it is the hardest of the three to see, because there is no empty output, no rejection, and no
+device fault. Nothing in the launch path is wrong; the work simply is not there.
+
+**How it was actually localised, and the technique to reuse: fill the output workspace with a
+SENTINEL before the launch and check whether the sentinel SURVIVES.** A surviving sentinel proves the
+body never ran. Note the asymmetry with C73's poison check: there, 8 of 11 exposures left no sentinel
+because the caching allocator handed out fresh blocks, so survival is a bonus signal for a *missing
+launch*. Here the launch DOES happen and the buffer is the one you primed, so the sentinel is
+reliable -- it is the primary signal, not a bonus.
+
+**Guard both sides.** A compile-time bound alone is what creates this: pair it with a **host-side
+bound** that rejects the configuration before launching, and a **device-side `rc`** for the case that
+reaches the kernel anyway. Then an out-of-budget configuration produces a loud refusal instead of a
+silent no-op.
+
+**And treat a dispatch macro as code that must be proven to run.** `defined but never invoked`
+compiles cleanly and tests green on any case whose path is still wired. Assert at least one device
+kernel row per accepted configuration (**C73**'s measurement) so a vanished body cannot pass.
+
+Related: **C73** (a legal no-op must still launch), **C75** (an rc read after an enqueue is always
+zero), **C66** (unwired host-side changes), and the `PTO_DBUF` finding (a lever that reserved memory
+and did nothing -- the same class of "the change did not take effect").
+
+---
+
+## C80: A VEC OP ON A TILE WITH `validCol < Cols` **AND** `validRow > 1` CAN FAULT THE CORE  🔴 **CRITICAL**
+
+**Rule.** A PTO Vec binary op or `TCVT` on a tile whose **valid column count is below its static
+`Cols` while its valid row count is above 1** can fault the AI core:
+
+```
+the address for the VEC instruction to read/write UB is out of bounds
+```
+
+The **flat** shape is clean -- either `validRow == 1`, or `validCol == Cols`. One `TMUL` on `[112,64]`
+tiles with a valid extent of `[3,17]` is enough to trigger it; independently reproduced on an
+fp16->fp32 `TCVT` over `[1,2048]` tiles at `validCol` 1536.
+
+**MTE IS NOT AFFECTED.** `TLOAD`/`TSTORE` with a partial `validCol` are fine, and the reason was
+measured rather than assumed: they lower to `copy_*_align_b32` with `lenBurst` in bytes and
+`ubGap = ((Cols-validCol)*sizeof(T)) >> 5`; the hardware advances the UB side by
+`ceil(lenBurst/32)*32 + ubGap*32`, and **those two round-offs cancel exactly for every `validCol`.**
+So the hazard is specific to the Vec pipe.
+
+### It is built to survive your test suite
+
+This is the part to internalise, because every cheap check passes:
+
+| what was tried | result |
+|---|---|
+| a single launch | **passes** |
+| 40 repeats over the SAME buffers | **passes** |
+| a 3480-case correctness sweep | **never saw it** |
+| repeats over **freshly allocated** tensors | **faults at launch 1-7** |
+
+And the obvious explanations are all wrong, each falsified by measurement:
+- **not a GM overrun** -- padding by 64 floats did not help, putting all six tensors in one buffer
+  with 1 MB canary gaps did not help, and a canary check found **zero** out-of-bounds writes;
+- **not a UB height limit** -- shrinking the UB budget from 172032 to 98304 bytes did not help.
+
+It was localised by **compile-guard bisection**: the two `TLOAD`s alone are clean, the arithmetic
+block faults, and then down to the single instruction.
+
+### The fix
+
+**Run every vector op and every cast at the tile's FULL STATIC WIDTH.** For a 2-D tile, take a flat
+`[1, Rows*Cols]` view over the whole region *including* each row's column padding -- when all buffers
+share the pitch, the valid columns get the right answer and the padding computes a value you discard.
+**Zero that padding once per launch** so it can never hold a denormal and cost you throughput.
+
+After the fix: 108 configs x 25 fresh-allocation launches, **0 faults**.
+
+### A companion MTE rule from the same probe
+
+**A UB address that is 4-byte aligned but NOT 32-byte aligned faults the MTE.** If you compute a
+per-lane base offset at runtime, round it to a multiple of 8 elements (fp32). Also measured there:
+index `TGATHER` and elementwise ops with a non-multiple-of-8 runtime length are exact **on the flat
+shape**, and a MaskPattern gather concatenates the selected columns **without honouring the
+destination's padding**.
+
+Related: **C77** (a Cube tile's partial extent needs the fractal-rounded declaration -- the Cube-side
+analogue of this rule), **C74a**, **C79**, and the cookbook entry on a narrow DMA burst rounding its
+write up to a 32-byte granule. The family is one sentence: **an operation touches more than the valid
+extent you asked for, and which pipe you are on decides whether that is benign.**
+
+## C81: AN IN-PLACE `TDIVS` SILENTLY BECOMES A RECIPROCAL-MULTIPLY  🔴 **CRITICAL**
+
+`DivSOp::BinSInstr` carries a "fix inplace alias" branch: when `dst == src`, `TDIVS(p, p, s)`
+lowers to `vmuls(p, p, 1.0f/s)` instead of a true divide. It compiles, it runs, it returns a
+plausible answer, and it is **not the same number** -- `1.0f/s` is rounded once and then multiplied,
+so you get up to 2 roundings where IEEE division gives one correctly-rounded result.
+
+This matters whenever the divide is the thing you are relying on for accuracy. Measured on
+`roi_align` (2026-09-28): an arm built specifically to *remove* a reciprocal-multiply and replace it
+with a real division would have silently re-introduced the reciprocal-multiply it existed to
+eliminate, because the natural spelling aliased `dst` onto `src`. The arm was built with a raw
+`vdiv` into a **distinct destination** instead.
+
+**Rule: when a division's rounding is load-bearing, give `TDIVS` a destination distinct from its
+source, or emit `vdiv` yourself.** Same family as **C78** (a `tmp` tile must differ from src and
+dst), the `TRECIP` aliased-dst trap (returns `1.0`, no error), and identity-`TCVT` corruption: PTO
+has several ops whose collapsed-alias instantiation is a *different operation*, not a no-op.
+
+## C82: `double` IS REJECTED OUTRIGHT INSIDE AN AICORE FUNCTION
+
+Under `--cce-aicore-arch=dav-c220-vec`, bisheng refuses any fp64 in device code:
+
+```
+error: cast to/from double precision floating variable is not allowed in aicore function
+```
+
+So the standard numerical remedy -- *compute the quotient in fp64 and round once* -- is simply
+unavailable on device. This is a hard constraint on how a precision problem can be fixed, not a
+tuning choice, and it is worth knowing **before** designing a fix around wider intermediates.
+
+**Consequence:** when an fp32 expression on device is not accurate enough, the wider-intermediate
+remedy is unavailable and you must fix the *expression*, not the precision -- see **C83**, where the
+culprit was FMA contraction and the fix was a `volatile` launder.
+
+**Moving the arithmetic to the host is the fallback, and on the one case measured it did nothing.**
+Supplying every division from the host as IEEE-exact fp32 left the coordinates bit-for-bit unchanged
+(proven live by a poison control). So host precompute is a *performance* play on the scalar pipe, not
+a correctness fix -- price it separately and do not reach for it before identifying which step is
+actually non-IEEE.
+
+## C83: FMA CONTRACTION SILENTLY COSTS 1 ulp IN A SCALAR FLOAT CHAIN, AND `-ffp-contract=off` DOES NOT STOP IT  🔴 **CRITICAL**
+
+A scalar multiply-add chain such as `base + i0*s0 + i1*s1` gets **contracted into FMAs**, which drops
+one rounding per fused pair. That is a **1-ulp difference on a minority of values** -- the exact
+signature of a "the hardware is not IEEE" red herring.
+
+Measured on `roi_align` (2026-09-28) with an ABI-preserving build that emitted the kernel's own
+computed coordinates instead of its result, compared bitwise against torch's fp32 expression:
+**5.7-11.8% of coordinates differed, by exactly 1.00 ulp** (case 8 y 56/679, case 2 y 211/1792,
+case 12 y 238/2509).
+
+**`-ffp-contract=off` is silently ineffective here.** It **changes the binary** (different md5) while
+leaving the arithmetic **bit-identical**, so it reads as a clean negative when it is a no-op. That
+false negative was used to "falsify FMA contraction" -- and FMA contraction was the entire defect.
+**Never treat that flag as evidence, and never rely on it for numerical reproducibility.**
+
+**What works: launder the products through `volatile` to force a round-to-fp32 at each step.**
+
+```cpp
+AICORE inline float coord3(float base, float i0, float s0, float i1, float s1)
+{
+    volatile float t0 = i0 * s0;      // volatile forces the fp32 rounding
+    volatile float t1 = i1 * s1;      // that the FMA was skipping
+    const float a = base + t0;
+    return a + t1;
+}
+```
+
+Result on `roi_align`: coordinates **0/679, 0/1792, 0/2509, 0/2100** bitwise-exact, `max|dev| = 0.0`;
+the gate went **6/20 -> 12/20** with **no case broken**, every fp32 case improving **13x-71x** in
+`max_diff`, for ~10 lines at 3 sites -- no ABI change, no host buffer, no redesign. Cost: all 20 cases
+inside the +-6.29% noise band, but 18 of 20 slower with a consistent sign, so score it *at or below
+the noise floor, directionally slightly negative*, not free.
+
+**Why 1 ulp is not a footnote.** `frac = c - floor(c)` cancels the large integer part and leaves the
+error at full size against a now-tiny value, so a 1-ulp *relative* coordinate error becomes an
+*absolute* weight error of `ulp(coord)`, reaching the output scaled by `max|x|`. Predicting
+`ulp(coord)*max|x|` tracked observed error within 0.4-2.8x on all 9 fp32 cases; the
+accumulation-order prediction `ulp(x)*sqrt(count)` was **20-90x too small on every one**.
+
+**RETRACTED in the same run, do not repeat:** the claim that AICore `vdiv` is not correctly rounded.
+A standalone probe over 65536 fp32 inputs spanning 2^-20..2^20 found `vdiv(a,16)`, `vmuls(a,0.0625)`,
+`vdiv(a,7)` and `vdiv/16` vs `vmuls*0.0625` **all 0/65536 bitwise different, max 0.000 ulp**. `vdiv`
+is exactly correctly rounded for power-of-two and non-power-of-two divisors alike. The original claim
+was an inference from a 1e-11 wobble in a 50M-element fp16 case -- a wobble read as an ISA property.
+**Scalar `/` is IEEE too:** supplying every division from the host, IEEE-exact, changed the
+coordinates by *nothing* (`56/679` -> `56/679`), proven live by a poison control that drove the same
+probe to `679/679`. The divisions were never the non-IEEE step.
+
+**How to find this class at all.** A result-level diff cannot separate a bad coordinate from a bad
+accumulation, and the two have opposite fixes. Build a diagnostic that emits the **intermediate**, and
+when you supply a value from outside, **poison it** to prove the kernel actually reads it -- a silent
+fallback and a genuine no-effect look identical.
+
+## C84: THE >255-BLOCK ROW STRIDE OVERFLOWS -- BUT ONLY WHERE A ROW STRIDE IS EMITTED  🔴 **CRITICAL**
+
+A multi-row Vec tile's row stride in 32-byte blocks is `Cols*sizeof(T)/32`. For fp32 that is
+`Cols/8`, so **`Cols = 2048` gives 256 and overflows the 8-bit repeat-stride field.**
+
+This rule has been wrong twice in opposite directions, so the *scope* is the whole content:
+
+**A tile is exposed only when the row stride is actually emitted.** Two shapes qualify:
+1. a **`ValidCol < Cols` sub-view** -- the rows are not contiguous, so each row advance is a stride;
+2. a **multi-row broadcast/expand** that re-reads one operand per row (`TCOLEXPANDMUL`,
+   `TROWEXPANDMUL`, and the same family).
+
+`ValidCol == Cols` elementwise work is **safe at any width**, because the tile flattens into one
+contiguous run and no row stride is ever emitted. `rblk == 1` is safe for the same reason -- there is
+no row advance.
+
+Measured on `arnq` (2026-09-28), `W in {512,1024,2048,4096} x rblk 1..16`, 64 configs:
+**512 and 1024 clean at every rblk; 2048 and 4096 fail at every `rblk >= 2`, pass at `rblk == 1`.**
+Signature: within each row-block **row 0 is exact, rows 1..rblk-1 are garbage** -- good rows exactly
+`{0,8}` at rblk=8 and `{0,3,6,9,12,15}` at rblk=3. It is **not the reduction**: swapping in a 2-level
+`OneRepeatProc` reduce moved the failure by 2 elements out of 3.09M.
+
+**How to probe it, because the obvious probe returns a false negative.** An earlier 137-point sweep
+concluded there was *no* cliff and got `Cols=4096` exact -- every probe tile had `ValidCol == Cols`,
+so it flattened and the stride was never emitted. **A stride-limit probe must vary `ValidCol` away
+from `Cols` AND force `rblk >= 2`.** Otherwise it is structurally incapable of seeing the fault it is
+looking for.
+
+**And do not lift such a cap without pricing it.** Lifting arnq's `W <= 1024` was measured at
+**+0.34 (W<=2048) / +0.42 (W<=4096)** -- inside the ~0.4 cross-session drift -- for **four**
+correctness fixes on a path that currently has none. HAP compresses hard near the hardware limit: a
+1.14x kernel speedup moved one case's HAP only 0.488 -> 0.532. Correctly declined.
+
+Related: **C49a** (scratch width), and the row-reduce scratch trap, which is a *different* fault with
+the same symptom -- a wrong reduction output beside a bit-exact elementwise output points at the
+scratch, not at the source tile's width.
+
+## C85: A QUERIED-CAP FIX IS PROVABLY NULL ON A PART WHERE THE QUERY RETURNS THE OLD CONSTANT
+
+When a fix replaces a hardcoded constant with a runtime query (`get_device_limit` /
+`GetDeviceResLimit`), **an A/B on a part whose queried value equals that constant is a no-op by
+construction** -- and a null result there says nothing about the fix's value on a part where the values
+differ.
+
+Measured: an A2 910B2 reports `vector_core_num = 48`, **exactly** the constant the fix replaced. The
+A2 A/B came back `-0.028` against a `0.019` null band, and that number was then used to argue the fix
+carried no value on A3. That inference is invalid. **A null on the part whose value matches is what a
+correct fix looks like.**
+
+**Prove liveness instead of arguing about it.** Force the *fallback* to an obviously wrong value and
+show the geometry changes: with the fallback forced 48 -> 7, the plan read `rblk 6 / items 43` before
+any op call and snapped to `rblk 5 / items 52` -- exactly the shipped 48-core plan -- after one call,
+proving the runtime push executes on the live registered path and its value wins. Three shapes, same
+result, source restored byte-for-byte afterwards.
+
+This is the same failure mode as an **unwired** lever measuring "neutral": if you cannot show the
+lever changing an observable, you have not measured the lever. Related: the L2-alias trap where
+passing a literal device id makes `rtGetL2CacheOffset` return 0 -- success, and useless -- so the
+alias never executes and the technique gets wrongly retired.
+
+## C86: NO DECLARED VALUE MAY REACH A REJECTION, AND EVERY REJECTION MUST NAME ITSELF  🔴 **CRITICAL**
+
+This is the **largest and most repeated defect class** in the cann-bench campaign: a kernel-side
+contract fitted to the cases that happened to be visible. Measured cost so far, hidden cases lost:
+
+| operator | our gate | declared | cases |
+|---|---|---|---:|
+| `gqa` | `D != 128 && D != 256 -> -3`; `Skv % 128 != 0 -> -4`; `Nq*D > 65535 -> -8` | `D 64~512 64-aligned`; `S_kv 1~8192`; `Nq<=256` | **26** |
+| `grouped_matmul` | bf16 bias unimplemented | bias dtypes incl. bf16 | 23 |
+| `softmax` | bucket table ending `(12288,1)` | last axis `1~2097152` | 8 |
+| `moe_gating_top_k_softmax` | `E > 512 -> ep = 1024`, no instantiation above | `E 1~2048` | 7 |
+| `adaptive_avg_pool_3d` | `LAUNCH(...,128) LAUNCH(...,144)` | `W 1~256` | 3 |
+| `conv_2d` | `khkw in {1,9,25}` | `K_h 1~16` | 3 |
+| `scatter` | index dims must equal data outside `dim` | PyTorch allows `index.size(d) <= src.size(d)` | 3 |
+
+**THE DETECTOR, and it is mechanical: if your accepted set EQUALS the spec's `cases.csv 实测`
+column, you have fitted the contract.** `desc.md` annotates declared-vs-exercised per axis and hands
+you the gap for free. `gqa` accepts exactly `D in {128,256}` where 实测 is "128 / 256", and exactly
+`Skv % 128 == 0` where 实测 is "128 ~ 2048". That is not convergent engineering, it is the visible
+cases written into the source. `mha` is the same shape -- a declared-surface probe returned **476 of
+673 combinations REJECTED**, led by `D=192`, which 实测 notes never appears.
+
+**Rule 1 -- a static ladder needs a general path beneath it.** Adding `192` to an instantiation list
+fixes the cases you were just billed for and leaves the next unlisted value just as broken. Keep the
+fast ladder for the common widths, then fall through to a runtime-tiled path so **no declared value
+can reach a rejection**. The discriminator stays: a constant that selects a **tile** is correct
+engineering; a constant that gates a **rejection** is a fitted contract.
+
+**Rule 2 -- a rejection must be self-describing.** `gqa`'s 26 failures arrived as one opaque line:
+
+```
+AI算子执行失败: gqa: shape outside the kernel contract (gqa_plan rejected)
+```
+
+The kernel distinguishes `-1` through `-8` internally and **none of it is surfaced**, so an 80-case
+remote run that already knew which axis failed told us nothing, and the defect had to be re-derived
+locally from `desc.md`. Emit the **axis name, the offending value, and the bound it violated** --
+`"D=192 not in {128,256}"` -- and one hidden run becomes a complete, ordered defect list.
+
+**Why this pays more than it looks.** These rejections are `compile_runtime_error`, so they scale the
+**compile** term as well as function: `gqa` lost 6.5 compile marks and 10.1 function marks on top of
+the performance those 26 cases would have carried. Its full-pass projection is **78.04 against a
+68.82 posted entry, +9.22** -- the largest single gain on the board, from one class of constant.
+
+## C87: BACK-TO-BACK ACCUMULATING MMADs INTO ONE L0C NEED `pipe_barrier(PIPE_M)`  🔴 **CRITICAL**
+
+`TMATMUL_ACC` reads L0C as its C-matrix source **and** writes it. In a K loop with an L0 ping-pong
+path, if nothing drains the **M pipe** between iterations the next MMAD's L0C read can overlap the
+previous MMAD's L0C write. The hardware reports:
+
+```
+aicore error, error code = 0x40000
+errorStr: The address for VEC to read L0C conflicts with that for CUBE to write L0C
+```
+
+on **every** Cube block, and the host sees ACL **507015** plus an unrecoverable device fault that
+cascades every later case.
+
+**It needs `nk >= 2`** (two K sub-tiles in one L1 chunk), and **whether a part tolerates it depends on
+the accumulator size.** Measured: one A2 tolerates it from `MT*NT >= 1024` up; an A3 does not. That is
+the whole trap -- see the portability note below.
+
+**Fix: `pipe_barrier(PIPE_M)` between consecutive accumulating MMADs.** Verified to clear the fault
+*with the ping-pong forced on for every tile*, i.e. it neutralises the mechanism rather than the
+trigger. Cost on `conv_3d_backprop_filter`: **0.10 points**, all of it lost MMAD-to-MMAD pipelining.
+
+**Two plausible fixes that were built, measured, and FAILED -- do not retry them:**
+1. **Ping-ponging the accumulator between the two halves of L0C.** The obvious candidate, because the
+   error names the *address*. It was written, built and measured neutral before a reproducer killed it.
+2. **Declaring the `Acc` tile with the issued MMAD row count (`mrow`) instead of `mvalid`.**
+
+**Do not gate the barrier on accumulator size.** The safe size differs per part and is unknown on
+anything you have not tested. A fitted threshold is what caused this fault: the shipped kernel's
+`MT*NT >= 1024` ping-pong condition was tuned by trial on an A2 and happened to sit exactly at that
+part's tolerance boundary, so every scored case avoided the hazard and the A3 hit it on the first small
+shape. **A threshold fitted by trial that guards a HAZARD is a portability landmine, not a tuning
+choice** -- the shape-fitting rule of **C86** applied to hazards rather than to declared ranges.
+
+**Build a reproducer before you believe a fix.** Forcing the hazardous path on for a small tile
+(`MT = NT = 16`) reproduced the identical error code, error string and ACL code on local hardware --
+and that reproducer is the only reason the two failed candidates above were caught instead of shipped.
+
+**A TRANSITIVE `M -> MTE1 -> M` FLAG CHAIN ALSO DISCHARGES C87, and it is stronger than the
+barrier.** A kernel that keeps a **single** L0A/L0B slot must already protect that slot's WAR, so it
+carries:
+
+```
+set_flag(PIPE_M, PIPE_MTE1, id); wait_flag(PIPE_M, PIPE_MTE1, id);   // prev MMAD -> this TEXTRACT
+  ... TEXTRACT into the single L0A/L0B slot ...
+set_flag(PIPE_MTE1, PIPE_M, id); wait_flag(PIPE_MTE1, PIPE_M, id);   // that TEXTRACT -> next MMAD
+TMATMUL_ACC(...)
+```
+
+That fully **serialises** M rather than merely draining it, so L0C protection falls out as a
+by-product. Measured on two operators: adding the explicit barrier to a kernel that already had the
+chain cost **+0.18 / null** (sign test p=0.50) -- the pipe was already empty, as predicted before
+measuring.
+
+> **CORRECTION, and it is the important part. "The `M -> MTE1` half is the one that matters" is
+> WRONG -- it cleared 3 of 4 kernels that are actually exposed, because all four HAVE that half.
+> The missing clause is DISTANCE, not presence:**
+>
+> ```
+> coverage requires   chain_ordering_distance  >=  accumulation_edge_distance
+> ```
+>
+> A kernel with **S** L0A/L0B slots places its `M -> MTE1` wait **S iterations back**
+> (`if (t >= S) wait_flag(PIPE_M, PIPE_MTE1, ev[t % S])`), which transitively orders `A(t-S)`
+> before `A(t)`. If the accumulation edge into one L0C is **D** apart and **`D < S`**, that edge is
+> **undischarged however complete the chain looks.** The two safe kernels were safe because they keep
+> a **single** slot, so `S = 1 = D` -- **a property of the slot count, not of the flag's presence.**
+
+**So compute S and D per edge.** Worked verdicts from one trace over four kernels:
+
+| kernel | ACC sites | edge | S | D | verdict |
+|---|---|---|---|---|---|
+| lstm | 225, 267 | cross-iteration `kb->kb+1` | 1 | 1 | **covered** |
+| conv_2d `kernel_conv.cpp` | 331 | per m-block `kk->kk+1` | 2 | `nmb` | **UNCOVERED at `nmb==1`** |
+| conv_2d `kernel_conv_gen.cpp` | 387 | consecutive `t->t+1`, one acc | 2 | 1 | **UNCOVERED always** |
+| grouped_matmul | 297, 511 | 511: `ks->ks+1` | `kL0D?2:1` | 1 | 297 covered; **511 UNCOVERED whenever `kL0D`** |
+| gmsq | 388 `cube_mm`, 433 `cube_mul` | consecutive sub-steps | 1 / `kNL0=2` | 1 | 388 covered; **433 UNCOVERED** |
+
+**Two more forms the presence rule gets wrong, both measured:**
+
+- **A same-iteration `set_flag(PIPE_MTE1, PIPE_M, id); wait_flag(...)` ring is NOT a discharge.** It
+  makes M wait for MTE1; it does not drain M and never orders M before M. It sits immediately before
+  the MMAD and looks exactly like the chain's second half. Three of the four kernels above have one.
+- **A TRAILING `set_flag(PIPE_M, PIPE_MTE1, id); wait_flag(...)` pair AFTER the MMAD, in the same
+  function, DOES discharge** -- it closes the chain at distance 1 with no barrier. That is why
+  `gmsq`'s `cube_mm` and `grouped_matmul`'s line-297 helper are safe.
+
+**A kernel's own comments may document the exposure as a performance argument.** One header states
+outright *"Two L0 buffers move that flag to distance 2."* That sentence **is** the C87 defect, written
+down by whoever introduced it. Another file's comments record a device fault blunted by disabling
+double-buffering, diagnosed as "an exactly-full L0B", with the caveats *"the fault's footprint is not a
+clean function of the shape"*, *"at fixed K=272 it fires at nvalid 20/24/32 and not 16/34/44"*, and
+*"N=160 faulted through the packaged driver while the same shape was clean through a standalone
+harness"*. **Address- and timing-sensitive, shape-incoherent: that is this defect's signature**, and
+the blunt workaround was costing 0.46 points and three cases' speedup that the barrier may recover.
+
+**Three consequences for how you check it.**
+
+1. **Grepping for `pipe_barrier(PIPE_M)` is not a C87 audit.** It reports safe kernels as FAIL, and --
+   worse -- would *clear* a genuinely racy ping-pong kernel that happens to contain one unrelated
+   barrier. A drain hidden behind a macro (`#define MHA_MBAR() pipe_barrier(PIPE_M)`) also counts once
+   as a literal while the call sites are what actually drain. Resolve macros, then **count logical
+   accumulation edges against discharges**, per file -- and compute **S and D**, per the distance rule
+   above. **Audit only the sources the wheel actually builds:** one tree carries 14 files in
+   `variants/` that its CMakeLists never registers, one of them an older revision of the shipped
+   file, and a scan of all of them buried the single live file so completely that it never appeared in
+   the report at all.
+2. **Count the edges; do not eye them.** Three easy misses, all real: an accumulator declared
+   *outside* the K loop makes `kb -> kb+1` a **cross-iteration** edge; a **bare `TMATMUL_ACC`** outside
+   the usual `if/else` slot-select form is a third edge the pattern skips; and a `first` flag never
+   reset inside an inner loop makes **both** `j -> j+1` and `kc -> kc+1` accumulate. An ordered token
+   trace of every MMAD and pipe flag, comment- and string-suppressed, is the only reliable method.
+3. **The chain can be present and still not cover every edge.** The ping-pong form skips the
+   `M -> MTE1` wait for the first iterations (`j < 2`). Present-but-conditional is not discharged.
+
+**Land the drain anyway even when the chain already covers it.** An invariant that holds by
+coincidence vanishes the moment someone double-buffers L0 -- which is exactly the schedule one of
+these kernels' own headers records as racy. It was free on one operator and cost **0.22** (~1.5%,
+sign test p=0.041, concentrated entirely in the short cases) on the other, against a triage of
+**-18.07** for serving an artifact that can take down a shared runner. **No hoist exists**: the edge
+is between consecutive *innermost* iterations, so any outer placement fails to cover it. Cost tracks
+**placement depth, not the operator** -- once per K step is free, twice per innermost iteration is 6-7x
+the `conv_3d` reference.
+
+**And check the reachable accumulator size through the DECLARED surface, not the scored cases.** Both
+operators above reach `MT*NT = 256` on declared-but-never-scored paths -- one because
+`gen_kT(S_kv) = (S_kv >= 64) ? 64 : 16` while its checker accepts `S_kv` from 1, the other because its
+reject function requires only `1 <= Dv <= Dk` and never that `Dv` be 64-aligned. The visible cases use
+neither. **A tolerance that depends on accumulator size plus a cap fitted to the visible cases is the
+C86 failure wearing a hazard's clothes.**
+
+## C88: THREE MORE SHAPES OF LATENT DEVICE FAULT, ALL CORE-COUNT-INDEPENDENT
+
+Found in one operator alongside **C87**, each reproduced on local hardware and each able to fault
+*any* part. Check these whenever a kernel has a fast path fitted to the sizes it was tested on:
+
+1. **A tail-overlap expression that goes NEGATIVE below the planner's chunk floor.** `m0 = DHW - CH`
+   with `CH = 128` and `D*H*W < 128` makes the overlap negative, so TLOAD/TSTORE address **below the
+   base** of the tensor -- vector core exception, ACL **507035**. Any `x - CONST` used as an offset
+   needs a floor at 0 and a separate small-problem path.
+2. **`scatter_vnchwconv_b16` with `repeat == 1` and non-zero repeat strides is an ILLEGAL encoding** --
+   it returns **silent garbage**, not an error. Measured wrong for `D*H*W <= 16` and correct from 17.
+   When a repeat count collapses to 1, zero the repeat strides.
+3. **Fixed-width epilogue UB tiles with no bound on the reduction extent.** `EPI_TMAX`-wide tiles with
+   no check on `Kd*Kh*Kw` or `Cin/groups` faulted (507035) at `K = 9x9x9` (extent 729) and at channel
+   counts 600 and 1024. Chunk the epilogue over **every** axis that can exceed the tile, not just the
+   one the visible cases stress.
+
+**Harness note that cost a false positive:** torch_npu's task queue can submit a torch `fill_`
+**after** a direct `ctypes` kernel launch on the same stream, so a poisoned-guard check read a torch
+write as a kernel bug. Put `torch.npu.synchronize()` after the poison fills before launching.
+
+## C89: A SAME-PRECISION `native_output` MUST BE COMPUTED ON THE **CPU**  🔴 **CRITICAL**
+
+`compare_tensors` uses the same-precision reference's **per-element error COUNTS** as the CPU
+denominator of its small-value and cancellation fallbacks:
+
+```python
+cancel_passed = cancel_error_count / max(cancel_cpu_error_count, 1) <= 2
+```
+
+An `native_output` computed with `device="npu"` therefore carries **NPU-sized errors**, inflating that
+denominator until the ratio test passes **unconditionally**. The harness reports a clean sweep and the
+real evaluator does not.
+
+Measured on `mla` (2026-09-29): `mla_common.native_ref` used `device="npu"`, and that is **why its
+record claimed 20/20** when cann-bench scored it **11/20 / 48.30**. The evaluator computes the
+reference on CPU (`evaluator.py:401-405`, `native_inputs = tensors_to_cpu(...)`, `to_device=False`).
+After the harness was corrected it reproduced the evaluator **exactly** — same 11/20, the same nine
+cases, MERE agreeing digit-for-digit.
+
+**Rule: the same-precision reference is a CPU computation at the case's own dtype. Never on device.**
+This is the cheapest possible instance of the self-harness-pass class: one keyword, and it manufactures
+a false full pass on an operator whose real score is 20 points lower.
+
+**Related trap in the same family — MERE is not the gate.** On that operator case 1 *passed* at MERE
+`3.361e-4` while case 13 *failed* at `2.186e-4`. `compare_tensors` runs a fast path
+(`mere < thr and mare < 10*thr`) and then a three-domain fallback; what fails is usually
+`normal_passed`. Never reason about pass/fail from MERE alone.
+
+**And dtype slack is not symmetric.** bf16 gets 8x more room than fp16 on **two** axes — MERE threshold
+`2^-7` vs `2^-10`, and `small_value_threshold` `2^-8` vs `2^-11`. The second matters more: a wide
+small-value band can swallow **every** element into the small-value/cancellation domains, leaving
+`normal_total_count == 0` and a reported `MERE = MARE = 0.0`. So "the bf16 case passes" is **not**
+evidence that the arithmetic is sound — it may mean no element was left in the normal domain to fail.
+Check `normal_total_count` before drawing any conclusion from a bf16 pass.
+
+## C90: A UB ARENA OVER-RUN THAT IS BENIGN AT `db==1` IS A HARD FAULT AT `db==2`  🔴 **CRITICAL**
+
+An over-run that "cannot matter because of ordering" stops being ordered the moment you double-buffer.
+With `db == 2` the **next** work item's tile is prefetched into slot 1 while the current item is still
+consuming slot 0. If slot 1's staging top crosses into the chunk the current item is **reading**, the
+consumer is corrupted — and unlike `db == 1` nothing heals it, because MTE2 issues the prefetch *after*
+the chunk's own DMA while the consumer waits only on that chunk's flag, which was set **before** the
+prefetch.
+
+Measured on `scatter` (2026-09-29), 36 declared-shape cases:
+
+| | shipped | fixed |
+|---|---|---|
+| hard device fault | **12 / 36** | 0 |
+| silently WRONG | **4 / 36** | 0 |
+| PASS | 20 / 36 | **36 / 36** |
+
+```
+507035 ... aivec error, core id 8 ... errcode:(0,0x4000,0)
+errorStr: The GM address accessed by scalar exceeds 48 bits
+```
+
+Ordinary shapes: `[4096, 43, 256] dim=1`, `[4096, 86, 128]`, `[4096, 172, 64]`. Neighbouring `D = 42` and
+`44` pass, so nothing in the visible set could have found it.
+
+**Rule: reserve the inter-arena gap in the capacity bound AND in the `db` decision, not just in the
+tile size.** If an over-run is argued benign by ordering, state which flag orders it and check that the
+prefetch is on the same flag. It usually is not.
+
+## C91: AN ARENA BOUND MUST COUNT UNMASKED-REPEAT OVER-PROCESSING, NOT DMA EXTENTS  🔴 **CRITICAL**
+
+A capacity bound computed from **DMA extents** is wrong whenever a vector helper processes whole
+repeats. `widen`/`narrow`-style helpers write `ceil(n/64) * {256,128}` bytes regardless of `n`, so the
+real high-water mark exceeds `align32(len * ESZ)` by up to **126 B**.
+
+Measured: counting DMA extents put a threshold at `L = 21969`; the true threshold is **`L = 21953`**, and
+a chunk sized to the DMA figure still over-ran by 64 B. A first fix reserving 288 B **still** over-ran by
+64 B on 860,807 of 66,701,000 audited plans; only 384 B cleared it.
+
+**Rule: size the arena from what the widest helper WRITES, add a named reserve, and pin it with a
+`static_assert` that states why the number is what it is.** The root cause on `scatter` was that the
+arena arithmetic was entirely runtime and host-side with **not one `static_assert` in the kernel**.
+
+## C92: torch's `amin`/`amax` PROPAGATE NaN — `(n<o) ? n : o` DROPS IT
+
+`scatter_reduce_` with `amin`/`amax` propagates a NaN from `src`. The natural device form
+`(n < o) ? n : o` is **false** for NaN and therefore keeps the old value, silently dropping it. The
+comparator then fails at the **NaN-position gate** with `MERE = MARE = 0.000000` — the signature that
+looks like bit-exactness and is not.
+
+Fix: `(n < o || n != n) ? n : o` for floating accumulators. Also check the narrowing path —
+`f32_to_bf16` turned some NaNs into `-0.0`, which needs its own `v != v` guard.
+
+This class is **invisible to the C86 declared-surface detector**, because the value is *accepted and
+mis-computed* rather than rejected. A declared-unconstrained value range means NaN is a legal input.
+
+## C93: A PLANNER SWEEP CAN BE BLIND TO THE ONLY BRANCH THAT REJECTS
+
+A sweep of 213,850 planner shapes reported **0 rejections** and was wrong twice over:
+
+1. the query entry point **never passed `vecPath`**, so the vector path was unreachable by construction;
+2. its `outer` grid was `(1, 2, 13)` and **never reached the core count**, so the cost model never chose
+   the widest tile — *the only branch that can reject*.
+
+A corrected sweep over 10,160,600 shapes found **17,940 rejections** in that same planner, 3,588 of them
+reachable at runtime, every one with an **empty** message.
+
+**Rule: a sweep must be shown to REACH each branch it claims to clear.** Instrument the branches and
+assert coverage, or the zero means nothing. This is the seventh uncontrolled scan in this campaign to
+return zero and be wrong.
+
+## C94: A TASSIGN OFFSET CONTAINING A RUNTIME COLUMN INDEX FAULTS THE CORE  🔴 **CRITICAL**
+
+A Vec tile `TASSIGN`ed to a **non-32-byte-aligned** UB address raises `aicore exception` / ACL **507015**
+— a hard fault, not a wrong answer. Any offset built from a runtime *column* index will eventually be
+unaligned.
+
+Isolated on `mla` with a paired control:
+
+| offset | result |
+|---|---|
+| exact column offset (`UB_TMPB + (r*kCW + off)*4`, off=249 → 996 B) | **aicore exception** |
+| same rounded to 8 fp32 (32 B) | no fault, but MERE 7.6e-02 — wrong by the ≤7 columns the rounding masks |
+
+So the obvious repair (round the offset) trades a fault for a wrong answer. **The safe idiom is to fill
+the whole chunk, then write each row's valid prefix at column 0 — never index into a row.**
+
+And note the diagnostic trap: **the first fault poisons the process**, so 13 of 14 cases in that sweep
+reported failure from one bug. One fault means re-run from a clean process before believing any later row.
+
+## C95: TWO A2/A3 LIBRARY FACTS THAT CLOSE OBVIOUS DESIGNS
+
+Both checked against the pinned headers rather than assumed, and each killed a plan that looked free:
+
+1. **`PadValue::Zero` does NOT zero the inactive rows of an L1 Mat tile.** It zero-fills only the final
+   partial C0 block. Every "load fewer rows and let the pad be zero" scheme is therefore wrong, and a
+   partial reduction over such a tile reads **stale L1**. Workable alternative, used on `mla`: size the
+   chunks so **every tile is statically full** (e.g. 64-wide + 16-wide), handle the M and reduction tails
+   by *idempotent overlap* where the result is stored rather than accumulated, and pre-fill the operand
+   from an in-bounds window so `0 x finite == 0` exactly.
+2. **`TSTORE`'s `preQuantScalar` cannot scale an fp32 Acc into an fp16 GM store.**
+   `CheckAcc2gm<..., isQuant=true>` at `pto/npu/a2a3/TStore.hpp:594` `static_assert`s an int8/uint8
+   output. Any "scale it for free in the fixpipe" plan for a 16-bit float output is closed by the
+   library, not by judgement.
+
+## C96: THE COST OF A GENERAL PATH IS ITS LAUNCH SYMBOLS, NOT ITS CODE SIZE
+
+Widening a fitted contract usually means adding a general path, and the reflex objection is that the
+binary grows and the fast path slows. Measured on `mla` with a **stub ablation** — keep the added launch
+symbols, delete the 45.7 KB general-path body:
+
+| arm | added `__global__` symbols | per-case median ratio |
+|---|---:|---:|
+| control | 0 | 1.0000 |
+| general path, 1 symbol | 1 | 1.0143 |
+| general path, 2 symbols | 2 | 1.0183 |
+| **stub: 2 symbols, bodies REMOVED** | 2 | **1.0218** |
+
+Removing the body costs **the same or more** than keeping it. So the cost tracks the **number of added
+entry points**, not their size — and folding two general launches into one recovered 0.4pp at zero cost
+in generality. `scatter` measured the same thing from the other side: PATH G's +383 KB and 46 extra
+instantiations were **neutral**.
+
+**Consequence: "the general path would cost performance" is not a reason to keep a fitted contract.**
+Add the generality, then minimise the number of launch entry points.
+
+**Method note that earned this:** the score-level delta read as a null (−0.37%, ranges overlapping)
+while the per-case median said 1.5–2% slower with **17 of 19 cases slower** (sign test p ≈ 4e-4). One
+aggregate delta would have been wrong in **both** directions on the same data — report per-case
+distribution and a sign test alongside the score.
+
+## C97: A WIDE LAUNCH PARAMETER BLOCK IS A FIXED PER-LAUNCH TAX  🔴 **measured twice**
+
+**C96** says the cost of a general path is its launch *symbols*, not its code size. This is the other
+half: the **width of the launch argument block** is a real, measurable cost, and it lands entirely on
+the small cases.
+
+Measured on `quant_matmul`: the same correctness, implemented with a wide ABI, cost **−0.63** against a
+0.272 control range — outside the band, so real. Per-case ratios localised it exactly:
+
+| cases | ratio |
+|---|---|
+| small (16, 10, 11, 14) | **0.900 / 0.912 / 0.913 / 0.912** |
+| large (19, 4, 6) | 0.984 / 0.988 / 0.993 |
+
+That is a **fixed per-launch** cost from **13 extra kernel arguments**, not a per-work cost. Two
+ablations inside the wide design were both null (removing host `std::vector` churn; replacing
+by-reference out-params with a value return) — only **narrowing the ABI to two strides** recovered it,
+and the narrow version measured **+0.016**, a null.
+
+**Rule: when you add generality, pass the minimum the device needs.** Derive what you can on device
+from what is already there rather than adding arguments. And measure the small cases separately — an
+aggregate score hides this completely, because the large cases barely move.
+
+## C98: A PROBE'S OWN dtype CHOICE CHANGES WHICH THRESHOLD `compare_tensors` USES
+
+`compare_tensors` selects its threshold from the **dtype of the tensors you hand it**. Upcasting
+`ai_output` to fp64 before comparing makes it pick the **float64** threshold `2^-13` instead of bf16's
+`2^-7` — **48x stricter than the real gate**.
+
+Measured on `quant_matmul`: that mis-bucketing manufactured one **false FAIL** (a 1-ULP bf16 tie), and
+— worse — once corrected it **exposed a real failure the strict call had been hiding**. A wrongly
+bucketed comparison is not merely conservative; it moves which cases land in which fallback band, so it
+can conceal as well as invent.
+
+**Rule: hand the comparator the operator's own dtypes, never a promoted copy.** And two companion
+traps found in the same pass:
+
+- **A single-element positive control is too weak for this comparator.** A `+1000` spike on 1 of 16,384
+  elements returned `passed=True` (MERE 1.0e-2, MARE 1.6e2) — the cancellation clause legitimately
+  forgives one outlier when the reference is noisy. Scale a **tenth of the output** by 1.5x instead.
+- **Add a NEGATIVE control that aborts the scan if the probe rejects something the evaluator passes.**
+  A probe that transcribed the fp64 oracle for *both* the oracle and the same-precision reference made
+  the reference far too accurate, tightening the cancellation clause, and reported **122 of 124 non-PASS
+  including shapes the real evaluator passes 20/20**. Import the task's own `golden.py` rather than
+  re-deriving either reference.
+
+## C99: THREE MORE WAYS A FITTED CONTRACT HIDES, ALL FOUND IN ONE PASS
+
+From `weight_quant_batch_matmul`, whose accepted set equalled the `实测` column on **all three** shape
+axes — `M` 1–128 of a declared 1–512, `K` only multiples of 256 of a declared 1–65535 (**255 of every
+256 values refused, including the declared maximum**), `N` only multiples of 128:
+
+1. **A cap can be architectural rather than a tile knob — check before widening.** `M > 128` was not a
+   tuning choice: `MR = 2M`, so M=512 overflows L0A (256 KB vs 64 KB), L0C (1 MB vs 128 KB) *and* the
+   double-buffered L1. The fix was **host-side M blocking**, exact because the operator is
+   row-independent, and M<=128 still takes exactly one launch with the old geometry. Widening the tile
+   would have been wrong; widening the *contract* was right.
+2. **A padded store needs its conversion tile at the VALID width, not the padded one.** Widening the
+   int8 conversion tiles made `TCVT` write `sw` lanes from a `kw`-wide source. Detectable with
+   `x=1, w=1, scale=1` so `y` must equal `K`: K=1000 gave **974**, K=1023 gave **1011**. Keep conversion
+   at the valid width and widen only the store.
+3. **The GM row-stride field is 16 bits, and a declared maximum can sit exactly on it.** A flat
+   `[MR, Kp]` workspace put `Kp` in that field. With `x=1, w=1, scale=1/K` so `y` must be 1.0:
+   `Kp=65024` and `65280` gave 1.000000; `Kp=65536` gave **1.007812**, *identical* for K=65281, 65300
+   and 65535 — a stride artifact, not precision loss (the surplus 1/128 is 512 lanes, one chunk
+   double-counted). Cured by a chunk-major workspace with a constant stride.
+
+**And note what was NOT the hole:** the quantisation axes looked like the obvious suspect (per-channel
+vs per-group, group sizes, scale/offset dtypes) and were already correct, because `numel()`-based checks
+accepted the declared 2-D `[1,N]` form. The shape axes were the defect. Audit every axis; do not stop at
+the one that looks most likely.
+
+## C100: NEVER EXPRESS A MASK, GUARD OR SKIPPED TERM AS ARITHMETIC ON THE VALUE  🔴 **CRITICAL**
+
+**The rule: `keep * x` must be a SELECT. A skipped tap must be SKIPPED, not weighted by zero. A
+staged reference expression must not be re-associated. An accumulator must be wide enough that it
+cannot reach `Inf` where the reference stays finite.**
+
+This is one defect generator that produced **9 failing hidden cases across 6 operators** through five
+different mechanisms. It is worth a rule rather than nine patches.
+
+**Why it happens.** The reference does something *structural* -- a branch, a `masked_fill`, a select,
+an exact-precision evaluation. We do the *arithmetically equivalent* thing: multiply by a 0/1 mask,
+add a finite penalty, fold a coefficient, accumulate narrower. **Every one of those substitutions is
+exact over finite floats and unsound over the IEEE extended reals.** It introduces `0*Inf`, `0*NaN`,
+`Inf-Inf` or `0/0` at a position whose correct *finite* answer is unaffected. Reduced to primitives
+there are exactly **two** offending operations:
+
+```
+0 * non-finite          non-finite - non-finite
+```
+
+**The signature, and why it is invisible to every metric you would normally use.** These cases report
+`MERE = MARE = 0.000000` with *every finite element bit-clean*. That is not bit-exactness: the
+comparator returns **dataclass defaults** because it exited at the NaN-position gate before measuring
+anything. **A MERE/MARE harness structurally cannot see this class.**
+
+Two consequences read directly from `compare.py`, both of which kill the obvious hypotheses:
+
+- The NaN gate (L390-399) is a **hard early return**. Nothing downstream of it runs -- not the stage-1
+  fast path, not the band analysis.
+- **Inf handling (L407-450) is NOT a gate.** An `Inf` on one side only is replaced by `max_finite` and
+  the comparison **continues**; only `both_inf` with *opposite signs* fails, with a different message.
+  So **overflow-to-`Inf` on a narrowing store cannot produce this failure**, and neither can a finite
+  `-1e30` sentinel where the reference emits `-inf`. A finite sentinel reaches this gate only if the
+  `-inf` it replaces would have produced a **NaN downstream**: the sentinel is an upstream cause, the
+  gate is always a NaN.
+
+**The five mechanisms, so you can recognise them while writing rather than after a hidden run:**
+
+1. **Fold / re-association.** A staged reference expression algebraically folded into fewer ops.
+   Exact on finite inputs; different NaN/Inf pattern on non-finite ones.
+2. **Zero-weight tap or zero-mask multiply.** Measured on an interpolation: our blend computed
+   `x[i0]*(1-lam) + x[i1]*lam` with `i1 = min(i0+1, S-1)`, **both taps always multiplied**. A one-hot
+   extraction showed the reference agreed on *every weight* but **did not evaluate a zero-weight tap at
+   a different index**. At a position whose inputs were **all finite**, ours NaN'd from
+   `0.0 * x[far] = 0*inf`. Exhaustive `S,T in [1,12]^2`: **45/530 fail**, trigger set `S==T`, and
+   **dtype-independent** -- which is how you tell it from mechanism 4.
+3. **Additive finite penalty instead of an overwrite.** The reference does `masked_fill(-inf)`; we add
+   a large negative bias. Same finite result, different non-finite algebra.
+4. **An fp32 intermediate overflowing into subtract-the-max.** Raw scores overflow fp32 to `Inf`, then
+   `Inf - Inf` in the row-max subtraction NaNs the **whole row**. **Structurally bf16-only**: the
+   analytic threshold at `D=128` is `sqrt(3.4e38/128) = 1.63e18`, measured clean at `1e18` and
+   1920/2048 NaN at `1e19`. **fp16 can never reach it** (`65504^2 * D = 5.5e11`); bf16 can
+   (`max 3.39e38`). That prediction is the discriminator -- if a failure is bf16-only, suspect this;
+   if it fires at every dtype, suspect mechanism 2.
+5. **A guard the reference has and we do not.** Check the reference's guard; **do not assume it leaves
+   the case undefined.** One loss kernel computed `loss_i = keep_i * (max_i + log(sum exp) - x_t)`
+   while the reference **never evaluates an ignored row at all** and writes 0 -- so an ignored row with
+   any non-finite logit gives `0*NaN = NaN` on our side and `0` in the reference, and `sum`/`mean`
+   inherit it. **The fix is to apply `keep` as a select, not a multiply** (or zero the bracket first).
+
+**A corollary worth its own line: size every magnitude constant to the ACTUAL dtype, never to fp16.**
+One attention kernel carried `MASK_RAW_PER_D = 2*65504^2` with the comment *"Taking M = 65504 (the
+fp16 maximum)"*. On bf16 the true bound is `2*(3.39e38)^2`, so that one constant produced **two**
+independent bf16 defects -- a mask leak above `|x| ~ 65504` and the mechanism-4 overflow above
+`|x| ~ 1.63e18`. This is **C86's shape-fitting failure applied to the value axis**: a constant fitted
+to one dtype's range, used on a dtype with a vastly wider one.
+
+**The test that finds the whole class, and it costs no device time.** Run the reference on **CPU in
+fp64**, run the kernel, and **diff the NaN masks only** -- over the four distributions the benchmark's
+own generator can emit: `[-inf, inf]` (about 5% `+Inf`, 5% `-Inf`), `[nan, nan]` (about 50% NaN),
+dtype-boundary magnitudes, and zeros. Note the generator **does** have a NaN path even where the spec
+disclaims one, so non-finite input is never hypothetical. Two warnings from building this probe:
+
+- **Both sides NaN everywhere is a PASS**, so a 50%-NaN generator alone does not discriminate. It was
+  the `[-inf, inf]` and `x1e20` distributions that separated mechanisms 3 and 4.
+- The probe needs a **positive control** plus negative controls for the two hypotheses that the gate's
+  structure already rules out (one-sided `Inf`, finite sentinel vs `-inf`), or it will report a clean
+  sweep it did not earn.
+
+## C101: TWO MMAD TILE-VALIDITY FACTS THAT SILENTLY RETURN WRONG DATA  🔴 **CRITICAL**
+
+Both were measured on real hardware, and **both were guessed wrong on the first attempt.** Neither
+faults, neither warns: the kernel runs and the numbers are wrong.
+
+**1. An MMAD whose RIGHT tile has `ValidCol < Cols` returns wrong data.**
+
+Isolated on an *in-contract* control shape with a forced-general build, so nothing else differed: the
+query branch (`ncols = 512 = 2x256`) was correct at `mere 1.4e-6`, while the kv branch (`ncols = 192`)
+came back **garbage at `mere 3.3`** -- same code path, only the right-tile `vn` differing.
+
+**The fix is not to widen the tile. Keep the Right tile fully valid and let the N tail ride on the
+store**, which is exact: `TStoreAccNz2nd` takes its L0C stride from `validRow` alone and its width from
+`validCol`, so a narrower store is a correct projection of a full-width accumulator.
+
+**2. A partial K panel is correct only when `ceil(vk/16)*16` equals the tile's PHYSICAL K width.**
+
+Measured: `D=127` in a 64-wide panel **passes** (64+63, and `ceil(63/16)*16 = 64` matches). `D=16` in a
+64-wide tile **fails at `mere 6.3e-2`**, as do `D=17`, `He=257`, `Hcq=257`. `He=320` is the clean
+control. So the rule is not "K must be a multiple of 16" and not "any K works" -- it is that the
+rounded-up valid K must **fill** the panel it is declared in.
+
+**Fix: template the K panel width** -- 64 when `K % 64 == 0`, else 16 -- rather than padding the data or
+moving the base pointer.
+
+Both of these are why a general path needs a **forced-general** correctness run: a build where every
+phase is pushed onto its general path even for shapes the fast path would take. On one operator that
+run (4/4 shapes x 2 seeds) is what found both bugs, and the ordinary declared-surface sweep did not,
+because the fast path shadowed them.
+
+## C102: INSIDE ONE LONG-RUNNING KERNEL, CODE SIZE COSTS EVEN WHERE NEVER EXECUTED
+
+**This is the inverse of C96, and both are true of different situations.** C96 says the cost of adding
+a general path is the number of added **launch symbols**, not its code size -- measured by a stub
+ablation that deleted 45.7 KB of body while keeping the symbols and cost the same. That holds for the
+**per-launch** case.
+
+But inside a **single long-running MIX kernel**, the opposite was measured. Adding general paths as
+device functions in the one existing launch -- **zero new launch symbols, zero new kernel arguments** --
+still cost about 1%:
+
+| arm | median | spread | sign test vs control |
+|---|---:|---:|---|
+| control (pre) | 69.6293 | 0.2333 | -- |
+| `gen` (general paths, +61.8 KB device image) | 69.5359 | 0.5193 | **16/20 slower, p = 0.0118** |
+| `stub` (branches kept, **bodies deleted**, +1.3 KB) | 69.6773 | 0.2751 | 14/20 *faster*, p = 0.115 |
+| `control_repeat` (**same pre binary again**) | 69.6471 | 0.2973 | 12/20 faster, p = 0.5034 |
+
+**Read the attribution carefully, because the score cannot see it.** The null band from the same binary
+twice is **0.3283**, and `gen - control = -0.1023`, i.e. **0.31 of the null band -- not separable by
+score at all.** Only the sign test resolves it, and the **stub ablation attributes it**: branches cost
+nothing (`stub` is if anything faster), while `gen` vs `stub` is 15/20 slower at `p = 0.041`. So the
+cost is **body bytes**, in code that never runs for the measured shapes -- an instruction-cache or
+image-locality effect, not a branch.
+
+**Consequences for how you add generality:**
+- Prefer **device functions inside an existing launch** over new launches (C96/C97 still apply, and a
+  wide launch argument block is its own per-launch tax).
+- But then **watch instantiation count**, because that is what multiplies body bytes. On the measured
+  operator the lever was six instantiations (`NPL x CT x KGT`) reducible to four by making `NPL` a
+  runtime loop bound.
+- **Always run the stub arm.** Without it, a ~1% regression is indistinguishable from "branches are
+  expensive", which would have sent the next pass optimising the wrong thing.
+
+## C103: `TAXPY`'s SCALAR IS TYPED BY THE **SOURCE** TILE, NOT THE DESTINATION  🔴 **CRITICAL**
+
+`pto`'s signature is
+
+```cpp
+TAXPY_IMPL(dst, src, typename TileDataSrc::DType scalar)     // npu/a2a3/TAxpy.hpp:132
+```
+
+so the scalar is **converted to the SOURCE tile's dtype before the multiply**. An fp32 destination
+does not protect it. With `dst` fp32 and `src` `half`, an fp32 weight is silently rounded to fp16 --
+**4.9e-4 relative** -- and on data with `|x| ~ 65000` that became `max_diff = 32.0`.
+
+**It accounted for 7 of 8 remaining failures on one operator**, and the tell was an **asymmetry**: the
+row combine used the `TAXPY` wrapper and lost the weight, while the column combine called the raw
+`vaxpy` with an fp32 scalar against an fp32 source and did not. Same kernel, same weight, two
+precisions.
+
+**Fix, when the source must stay 16-bit** (it often must -- a 16-bit operand is what a Cube MMAD or a
+narrow store requires): split the fp32 scalar into two 16-bit terms and issue two `TAXPY`s.
+
+```cpp
+if constexpr (sizeof(T) == 2) {                 // leave the fp32 path alone
+    const T wh = static_cast<T>(w);
+    const T wl = static_cast<T>(w - static_cast<float>(wh));   // exact, by Sterbenz
+    TAXPY(dst, src, wh);
+    pipe_barrier(PIPE_V);                       // same-pipe RAW on dst, see C48
+    TAXPY(dst, src, wl);
+}
+```
+
+That is ~22 mantissa bits: weight error `4.9e-4 -> 2.4e-7`, a **2000x** improvement where ~16x was
+needed. `w - (float)wh` is exact by Sterbenz's lemma, so the pair loses nothing. **Cost measured
+null** -- and only because a third arm caught it: the nine touched cases showed geomean **+2.4%** with
+a sign test at **p = 0.0195**, and a **byte-identical rebuild of the control read +2.2% on the same
+nine**, leaving an attributable **1.002**. Two arms would have banked a phantom 2.4% regression.
+
+**Generalise the audit, not the fix:** any `pto` call taking a scalar may type it from a tile rather
+than from the literal. Check the signature in the header before assuming an fp32 scalar survives, and
+suspect this class whenever **two code paths computing the same quantity disagree only in precision**.
+
+## C104: ALIGN-MODE DMA DOES **NOT** ZERO-FILL ITS PADDING  🔴 **CRITICAL**
+
+`copy_gm_to_ubuf_align_b16` / `_b32` take `leftPadding` / `rightPadding`. **They do not zero those
+columns -- they leave whatever was in UB.** Any kernel that relies on the pad arguments to supply zeros
+for out-of-image columns reads residue.
+
+Measured consequence on one operator: output columns `wo = 0` and `wo = Wo-1` were **NaN on every
+16-bit case that had padding** -- 12 of 20 cases failing `NaN位置不匹配` with `MERE = MARE = 0`, i.e. the
+NaN-position gate of **C100**. The only 16-bit survivors were a 1x1-pad-0 case and an all-NaN case; the
+fp32 case showed the same residue as an inf/Naha placement difference at the same two columns.
+
+**Fix: scrub `[0, lp)` and `[lp + len, Wc)` explicitly after every align-mode DMA.** Do not try to
+clean it up later -- see C105: `vmin`/`vmax` cannot remove a NaN.
+
+**And this is the defect that device 0 hides.** The operator's recorded score of `67.57 at 19/20` was
+taken on **physical device 0**, whose UB happened to be zero, so the residue read as zeros and the
+kernel looked correct. Re-measured on a good card the same commit scores **38.894 at 7/20**, failing
+identically. The excluded card does not only compute wrong answers -- **it can make a broken kernel
+look correct**, which is the more dangerous direction. Any recorded number whose script did not set
+`ASCEND_RT_VISIBLE_DEVICES` is suspect, because the evaluator always runs logical 0.
+
+## C105: `vmin`/`vmax`/`vmins`/`vmaxs` PROPAGATE NaN BUT CLAMP Inf
+
+Probed on a2a3: `inf -> +-1e30` (clamped), `NaN -> NaN` (propagated).
+
+**So a NaN cannot be scrubbed after the fact -- it must be prevented.** A saturating clamp is a valid
+way to keep an *infinity* out of an accumulator, and no way at all to remove a NaN that already exists.
+Plan the order accordingly: prevent the `0 * Inf` / `Inf - Inf` (C100), then clamp.
+
+**Corollary, measured:** an operator's **bias** is inside its declared value range too. One case
+generates `+-inf` biases, and an infinite seed made the first compensated residual `(bias - s) + pC`
+an `Inf - Inf = NaN`, poisoning all 2528 positions where the golden is `+-inf`. **Saturating the bias
+seed** took that arm from 19/20 to 20/20. Audit the value range of every *parameter*, not only of the
+data tensor.
+
+## C106: `TFusedMulAdd` / `TMulAddDst` ARE FUSED IN NAME ONLY -- NEITHER `vaxpy` NOR `vmla` SINGLE-ROUNDS
+
+Probed with the standard discriminator `a = b = 1 + 2^-23`, `c = -(1 + 2^-22)`: a true FMA leaves
+`2^-46`, two roundings leave `0.0`. **All three arms -- `vmla` with a full `src1`, `vmla` with a
+stride-0 broadcast `src1`, and `vaxpy` with a scalar -- returned `0.0`.** So on the Vec pipe there is
+**no single-rounding multiply-add available**, whatever the intrinsic is called. (A stride-0 `src1`
+broadcast does work, so that part of the idiom is fine.)
+
+**This does not contradict C83** -- keep the two straight, they are different units:
+
+| | behaviour | consequence |
+|---|---|---|
+| **scalar** unit (C83) | **contracts** into an FMA, and `-ffp-contract=off` does **not** stop it | costs 1 ulp against a reference that did not fuse; needs a `volatile` launder |
+| **Vec** pipe (C106) | does **not** fuse, ever | you cannot *gain* a rounding; a 10-term sum costs 10 roundings |
+
+**What follows for accuracy work:** when a CPU model shows a case needs single-rounding, you cannot get
+it from the Vec pipe. The routes that do work, measured on a 10-addition accumulation that failed
+`6/2 of 881` with two roundings: **Kahan** (`2/2`, PASS) or a **compensated two-float** accumulator.
+Model it on the host first -- a CPU model of the exact tap order reproduced both the shipped numbers
+and a previously reverted attempt **bit-for-bit**, which is how "no ordering of ten fp32 additions can
+pass" was shown to be true of *orderings* and false of the operator.
+
+## C107: A CAPACITY GUARD THAT **GIVES UP** IS A SIXTH FITTED-CONTRACT MECHANISM
+
+C86 lists five ways a supported set gets fitted to the visible cases. Here is a sixth, and it is the
+most deceptive because it **reads like a tile ladder and behaves like an unchecked buffer**.
+
+One path staged `C*VP` rows into a buffer bounded by `NROW = DSTC = 1024` with **no channel blocking**,
+unlike its two sibling paths which had it. Its only protection was an **R-shrink loop that floors at
+32** -- so the bound holds while `C <= 32` and silently stops holding above it. Declared `C` goes to
+**512**, i.e. 16x past where the guard works. At `C = 257` fp32 nearest the device took an aivec
+exception: `retCode = 0x31`, `errorStr = "MTE accesses an invalid GM address"`.
+
+**The guard is not a rejection and not a clamp. It is a best-effort shrink that runs out of room and
+then proceeds anyway.** Grep sees a loop that adjusts a tile, which looks like correct engineering.
+
+**And the reason it survived every earlier sweep is the part to internalise: the fault region is
+NON-MONOTONE, because a cost model chooses the path.**
+
+```
+C =  33 FAULT    64 PASS   128 PASS   256 PASS
+C = 257 FAULT   300 FAULT  384 PASS   512 PASS
+```
+
+**A powers-of-two sweep returns CLEAN. A sweep that checks only the declared maximum returns CLEAN.
+Both are wrong.** The tell was `C = 33` -- one past a boundary, the same probe shape that finds
+alignment defects. **Whenever a cost model or a heuristic selects between paths, the reachable-failure
+set is not an interval, so sweep off-by-one values around every threshold in the chooser, not just the
+extremes of the declared range.**
+
+**Audit rule:** when one path among siblings lacks a blocking loop the others have, that asymmetry is
+the defect -- the same signal as C103's row-vs-column precision asymmetry. Ask of every capacity guard:
+*what does it do when it cannot shrink far enough?* If the answer is "continues", it is this class.
+
+## C108: A UB TILE BASE BUILT FROM A RUNTIME PRODUCT IS ONLY SOMETIMES 32-BYTE ALIGNED  🔴 **CRITICAL**
+
+```cpp
+TASSIGN(ge, UB_GE + static_cast<int32_t>(k * srun) * 4);   // aligned only when srun % 8 == 0
+```
+
+A Vec instruction requires a **32-byte-aligned** UB address. A base formed as
+`UB_BASE + <runtime expr> * sizeof(T)` is aligned only when the expression happens to make the byte
+offset a multiple of 32 -- and a **declared axis usually does not**. Here `srun` is the *product of the
+spatial dims*, declared `1~512` over 2D-5D input, so **seven of every eight values are misaligned.**
+
+It raises `507035`, *"The vector core execution is abnormal"* / *"The UB address accessed by the VEC
+instruction is not aligned"*. One such case **took down a shared runner and cascaded 21 more**.
+
+**The predicate was established exactly -- 81/81 points, zero mispredictions:**
+
+```
+FAULT  <=>  mode == 1  AND  cg >= 2  AND  srun >= 2  AND  (srun % 8) != 0
+cg == 1   -> clean (k is only ever 0, so the offset is 0)
+srun == 1 -> clean (a separate branch avoids the k*srun offset)
+```
+
+**Measured, `cg=2`, fp16:** `1 ok | 2..7 FAULT | 8 ok | 9 FAULT | 16 ok | 17 FAULT | 32 ok | 33 FAULT |
+64 ok | 65 FAULT | 129 FAULT`. **Smallest reproducer: `x = [2,2,2]` fp16, `num_groups=1` -- eight
+elements.** Value range is irrelevant; unit-scale data faults.
+
+**This is C107's sibling, and it sharpens the sweep rule. A POWERS-OF-TWO SWEEP OF THAT AXIS IS CLEAN
+AND WRONG** -- 8/16/32/64/128 all pass. **The tells are 9, 17, 33, 65, 129: sweep the `% 8` residues of
+any axis that multiplies into a UB offset**, not its extremes and not its round numbers.
+
+**The fix that costs nothing:** walk `k` **descending** and start each channel's tile at the largest
+8-float boundary `<= k*srun`, lengthening it to `(k+1)*srun - beg`. The extra head elements spill
+backwards into channel `k-1`'s span, and `k-1` is expanded *afterwards*, so it rewrites exactly those
+elements with its own value. **When `srun % 8 == 0`, `beg` IS `k*srun` and `len` IS `srun`**, so every
+shape that already worked is written **byte-identically** -- only the loop order changes, and those
+writes are disjoint. Measured: per-case `t_hw_us` **exactly equal on 20 of 20** visible cases, and the
+raw output bytes SHA-256 identical, with a live positive control proving the comparison can see a
+difference.
+
+**Two process points this cost:**
+- **Why no gate saw it.** `mode 1` needs `rowlen <= 2048`, i.e. a tiny row, and the only two mode-1
+  visible cases dodge it -- one has `srun=128` (aligned), the other `srun=1` (the special-cased
+  branch). A declared axis was fully exercised in *range* and never in *residue*.
+- **It was NOT a regression.** The pre-existing base build faults identically, 10/10 matching points
+  on both sides of the boundary. Suspecting the newest code path is a reasonable prior and it was
+  wrong here -- **test the base build before attributing a fault to the latest change.**
+
+## C109: A TSTORE OUT OF AN L0C `Acc` TILE WRITES THE FULL 16-ROW FRACTAL  🔴 **CRITICAL**
+
+Not the declared valid rows -- **the whole fractal**. The overrun lands on whatever the layout puts
+next, so the symptom is wherever that happens to be.
+
+**Measured instance.** An operator accepted `projSize` 1..15 and was **silently wrong** for them
+whenever `numLayers >= 2` -- relative error **~1.0** at `P = {1,2,5,8,15}` for `L = 2,3`, and ~1e-6 at
+`P = 16`. The store overran `xt[l+1]` and overwrote the **K-augmentation ones row** that the folded bias
+depends on (and, bidirectionally, the next direction's slot).
+
+**Every observation follows from that one cause**, which is how you confirm it rather than guess:
+`P % 16 == 0` works; `P == 0` works (a Vec/UB store honours the row count); and **`L == 1` works because
+`xt[1]`'s ones row is only read by iproj for layer 1** -- which is precisely why **every single-layer
+`projSize` probe passes and hides it**.
+
+**Fix:** align the destination slot to the fractal (`Eslot = alignUp(E,16)`) and place the dependent row
+past it (`D*Eslot`). `P == 0` or `P % 16 == 0` then changes nothing.
+
+**Audit rule:** wherever an `Acc` tile is stored with a valid-row count below 16, ask **what occupies
+the next 16-row-aligned bytes**. If anything downstream reads that region, it is already corrupted.
+
+## C110: DUPLICATED GEOMETRY BETWEEN DRIVER AND KERNEL IS A SILENT OOB WRITE
+
+A host constant and a kernel constant describing the same geometry **will** drift. A stale host
+`Kpmax` of 64 against the kernel's 128 produced an out-of-bounds GM write -- **no error, no fault.**
+
+**The symptom is the diagnostic:** results that vary **run to run** and *converge* as the workspace
+fills with its own residue -- measured `4.267 -> 5.018 -> 5.212 -> 5.212`. A stable wrong answer is a
+logic bug; a **drifting** wrong answer that settles is uninitialised or overrun memory.
+
+**Rule:** a geometry constant lives in exactly one place. If the ABI forces it into two, assert the
+relationship at the boundary and write the rule at **both** sites. Dump the driver's cached workspaces
+when a wrong answer will not reproduce.

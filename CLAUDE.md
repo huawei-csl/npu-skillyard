@@ -92,6 +92,25 @@ CANN version, then re-validate (still STOPs if it can't see the NPU). This keeps
 (contract only) and turns "environment not ready" into an early, actionable failure. Env
 vars: `$PTO_PYTHON`, `$PTO_LIB_PATH` (pto-isa), `$PTO_INCLUDE_DIR`, `$PTO_ISA_REPO`.
 
+### Campaign components (cann-bench, not the generation pipeline)
+
+Two components exist for running an operator against the **cann-bench** leaderboard and for handling
+failures. They are separate from the generation pipeline above and are invoked directly, not by the
+stage drivers:
+
+- `skills/cannbench-campaign-loop` -- the end-to-end loop: control, the free pre-submission gates,
+  submit, retrieve, decide, fix, record. Holds the **scoring model** and the credit economics.
+- `skills/cannbench-failure-triage` -- the **decision procedure for a failure**. A dispatch table from
+  signature -> class -> cause -> action, the rule that real defects must be counted separately from
+  cascade casualties, the controls that must exist before any number is believed, and the pass-count
+  gate.
+- `agents/cannbench-triage.md` -- an agent that executes that procedure from a job id and **stops at
+  the submit boundary**. It never calls `submit_kernel` or `rerun_hidden_cases`.
+
+**The governing rule for both: we submit only when a FULL pass is projected** -- a pass count of N,
+not a score. A `partial_pass` posts nothing, so a delta attached to a known sub-N ceiling is
+uncollectable. Fixing is never gated; only submitting is.
+
 The skills (`torch-algorithm-to-pto-stages`, `pto-stage-artifact-generator-local`,
 `pto-stage-kernel-generator-v2`, `pto-kernel-optimizer`) are the *per-phase* building
 blocks both drivers invoke. `pto-stage-kernel-generator-v2/SKILL.md` is the largest and

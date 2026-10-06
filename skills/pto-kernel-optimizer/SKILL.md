@@ -935,6 +935,29 @@ applied early. What survives is a discriminator and one number, not a recipe:
   operand's GM burst was capped at **256 bytes** by the `TRESHAPE`/`TEXTRACT` square-tile
   constraint, which I had recorded in the same report. **Both hypotheses predicted that loss.**
 
+  > **AND THAT SQUARE-TILE CONSTRAINT WAS NOT REAL** (measured 2026-09-27). It was **a bug in
+  > our own declaration**, recorded as a probed platform fact and then cited as one here.
+  > `TRESHAPE` is a pure alias and `TEXTRACT` bounds by the source's *template* shape, so the ZN
+  > view has to carry the **transpose's** shape:
+  >
+  > ```cpp
+  > - L1MatZN<T, NT, KT, DYNAMIC, DYNAMIC> bzn(nvalid, kv);   // invisible while NT == KT
+  > + L1MatZN<T, KT, NT, DYNAMIC, DYNAMIC> bzn(kv, nvalid);
+  > ```
+  >
+  > The bug is **invisible at `KT == NT`** -- which is exactly the configuration the original
+  > probe swept -- so the probe "confirmed" a constraint it had constructed. Proof both ways:
+  > the corrected declaration at `KT == NT` compiles to a **byte-identical** device binary, and
+  > `KT=256, NT=128` validates 20/20 plus 216/216 degenerate. Unlocking it took the weight row
+  > from 256 B to 512 B, **668 -> 1410 GB/s**, worth 1.07-1.13x on five cases.
+  >
+  > **The methodological point, and it is why this note is here rather than in a changelog:**
+  > the probe varied the *geometry* and never varied the *declaration*. A rule was written from
+  > it, and it cost this operator a 2.1x DMA lever for an entire campaign. **When an ISA claim is
+  > "X is silently wrong" or "X is not supported", check the call site before you believe the
+  > hardware** -- and make a probe vary the thing the claim is *about*, not merely the thing that
+  > is easy to sweep.
+
   `softmax` separates them, because there every last-axis operand is read **once**
   (redundancy 1.0, the crossover's strongest predicted WIN). Measured, one binary, runtime
   mask, one arm per process, reproduced independently of the run that reported it:
@@ -1417,6 +1440,74 @@ tasks against a mean of 5.8 and cost **19%**, with no pipe ratio moving. The rul
 Diagnose this by computing tasks-per-core from the index arithmetic and comparing the maximum
 against the mean, *before* reaching for a profile. A pipe profile cannot see it.
 
+## 3.20b A RUNTIME TILE WIDTH COSTS 5-19% EVEN WHEN ITS VALUE EQUALS THE LITERAL
+
+**Measured on `engram_gate_fusion`, 2026-09-28.** Several tiles were *already* runtime-`ValidCol`
+tiles, but were being passed the **literal** `RCT`. Passing a **variable of the same value** moved
+ten untouched power-of-two-D cases by **0.887 to 1.236** -- because it defeats constant folding.
+
+This is not a UbS-vs-UbT question and not a tile-shape question. The tile declaration is unchanged;
+only the *provenance* of the extent changes, and the compiler stops folding.
+
+**Why it matters for measurement, which is the real trap:** it **invalidated three attempts before
+it was isolated**. Any change that converts a compile-time extent into a runtime one carries this
+cost silently, so an experiment that does so is measuring two things at once and will attribute the
+loss to its own hypothesis.
+
+**Rule.** When an attempt replaces a literal extent with a variable, add a control arm that passes a
+variable holding the ORIGINAL value. If that control is not ~1.00, the experiment is confounded and
+its ratio means nothing until the folding cost is separated out.
+
+## 3.21a THE NOOP FLOOR LIES FOR A COMPUTE-BOUND OPERATOR -- FLOOR PER STAGE
+
+The `-DPTO_NOOP` floor works by deleting arithmetic and keeping the memory schedule. On a
+**memory-bound** kernel that leaves a meaningful bound. On a **compute-bound** one it deletes the
+work itself, and the "floor" becomes nonsense.
+
+`conv_2d` is the worked example. With the MMAD removed, the whole-op floor on the fp32 cases drops
+**below `t_hw`**, and scoring every case at 1.10x of it projects a meaningless **149.04** -- against
+a 100-point maximum. A number above the scale should be the tell, but a subtler version of the same
+error just inflates your headroom estimate and sends you chasing a gap that is not there.
+
+**Floor each STAGE against its own binding resource, then sum:**
+
+- a load/store stage -> its MTE-only floor
+- a **compute** stage -> `max(MTE-only, MMAD-only)`, never MTE-only alone
+
+Done that way `conv_2d`'s conv stage reads **1.00-1.07x of its floor on 15 of 20 cases** -- i.e.
+genuinely finished -- while the naive whole-op column reads 1.11-2.21x and implies large headroom
+that does not exist. Case 5 independently confirms it: 77.3 GFLOP in 914.5 us is **84.5 TFLOP/s
+fp32, 95% of the 88.5 TFLOP/s the cube can issue**.
+
+**Corollary for the `min(measured, 1.10x floor)` headroom estimate:** it is only as honest as the
+floor. Report which stages are at their limit and which are not, rather than one operator-level
+ratio -- and if a floor implies a score above the maximum, the floor is wrong, not the kernel.
+
+## 3.21b A LEVER REJECTED ON REASONING IS NOT REJECTED
+
+**Measured across two independent campaigns: reasoning-only rejections were wrong 4 times out of 6.**
+
+When a prior campaign records a lever as rejected, check HOW it was rejected. If the entry has no
+ratio next to it, it was an argument, not a result -- and arguments about this hardware lose:
+
+- `rms_norm` v1 rejected 5 levers on reasoning. Re-tested all five: **3 were wrong.** One of them,
+  hoisting a reduce-loop barrier, became the campaign's **biggest general-path win (1.099x)**.
+- `engram_gate_fusion` v1 rejected the conv-pass-count lever by reading a directory listing:
+  "`TMULA`/`TMADD` are absent from `a2a3`, therefore the conv floor is `2K-1` passes." **The
+  premise was true and the inference was wrong** -- PTO's col-expand path already issues
+  `vmul(..., src1RepeatStride=0)`, and `vmla` in the same slot gives a column-broadcast MLA.
+  Conv went from `2K-1` passes to `K`, worth **+0.75 score**.
+
+Both failures share a shape: **a true fact about what exists was converted into a false conclusion
+about what is reachable.** An instruction being absent from a header directory does not mean the
+operation is unreachable; it means that spelling of it is.
+
+**Rule.** A lever costs one measurement to refute and a whole campaign to wrongly skip. Re-test
+every inherited reasoning-only rejection before building on it, and when you reject a lever
+yourself, either attach a ratio or label it `NOT MEASURED` so the next campaign knows to re-test it.
+An inherited rejection *with* a ratio can still be void if a later attempt moved the bottleneck
+(see 3.9) -- re-test those too, but that is a re-pricing, not an unexamined assumption.
+
 ## 3.22 THREE STANDING PRIORS, CORRECTED BY A DATA-MOVEMENT KERNEL
 
 Every rule below had been asserted confidently in this skill and in run briefs. A single
@@ -1439,6 +1530,28 @@ width", never "depth is closed".**
 device: **1.14 us at block_dim 48, 0.74 us at block_dim 8.** The 4 us figure came from an
 `npu.Event` loop where host enqueue and device time agreed -- i.e. it measured the harness.
 Quote the two separately, and note the device floor **falls with block_dim**.
+
+> **DISPUTED -- two of our own measurements disagree and neither has been adjudicated.**
+> A later `rms_norm` campaign measured the device launch floor with a kernel that returns at its
+> first instruction and got **1.58 us at block_dim 2, rising ~65 ns per block, so 4.64 us at
+> block_dim 48** -- a floor that *rises* with block_dim, and ~4x the figure above at bd=48. It
+> reported that intercept as the entire `4.74 us` constant of its own `4.42 ns/row + 4.74 us` fit,
+> which is internally consistent.
+> A third measurement (`conv_2d`, empty AICore kernels, same metric) shows why both are too simple:
+> **the floor depends on the ARCH and is NOT MONOTONIC in block_dim.**
+>
+> | arch | bd=1 | bd=8 | bd=24 | bd=40 | bd=48 |
+> |---|---|---|---|---|---|
+> | `dav-c220-vec` | 0.92 | 2.74 | 1.70 | 2.22 | 2.58 |
+> | `dav-c220-cube` | 1.78 | 1.14 | 1.66 | -- | -- |
+> | `dav-c220` MIX | 1.14 | 1.68 | 3.36 | 5.20 | 6.06 |
+>
+> MIX rises steeply and roughly monotonically; `-vec` does not rise monotonically at all. So "the
+> floor falls with block_dim" and "the floor rises ~65 ns per block" are each true of some arch and
+> false of others, and a single number for "the launch floor" does not exist.
+>
+> **Do not quote any of these as settled.** Measure the floor for **your arch**, with an empty
+> kernel, across the block_dim range you actually use, before pricing a schedule with it.
 
 **3. "block_dim does not matter" -- it was the biggest single win here (+14%).** The prior came
 from two ops where a sweep moved nothing. On this one, choosing `block_dim` from payload size

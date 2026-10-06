@@ -34,6 +34,10 @@ After install, the skills are namespaced under the plugin, e.g.
   C-series critical rules, the archetype decision tree, and the C24 compile recipe).
 - **pto-kernel-optimizer** -- drive a correct kernel toward a performance target
   (measure -> decide -> attack -> re-measure).
+- **cannbench-campaign-loop** -- run one operator through the external cann-bench scorer:
+  control -> free pre-submission gates -> submit -> retrieve -> decompose -> decide whether a
+  fix is worth anything -> fix -> record. Encodes the scoring model, the credit economics, the
+  evaluator's traps, the failure taxonomy, and the defect classes that have cost real points.
 
 ### Agents (`agents/`)
 - **stage-pipeline** -- full-pipeline orchestrator (Phases 0-7) with parallel per-stage
