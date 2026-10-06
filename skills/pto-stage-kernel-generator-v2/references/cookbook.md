@@ -4183,3 +4183,31 @@ whenever you touch barriers, and treat a single fault in fifty as a real defect 
 
 Related: C52 (raw intrinsics own the barriers), C78 (an aliased `tmp` is a race that passes every
 gate we have).
+
+## COOK-§24: RESIDENCY RANKS BY **BYTES x REUSE**, NOT BY CONVENIENCE
+
+**In a loop-carried recurrence the residency candidate is the operand that does NOT change across
+iterations.** Rank candidates by `bytes * (times re-read)`, and stage the winner once outside the
+loop.
+
+**Worked inversion, verified in our own source.** `kernel_lstm.cpp`'s `gemm_m_k16`:
+
+```c
+for (int32_t kb = 0; kb < nKt; ++kb) {
+    GT<float> ga(wptr + kb*kKT, ...);          // the WEIGHT -- loop-invariant across timesteps
+    GT<float> gb(rptr + kb*kKT*kNT, ...);      // the per-step operand
+    TLOAD(l1a, ga);                            // re-loaded from GM every kb ...
+    TLOAD(l1b, gb);                            // ... and the function is called per M tile per step
+```
+
+So the kernel stages the **small per-step operand** (the hidden state, 16 columns) into L1 each step
+and **re-loads the large loop-invariant weight from GM on every K block, every M tile, every
+timestep.** That is exactly backwards: the weight is the operand with the reuse.
+
+**Couples to C123:** fp32 operands **double** the weight footprint against fp16, so an upcast can push
+a weight that *would* fit L1 out of it -- turning a residency win into a per-iteration GM reload.
+Check the dtype decision and the residency decision together.
+
+**The L1-eviction half of this is a HYPOTHESIS, not a measurement.** That re-loading the weight
+actually evicts it, rather than hitting in L1, has not been measured on our part -- do not quote a
+cost for it without a two-arm probe.

@@ -132,7 +132,12 @@ a cookbook section or platform model section for details.
 5. □ Compute UB budget — PLAT-§UB, verify fits in 192KB (A2/A3) or 256KB (A5)
      If Cube path (TMATMUL): add L1 Mat staging tiles and L0 Left/Right tiles to budget (C26).
 6. □ Select sync protocol — from archetype (Vec-only flags vs cross-core FFTS)
-7. □ Plan work distribution — COOK-§1.68/§1.69 (grid-stride or varlen)
+7. □ Plan work distribution — COOK-§1.68/§1.69 (grid-stride or varlen).
+      **C124: enumerate the grid-stride ITEM COUNT for every shape in the declared contract
+      and compare it against `block_dim`.** An item count below the block dim means the kernel
+      runs on a fraction of the device and NO correctness gate can see it. Detect-and-decide:
+      splitting a second axis costs a per-step grid barrier, and raising a `block_dim` cap buys
+      nothing while the item count binds.
      Derive elements_per_iteration from problem and input shapes.
 8. □ Choose tile shapes — fixed compile-time tiles, runtime outer loops
 9. □ Draft UB address map — COOK-§1.6/§3 with static_assert guard
@@ -3334,6 +3339,81 @@ grep -rnE '(^|[^A-Za-z_])(TCI|TRESHAPE|SETFMATRIX|SET_IMG2COL[A-Z_]*) *[<(]' --i
 then **check the overload** (a 2-argument `TCI` is scalar; a 3-argument one is not) and **check what
 reads the tile**. A `TRESHAPE` whose result is consumed by a Cube/MTE1 op is a different pipe pair and
 is not covered by this rule -- confirm the consumer before converting anything.
+
+### C123: fp16 / bf16 GO INTO THE CUBE **NATIVELY** -- UPCASTING TO fp32 FIRST IS A DEFECT  🟡
+
+**Verified in the pinned library**, `a2a3/TMatmul.hpp` `CheckStaticMad`'s `static_assert` accepts:
+
+```
+(int32_t, int8_t,      int8_t)
+(float,   half,        half)          <-- fp16 operands, fp32 ACCUMULATOR
+(float,   float,       float)
+(float,   bfloat16_t,  bfloat16_t)    <-- bf16 operands, fp32 ACCUMULATOR
+```
+
+So a 16-bit operand already accumulates in fp32. **Converting it to fp32 before the Cube buys no
+accuracy and costs throughput**, and the library's own cost model says how much
+(`costmodel/a2a3/cce_costmodel/cce_costmodel_cube.hpp`, `mad()`):
+
+```c
+constexpr uint64_t kCyclePerRepeatForFloat = 2;
+int cycle_per_repeat = 1;
+if (std::is_same_v<dtype_a, float>) cycle_per_repeat = 2;   // float is penalised
+const uint64_t kTiles = CeilDiv(k, 32 / sizeof(dtype_a));   // and gets a SMALLER k-tile
+```
+
+fp32 pays `cpr = 2` with `kTile = 8`; fp16 pays `cpr = 1` with `kTile = 16`. Cycles scale as
+`cpr * kTiles`, i.e. `k/4` against `k/16` -- **a 4x predicted difference for the same shape.**
+Cross-check: int8 gets `cpr = 1`, `kTile = 32`, predicting 8x over fp32, which matches an
+independently measured int8/fp32 ratio on another operator.
+
+**This figure is a COST-MODEL PREDICTION, not a device measurement.** Before quoting any speedup,
+run a two-arm on-device microbenchmark at identical shape -- fp16 operands against fp32 operands,
+same fp32 accumulator, with a null control -- and confirm the fp16 arm still clears the operator's
+accuracy gate.
+
+**Worked defect:** `kernel_lstm.cpp` routes every weight and input through **9 `TCVT` sites** into
+fp32 buffers in its PREP phase and declares **every** Cube tile as `float`
+(`L1Mat<float,...>`, `TileLeftF<float,...>`, `TileRightF<float,...>`), so it instantiates **only**
+the all-fp32 triple. **8 of its 20 cases are fp16 or bf16** and pay the 4x for nothing -- and its
+golden is an fp32 CPU computation anyway, so there is no accuracy argument for the upcast.
+
+**Second-order effect, and it couples to COOK-24:** fp32 operands **double the weight footprint**
+versus fp16, which can push a loop-invariant weight that would fit L1 out of it. So an upcast can
+convert a residency win into a per-iteration GM reload.
+
+### C124: A GRID-STRIDE LOOP WHOSE **ITEM COUNT** IS BELOW THE BLOCK DIM RUNS ON A FRACTION OF THE DEVICE  🔴 **CRITICAL**
+
+**No correctness gate can see this**, and no `block_dim` change fixes it.
+
+A grid-stride loop of the form
+
+```c
+for (int32_t it = lane; it < nItem; it += lanes) { ... }
+```
+
+executes on `min(nItem, lanes)` lanes. If `nItem < lanes`, the surplus cores are **idle by
+construction** -- every case passes, the score simply never reflects the hardware.
+
+**Worked defect:** `kernel_lstm.cpp:422` computes `nItemW = q.NU * nRB` (directions x
+`ceil(batch/16)`). Across the 20 declared cases that product is **1 for fifteen of them and 2 for
+the bidirectional ones, against a `block_dim` of up to 24** -- measured independently as *all
+recurrence work running on `vid == 0` of 1-4 active cores out of 24*. The four-gate axis, up to 1024
+rows, is a **serial loop inside the single active core**.
+
+**MAKE IT A MECHANICAL DETECTOR**, in the same spirit as the accepted-set-equals-exercised-set rule:
+**enumerate the item count the loop produces for every shape in the declared contract and compare it
+against the block dimension.** A declared shape whose item count is below the block dim is a finding.
+
+**And record the counter-pressure, because this is DETECT-AND-DECIDE, not always-split.** Splitting a
+second axis across blocks when the consumer needs all partials costs a **per-step grid barrier**,
+which collides with the cookbook's guidance against grid-barrelling a per-tile seam and with the
+`SYNCALL` block-dim cap (**C66**/**C57a**: a barrier over-subscribed past the device's core count
+deadlocks). So the detector reports; the decision is separate.
+
+**Corollary: raising a `block_dim` cap buys NOTHING while the item count is the binding constraint.**
+Measured on lstm -- `block_dim` forced to 2/4/8/16 all *lose*, best per-case +0.071, i.e. the existing
+value is already optimal because the item count, not the cap, is what limits occupancy.
 
 ### C122: PTO's **b32 index gather** ALIASES ITS OFFSET TABLE ONTO THE DESTINATION  🔴 **CRITICAL**
 

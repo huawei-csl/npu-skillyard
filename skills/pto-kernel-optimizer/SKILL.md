@@ -1563,3 +1563,36 @@ attempts is still scoped to the archetype it was tested on.** Before briefing a 
 name the archetype it was closed on -- and prefer sending an exploratory op at a *different*
 archetype precisely because it is where standing rules break.
 
+## A FLAT PER-ITERATION COST IS A DIAGNOSIS -- COMPUTE IT BEFORE CHOOSING A LEVER
+
+**Divide measured time by the loop-carried iteration count BEFORE picking anything to optimise.** If
+that quotient is flat across a sweep whose per-iteration arithmetic varies by orders of magnitude,
+the bottleneck is **per-iteration latency**, and an occupancy, tiling or dtype change is mispriced.
+
+**Worked example, recomputed from two independent sources** (lstm: README per-case device times x the
+`S*L` values from its performance campaign, i.e. time divided by `numLayers * timeStep`):
+
+| | min | max | spread |
+|---|---:|---:|---|
+| **us per iteration**, 15 cases with H <= 64 | 5.05 | 8.37 | **1.66x** |
+| per-iteration **arithmetic** (~H^2), same 15 | -- | -- | **16x** |
+
+**A 10x divergence.** The quotient only rises on H = 128/256 (9.3-23.9 us). Independently, a
+regression over the same cases gives `t = -4.46 + 7.923*(S*L) us` at **R^2 = 0.9881**, and adding a
+MAC term moves R^2 only to 0.9893 -- the cost is **fixed per iteration**, not proportional to work.
+Corroborated by the pipe view: summed AIV ratios 0.037-0.251 and AIC ~0.10-0.20, i.e. **75-96% idle
+on both engines**, with a per-step budget of AIV 1.65 / AIC 0.89 / barriers 0.56 / **essential
+arithmetic 0.013** us and ~54% unaccounted.
+
+**Why this rule exists: it would have pre-empted a redesign modelled at +4.75 that ablated to
++1.030.** That projection took its floor from pipe-busy ratios (0.84-2.40 us/step) when the measured
+floor was 4.51-6.66 -- **a pipe-utilisation ratio is not a floor estimate**, because it cannot see
+dependent-op drain or GM access latency. "Idle" was *waiting*, not *available*.
+
+**So when the quotient is flat:**
+1. **Do not** reach for occupancy, tiling, or operand dtype -- none of them touch a latency chain.
+2. **Count the dependent ops per iteration and price their serialisation.** On lstm that was 62
+   dependent Vec ops at a measured **26-34 cycles** of barrier drain each -- 61-83% of the clock.
+3. **Then price the lever by ABLATION, not by model**: build an arm that simply deletes the work the
+   redesign would remove. Whatever that measures is an upper bound no implementation can beat, it
+   costs two throwaway builds, and a wrong-answer arm needs no correctness battery.
