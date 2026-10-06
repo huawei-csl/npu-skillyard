@@ -6433,3 +6433,75 @@ logic bug; a **drifting** wrong answer that settles is uninitialised or overrun 
 **Rule:** a geometry constant lives in exactly one place. If the ABI forces it into two, assert the
 relationship at the boundary and write the rule at **both** sites. Dump the driver's cached workspaces
 when a wrong answer will not reproduce.
+
+### C125: A SATURATING TRANSCENDENTAL REBUILT AS `cheap_form + correction` LEAKS THE CORRECTION'S FLOOR WHERE THE CHEAP FORM WAS ALREADY EXACT  🔴 **CRITICAL**
+
+PTO has **no `TTANH` and no `TEXPM1`** (verified: a search for `tanh` returns nothing; Elementwise
+Tile-Tile carries `TEXP`/`TLOG`/`TDIV`/`TRECIP` only), so `tanh` must be built. The two-step trap below
+cost a real operator half of a 22-case failure class, and **step 2 is the part nobody checks**.
+
+**Step 1 -- the half-angle form cancels near zero.** `tanh(z) = 2*sigmoid(2z) - 1` with
+`sigmoid(2z) ~= 0.5 + z/2` carries an **ABSOLUTE** error of ~1 ulp at 1.0 (**measured 7e-08, FLAT in
+z**) while the true value is ~`z`, so the **RELATIVE** error is unbounded. With decaying activations
+the signal falls ~10x per layer while that error does not: measured `rel_fro` **3.2e-05 at
+numLayers=3 rising to 1.18 at numLayers=8**. No algebraic rearrangement helps -- `(1-u)/(1+u)` with
+`u = exp(-2z)` has the identical cancellation, because `TEXP` destroys the information (`u` is
+accurate to a *relative* 1e-7, which near `u == 1` is an *absolute* 1e-7 in `1-u ~= 2z`), and it
+additionally returns **NaN for `z <= -20`** without a guard. A small-argument polynomial is mandatory.
+
+**Step 2 -- the mask-free composite then breaks saturation.** The fix for step 1 is
+`tanh(z) = E(z) + [poly(zs) - E(zs)]`, `zs = clamp(z, +/-0.25)`, chosen mask-free so it needs no mask
+tile and no `TSELS` per site. But **for every `|z| > 0.25`, `zs` is pinned at +/-0.25, so the bracket is
+a CONSTANT ~+/-6e-08** -- and `E(z)` alone **is exact at saturation** (`exp` underflows, `2*1-1 == 1`).
+So the correction **de-saturates a `tanh` that should be exactly +/-1**. Measured absolute error,
+shipped composite vs gated:
+
+| \|z\| | composite | gated | torch |
+|---|---|---|---|
+| [0.5, 9) | 2.37e-07 | 1.78e-07 | 2.99e-08 |
+| [9, 20) | 5.96e-08 | **3.05e-08** | 3.05e-08 |
+| **[20, 1000)** | **5.96e-08** | **0** | 0 |
+
+**It cannot be tuned away.** `|corr|` is set by `E`'s own ~6e-08 absolute floor (the `2*sigmoid-1`
+cancellation) and that floor is **flat in the clamp value** -- identical at clamp 0.05, 0.25 and 1.0 --
+so no `kTanhClamp` makes `1.0 + corr` round back to `1.0`. Retuning the clamp is also
+hardware-fragile (it would depend on `TEXP` at one point).
+
+**Rule:** when you rebuild a saturating function as `cheap + correction`, **gate the correction off
+wherever the cheap form is already exact.** Arithmetic gate, 6 Vec ops, no mask tile, no extra UB, and
+bit-identical on the small-argument path by construction (`d == 0` exactly there):
+
+```cpp
+TSUB(w, z, zs);          // d = z - zs : EXACTLY 0 where zs == z
+TMUL(w, w, w);
+TMULS(w, w, -1.0e6f);
+TADDS(w, w, 1.0f);
+TMAXS(w, w, 0.0f);       // 1.0 at |d|==0, exactly 0.0 for |d| >= 1e-3
+TMUL(dst, dst, w);       // d^2 overflowing to inf still yields gate 0
+```
+
+**And the limit of the whole exercise, measured -- read this before budgeting accuracy work.** At a
+**catastrophic-cancellation position** (`c = f*c_prev + i*g` where two O(1) terms cancel to a few
+ulps) the residue is an exact integer multiple of one operand ulp, `2^-24 = 5.96e-08`. Against a
+comparator denominator of `|golden| + 1e-7`:
+
+```
+golden == 0        : MARE = 5.96e-08 / 1.0e-7  = 0.596   FAIL (limit 0.5)
+golden == 1e-8     : MARE = 5.96e-08 / 1.1e-7  = 0.544   FAIL
+golden == 5.96e-08 : MARE = 5.96e-08 / 1.6e-7  = 0.3735  pass
+```
+
+**ONE ulp of disagreement is already 1.09x-1.19x over the limit.** Passing such a position needs
+**zero** units of difference, i.e. bit-exactness with the reference. Three measurements say that is
+out of reach: the **exact fp64 answer rounded to the case dtype FAILS** (MARE 1.37 and 23.49 on two
+configs); **PyTorch's own non-oneDNN fp32 path FAILS** (1.553, 2.652); and **two equally valid
+references disagree by 75% of the entire budget** (oneDNN on vs off: MARE **0.3735** between the two
+goldens, leaving an implementation 0.1265 of 0.5). Swapping a single transcendental moves MARE
+0.81/1.03/1.07/1.27/3.6 in **no consistent direction**.
+
+So split the class before you build: where the failure is **your own contamination** it is
+convertible (measured 24x-92x MERE improvement, 12 fail->pass / 1 pass->fail over 334 configs); where
+it is **amplification of an unavoidable ulp** it is unwinnable at any accuracy. A **perfect** tanh
+converted only **7 of 16** failures -- so "make it more accurate" has a measured ceiling well below
+"all of them". See **C115** (judge by failure-set SUBSET, not count -- this fix is 12:1 and still not
+a strict subset: one config went 0.3177 -> 0.5012, 0.24% over, on a pure rounding lottery).
