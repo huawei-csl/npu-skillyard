@@ -6604,3 +6604,50 @@ have to say "because the compiler reorders aliased tiles", fix the aliasing inst
 a kernel, **measure what `PIPE_ALL` actually costs against `PIPE_V` on the target part** — if the two
 are comparable the conversion is correctness hygiene only, and that is worth knowing before you spend
 UB on de-aliasing.
+
+#### C127 addendum — MEASURED barrier costs, and why a high PIPE_ALL share is usually a UB symptom
+
+**The constants, measured on a2a3 `dav-c220-vec`** (dependent in-place `TADDS` chain, 10 000
+iterations, intra-arm spread 1 tick in 10 000; `get_sys_cnt()` **calibrated against wall clock**, not
+assumed — 50 MHz exactly, 20 ns/tick, 1 tick = 36 cycles at 1800 MHz, independently confirmed by a
+no-barrier arm measuring 1.00 repeat/cycle):
+
+| arm | cost |
+|---|---|
+| the op alone, no barrier | 3.0 cyc |
+| `pipe_barrier(PIPE_V)` | **19.9 cyc** |
+| `pipe_barrier(PIPE_ALL)` | **32.0 cyc** — **1.61x**, excess **12.1 cyc/site** |
+| a **redundant** `PIPE_ALL` | **9.0 cyc** — not free |
+| a **redundant** `PIPE_V` | **0.0 cyc** — elided |
+| `PIPE_V; PIPE_ALL` | exactly `PIPE_ALL` — prefixing buys nothing |
+
+So the lever is real but it is **1.61x, not 2-3x**. Price it per site against the step time before
+spending anything: 100 sites x 12.1 cyc is 1210 cycles, ~0.67 us at 1.8 GHz.
+
+**A free, correctness-safe way to bound the prize before converting anything.** Because a redundant
+`PIPE_ALL` costs a known 9.0 cyc and *doubling* every barrier is semantically identical, measure the
+slowdown from doubling and scale it by `12.1 / 9.0 = 1.344`. That bounds what conversion can win
+without changing a single barrier's meaning.
+
+**And a bulk conversion is not a safe experiment: it faults the device.** A mechanical
+`PIPE_ALL -> PIPE_V` across all 100 sites of one operator compiled and then **faulted the vector core
+(error 507035)** on the first case. Classify first; convert in small verified groups.
+
+**The correction to this rule's framing.** On the operator with the largest absolute count (100
+`PIPE_ALL` vs 84 `PIPE_V`), **only 3 of 100 were convertible**. The other 97 covered a genuine
+`MTE2` (23), `MTE3` (11), `PIPE_S` (10), flag-drain (10) or function-tail (15) edge, a b32 `TGATHER`
+(10), or a **live UB alias (15)** — and de-aliasing was *physically impossible* because its fp32 UB map
+is saturated **to the byte** (`188416 == its own limit`), with one region deliberately overlaid on two
+others to fit. Measured end result: **+0.18%, i.e. +0.0004 score points.**
+
+> **A kernel that buys its UB budget by aliasing pays for it in barrier width.** A high `PIPE_ALL`
+> share is therefore usually a **symptom of a saturated UB budget**, not of sloppiness — and the low
+> shares elsewhere (one operator runs 0 `PIPE_ALL` against 65 `PIPE_V`) likely reflect **UB headroom**
+> rather than superior discipline.
+
+**So apply C127 in this order:** (1) probe the two barrier costs on the target part; (2) bound the
+prize with the doubling trick; (3) build the alias graph **and report the UB headroom**; (4) convert
+only what has headroom. If the budget is saturated, **a documented residue with a comment naming each
+alias pair is the correct outcome** — and say so with the arithmetic rather than forcing a conversion.
+C127 remains right that an *undocumented* `PIPE_ALL` is a defect; it is wrong to assume a high share is
+recoverable.
