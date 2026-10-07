@@ -6515,3 +6515,38 @@ it is **amplification of an unavoidable ulp** it is unwinnable at any accuracy. 
 converted only **7 of 16** failures -- so "make it more accurate" has a measured ceiling well below
 "all of them". See **C115** (judge by failure-set SUBSET, not count -- this fix is 12:1 and still not
 a strict subset: one config went 0.3177 -> 0.5012, 0.24% over, on a pure rounding lottery).
+
+### C126: TWO IN-PLACE CLAMPS BACK TO BACK ARE A Vec RAW HAZARD THAT ONLY SHOWS ON ONE SIGN  🔴 **CRITICAL**
+
+```cpp
+TMINS(x, x, +KSAT);      // in-place
+TMAXS(x, x, -KSAT);      // in-place, reads what the previous op wrote -- NO BARRIER
+```
+
+MEASURED silent wrong answer. The second op reads `x` before the first has retired, so it can see the
+**stale** value. The defect is invisible whenever the first clamp is a no-op -- which is most inputs --
+so it survives every ordinary battery, and it manifests on **one sign only**: with `x = +inf`, a stale
+read gives `max(+inf, -KSAT) = +inf` instead of the clamped `+KSAT`; a downstream compensated-sum
+residual then computes `inf - inf = NaN` and `acc + NaN` destroys an output that was correct.
+`x = -inf` is unaffected. **12 of 108** fp32 non-finite configs on one operator, each presenting as
+`inf_only_golden == nan_only_ours`, and it cost two hidden cases.
+
+**Rule:** a `pipe_barrier(PIPE_V)` is required between consecutive **in-place** Vec ops on the same
+tile, even when both are "just a clamp" and even when they look like one fused saturation step. An
+in-place op is a read AND a write of the same address, so a second one is a RAW edge, not an
+independent elementwise op. Audit every pair of `TMINS`/`TMAXS`, `TADDS`/`TMULS`, `TSELS` and friends
+that share a destination.
+
+**Diagnosis recipe, because the symptom points away from the cause:** the visible failure was NaN in a
+compensated-accumulation path, so the natural suspect is the compensation arithmetic. Build an
+**ablation that deletes the compensation** -- if the failures vanish, that only proves the *path*, not
+the *op*. Then bisect to a single element with the simplest possible input (`x=+inf, w=1, b=0`), and
+check whether the failure is **sign-asymmetric**. Sign asymmetry on a symmetric pair of clamps is the
+fingerprint of a stale read rather than of bad arithmetic.
+
+**And do not read `total_count == 0` as a cause.** It is the comparator's early-return reporting
+artifact (`compare.py:398` builds a `CompareResult` with only `passed/dtype/threshold/error_msg`, so
+every count falls to its dataclass default). The SAME signature was traced on two operators in one day
+to two unrelated causes: a reference that suppresses NaN IEEE arithmetic produces (**unwinnable**), and
+this barrier bug (**fixable**). The signature identifies *which return fired*, never why. See **C41**
+for the MTE2 ordering version of the same class.
