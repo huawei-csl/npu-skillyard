@@ -4299,3 +4299,39 @@ barrier IS the cost, shown by a null arm, not argued. Two independent chains sha
 pair measure **2.0-2.4x** against a control that barriers after each. Launch floor is **1.08 us** for
 a `dav-c220-vec` noop against **3.49 us** for a MIX noop, i.e. a **+2.41 us MIX toll** -- so a
 single-engine launch is worth real time before any arithmetic runs.
+
+## COOK-27 -- a barrier's justification comment outlives the layout it describes
+
+MEASURED, and it was worth **1.056x** on one operator.
+
+A kernel carried a sound bisection in its header: `-O1`/`-O2` with `PIPE_V` computed WRONG answers,
+`PIPE_ALL` and `-O0` were exact, cause recorded as *"a `[2H,16]` tile and its `[H,16]` halves `TASSIGN`ed
+to the same UB address, so bisheng's tile dependence analysis sees no dependence and reorders."* On the
+strength of that comment a macro made **every** barrier in the file `PIPE_ALL`.
+
+**That layout had been deleted several revisions earlier.** The fast path was by then `[4H,16]` with
+quarters and the general path a separate arena. Converting all 96 macro sites to `PIPE_V` gave
+**0 fail->pass, 0 pass->fail, and not one MARE value changed across 96 real-battery configs** -- including
+the multi-chunk (`numLayers` 4/6) and projection paths that broke a prior change 9 ways. In a chaotic
+recurrence any bit difference moves MARE, so an unchanged MARE on every config is bit-identity measured
+through the benchmark's own comparator. Result: hot-path wide barriers **73 -> 3 per timestep**, static
+**129 -> 39**, **zero UB spent**, median **1.056x**, 16/16 measurements positive.
+
+**Rule:** a barrier comment must name **the alias pair AND the tile shapes**, so the next reader can see
+at a glance that the layout moved. A comment naming only a symptom ("the compiler reorders") ossifies
+into a permanent tax that no one can safely question. And when a comment cites a bisection, re-run the
+bisection before trusting it -- the one above no longer reproduces at all (`-O0` of that kernel now emits
+all zeros, control and treatment alike, so the "-O0 was exact" row is not testable today).
+
+**Two quantitative lessons from the same work.**
+
+1. **A linear barrier-count model UNDER-estimates the prize, by ~1.65x.** Predicted +5.41% from
+   `64 barriers x 23.0 cyc`; measured **+8.93%**. Removing a barrier does not just delete its cycles, it
+   lets the surrounding ops **pipeline**: probe measured a dependent op at **55.0 cyc with `PIPE_V` and
+   32.0 cyc without**. So price barrier removal from a measured no-barrier bound, not from cycle counts.
+2. **Count UB headroom in TILES, not bytes.** An arena with 20480 B free sounds like room to work; it is
+   **exactly one `[256,16]` fp32 tile**. An interleaving transformation needed **+3** tiles (49152 B)
+   because the two chains it would overlap **share storage** -- one chain's scratch tiles were *quarters
+   of* the tile the other chain writes whole. An Estrin split needed **+2**, and a +1-tile formulation
+   was proven not to exist (8 levels / 10 ops against 9 / 9: saves one barrier, costs one op, net
+   negative). "Spend the spare 20 KB" was not an executable instruction.
