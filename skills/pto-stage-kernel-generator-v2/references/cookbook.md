@@ -4335,3 +4335,56 @@ all zeros, control and treatment alike, so the "-O0 was exact" row is not testab
    of* the tile the other chain writes whole. An Estrin split needed **+2**, and a +1-tile formulation
    was proven not to exist (8 levels / 10 ops against 9 / 9: saves one barrier, costs one op, net
    negative). "Spend the spare 20 KB" was not an executable instruction.
+
+## COOK-28 -- barrier and flag costs, MEASURED, and why narrowing stops paying
+
+All figures from a standalone MIX (`dav-c220`) probe with a dependent `vadds` chain and a slope fit over
+20k-100k repeats so launch overhead cancels. Bare dependent op floor 1.52 ns.
+
+### Issue cost (nothing to stall on)
+| construct | ns | x PIPE_V | x PIPE_ALL |
+|---|---:|---:|---:|
+| `pipe_barrier(PIPE_V)` | 7.93 | 1.00 | 0.55 |
+| `pipe_barrier(PIPE_ALL)` | 14.55 | 1.84 | 1.00 |
+| `set_flag`/`wait_flag` pair (any direction) | **0.62-0.67** | **0.08** | **0.045** |
+
+`PIPE_ALL / PIPE_V = 1.835x` here against 1.60x from a cycle-based probe -- same direction and order;
+this one is a *marginal* cost over the bare op, reconcilable with an op floor of ~17 cyc.
+
+### IN-SITU cost at a real WAR edge -- the number that actually governs
+| edge | `PIPE_ALL` | flag pair | "nothing" (wrong) | flag saving |
+|---|---:|---:|---:|---:|
+| V->MTE2 | 115.79 | 113.59 | 63.03 | **4.2%** |
+| MTE3->V | 133.98 | 128.13 | 79.50 | **10.7%** |
+
+**The 22x issue advantage evaporates: the dominant cost is the MTE transfer stall, which both constructs
+pay in full.** So replacing a load-bearing `PIPE_ALL` with an adjacent flag pair buys **4-11%**, not 20x.
+A measured substitution of 5 such sites came in at **-0.038 score points, CI [-0.177, +0.101]** -- inside
+the noise.
+
+**A flag pair's real value is that it can be SPLIT.** `set_flag` early, `wait_flag` late, with independent
+work placed between them, hides the ~50 ns stall outright instead of shaving 4% off it. That is a
+restructuring, and it is where the remaining prize is.
+
+### Three hard rules that came out of the same work
+
+1. **`pipe_barrier(PIPE_S)` is NOT LEGAL on this arch.** It faults the vector core: `Illegal instruction`,
+   error `0x10`, aivector core 19. A scalar barrier is not a narrower option for any edge -- it does not
+   exist. (Mask-mode state is ordered with `PIPE_V`; see COOK-27.)
+2. **Where a `PIPE_ALL` covers TWO OR MORE distinct cross-pipe edges it is CHEAPER than the 2-3 flag pairs
+   that would replace it -- narrow only single-edge sites.** Measured: three `MTE3->V` sites were really
+   multi-edge (a `TSTORE` reading one buffer while the *next* work item `TLOAD`s into a buffer *this* item
+   still reads -- a V->MTE2 back-edge a lone MTE3->V pair cannot express). Substituting them produced
+   **12 deterministic bit differences**.
+3. **A determinism-only gate is insufficient; you need bit-identity against the control as well.** That
+   multi-edge failure had **zero** non-determinism -- it was deterministically wrong. An earlier bad arm on
+   the same kernel was caught *only* by non-determinism. **Both gates are necessary.**
+
+### And a measurement-integrity trap
+
+**A stale `cann_bench` installed in the venv silently wins the import.** With `PYTHONPATH=site_$arm:...`,
+a missing arm wheel resolved to `/home/endrix/git/pto-kernels/.venv/.../cann_bench` and printed a
+plausible `_C.abi3.so` md5. **Assert that the resolved `cann_bench.__file__` starts with that arm's own
+site dir**, every arm, every run -- not just that an md5 exists. Also: **compile contention depresses a
+timed pass** (one pass overlapping a build read 58.89 against 59.05/59.06 clean), so keep the host quiet
+during timing.
