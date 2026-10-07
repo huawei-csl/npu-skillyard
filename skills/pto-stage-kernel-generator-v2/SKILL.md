@@ -6550,3 +6550,57 @@ every count falls to its dataclass default). The SAME signature was traced on tw
 to two unrelated causes: a reference that suppresses NaN IEEE arithmetic produces (**unwinnable**), and
 this barrier bug (**fixable**). The signature identifies *which return fired*, never why. See **C41**
 for the MTE2 ordering version of the same class.
+
+### C127: `pipe_barrier(PIPE_ALL)` ON A Vec CHAIN IS A BUG UNTIL PROVEN OTHERWISE  🔴 **CRITICAL**
+
+**Default position: a `PIPE_ALL` separating two Vec ops is a defect report, not a synchronisation
+choice.** It drains *every* pipe — MTE1/2/3, M, V, S — to order two ops that live on one of them. And
+the barrier, not the arithmetic, is what a dependent Vec chain costs: **measured 20-25 cycles with a
+barrier and 0.0000 us/op without one**, with **2.0-2.4x** recovered by sharing one barrier across two
+independent chains instead of barriering after each.
+
+**Why it shows up, and why that is the real bug.** The usual justification is a measured bisection
+like this one, from a shipped kernel:
+
+```
+-O2 + PIPE_V   : WRONG (gate rel err ~1e0)      -O0 + PIPE_V   : EXACT
+-O1 + PIPE_V   : WRONG                          -O2 + PIPE_ALL : EXACT
+```
+
+That bisection is sound and its conclusion — "PIPE_V is not enough" — is **false**. The cause recorded
+alongside it: *two Tile OBJECTS `TASSIGN`ed to the same UB address (a `[2H,16]` tile and its `[H,16]`
+halves), so bisheng's tile dependence analysis sees no dependence between ops naming the different
+objects and reorders them.* **The aliasing is the defect. `PIPE_ALL` only hides it**, by being coarse
+enough to stop a reordering the compiler should never have been allowed to make. Give the tiles
+distinct addresses — **double-buffer where a ping-pong is genuinely needed** — and `PIPE_V` becomes
+correct at every one of those sites. See **C121**: a UB map's "disjoint" comment is a TIMING claim, and
+this is what it costs when the claim is used to justify overlap.
+
+**Legitimate `PIPE_ALL`, i.e. the special occasions.** Cross-engine seams where Cube and Vec
+synchronise; ordering against **`PIPE_S`** (**C119** — `TCI` is a scalar loop and `pipe_barrier(PIPE_V)`
+does not order it); after a raw-intrinsic swap that transferred barrier ownership to you (**C52**); and
+`PIPE_MTE2`/`MTE3` edges that `PIPE_V` cannot express (**C41**). Each of those needs the *narrowest*
+barrier that covers the edge, named in a comment. `PIPE_ALL` as a blanket is never one of them.
+
+**A text census UNDER-COUNTS, because the barrier is usually behind a macro.** Measured across 53
+operators: 705 literal `pipe_barrier(PIPE_ALL)` against 2163 `PIPE_V`, i.e. 24% — but one kernel
+defining `#define VBAR() pipe_barrier(PIPE_ALL)` showed **41 literal and 93 macro calls, so ~133
+against 2 PIPE_V (98.5%)**, and **25 of them sat inside one `tanh` helper called 4x per timestep** —
+about 100 full-pipeline barriers per step. That kernel has the **lowest HAP of all 53 (0.0958)** and a
+measured fixed 7.9 us/step with **61-83% of the clock in Vec dependent-op drain**. Always grep the
+macro definitions too:
+
+```bash
+grep -nE '#define +[A-Z_]+\(\) +pipe_barrier\(PIPE_[A-Z]+\)' kernel.cpp
+```
+
+**And price the barriers, not the ops.** A 6-op accuracy fix was modelled at **-0.054** score points
+from its arithmetic; what shipped was 6 ops **plus 6 `PIPE_ALL`** (x4 calls/step = +24 per step) and it
+measured **-0.087, 60% over**. When you add anything to a `VBAR`-separated chain, count the barriers
+you are adding — they are the cost.
+
+**Rule:** every `PIPE_ALL` carries a comment naming the cross-pipe edge it covers. If the comment would
+have to say "because the compiler reorders aliased tiles", fix the aliasing instead. Before converting
+a kernel, **measure what `PIPE_ALL` actually costs against `PIPE_V` on the target part** — if the two
+are comparable the conversion is correctness hygiene only, and that is worth knowing before you spend
+UB on de-aliasing.
