@@ -1118,6 +1118,56 @@ across 53 operators / 1060 cases the `[-100,100]` / `[-65504,65504]` extremes ba
 35 elementwise, normalisation and indexing operators and to **none** of the seven float level4
 FusedComposite operators, all of which cap at 1 or 2.
 
+### THE STRONGEST FLOOR IS THE REFERENCE'S **OWN STATEMENT ORDER**, EVALUATED IN THE CASE DTYPE
+
+An fp64-rounded floor answers "could any implementation pass". It does not answer the question that
+decides ownership: **is our rearrangement of the algebra worse than the reference's own?** Build a
+third arm -- `golden.py`'s statements, in its order, in the **case** dtype -- and score all three on
+the failing clause. Measured on `apply_adam_w`'s NaN-position gate, 3 value-range rows x 1,160
+attribute sets:
+
+| row | ours (folded) | staged | **reference's order, fp32** | **attributable to our fold** |
+|---|---:|---:|---:|---:|
+| `all_fmax` | 216 | 679 | **727** | **0** |
+| `m_inf_grad_huge` | 295 | 343 | **439** | **0** |
+| `all_ordinary` (negative control) | 0 | 0 | 0 | 0 |
+
+Read it as a **subset test, not a count comparison**: every attribute set where ours loses the gate
+is one where the reference's own fp32 evaluation loses it too (216 of 727, 295 of 439). That makes
+`attributable to our fold = 0` a *proof of non-ownership*, and it is far stronger than "we are also
+inaccurate here" -- our fold was in fact the **best of the three**, so clearing the case would mean
+beating fp32 itself, not fixing a defect.
+
+**The same table decides a config question for free.** The staged path would have fixed **0** of the
+511 and broken **511** -- confirming an earlier decision that had been taken on *total* comparator
+failures, a metric dominated by a different (precision) class. When you build the three arms, score
+them on the **failing clause only**, and you get the ownership verdict and the config verdict from
+one sweep.
+
+## STEP 2m -- BEFORE BLAMING THE KERNEL, SUSPECT YOUR OWN PROBE. TWO MEASURED SELF-BUGS.
+
+Both of these produced a confident, coherent, **wrong** story, and each was caught by a control
+rather than by review.
+
+**1. The comparator's message is on the per-output result, not on the result.**
+`CompareResult.error_msg` is **`None`**; the text you are dispatching on (`NaN位置不匹配` and
+friends) lives at **`CompareResult.output_results[i].error_msg`**. A classifier reading the outer
+field reported **0 NaN-position failures out of 10,624 trials** while 55 of them carried the
+`MERE = MARE = 0` early-return signature. **It was caught only because the positive control did not
+fire.** A zero from a new harness is a statement about the harness until a planted defect proves
+otherwise -- so plant one, every time, and treat a silent positive control as the finding.
+
+**2. A host-side model of a kernel's constant fold must reproduce the COMPILER, not Python.**
+Python and C disagree on non-finite arithmetic in the folds that matter: a model computing
+`ihat1 / s2` in Python returned `k1 = -inf` where the compiled `aw_consts()` returns `nan`. That one
+difference fabricated an entire defect class -- an apparently data-independent total failure across
+**24 attribute sets on every value-range row**, which was one step from being reported as a live
+bug. Falsified by compiling the exact fold with `g++` and printing the constants, then by a faithful
+IEEE model that showed the reference degenerates the same way.
+
+**The rule: when a model of device arithmetic disagrees with the device, compile the expression and
+read the constants before you believe the model.** Probe the mechanism, not the symptom.
+
 ## STEP 2j -- ENUMERATE HOST OPS BY WHAT **DISPATCHES**, NOT BY WHAT LOOKS LIKE A CALL
 
 The `561xxx` family is "the runner has no binary for this op". Three confirmed members:

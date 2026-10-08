@@ -240,6 +240,66 @@ per-case claim below ~10% on an unchanged path is reliable -- use the aggregate.
 process table reads EMPTY under concurrency**: test for the literal `No process in device` sentinel,
 never a process-line count, or a contended card reads as free.
 
+### `t_hw` IS A CLOSED-FORM FORMULA. RECOVER IT AND THE HAP CEILING FALLS OUT FOR FREE.
+
+`t_hw` is not a measurement. On a memory-bound elementwise operator it is
+**`touches * N * itemsize / assumed_bandwidth`**, with both constants fixed per platform -- and
+fitting it takes one pass over `tasks/metadata/<platform>.json` and `cases.csv`. Measured on
+`apply_adam_w`, all 20 cases, two platform files:
+
+| platform file | recovered formula | ratio to the fit | stdev |
+|---|---|---:|---:|
+| `910b2.json` | `4 * N * itemsize / 1920 GB/s` | **1.0000** | 0.00038 |
+| `950pr.json` | `4 * N * itemsize / 1600 GB/s` | **1.0000** | 0.00024 |
+
+Four significant figures on 20 of 20 cases is not a coincidence, it is the generator.
+
+**Why this is worth doing first: the touch count can be WRONG, and then `HAP = 1.0` is
+unreachable by construction.** `apply_adam_w` reads var/grad/m/v and writes one output --
+`proto.yaml` declares a single `Tensor y` and `golden.py` returns one tensor without mutating the
+moments -- so physics needs **5** touches while `t_hw` charges **4**. The floor is therefore
+
+```
+T_min / t_hw = (touches_real / BW_achievable) / (touches_charged / BW_assumed)
+```
+
+which at the **measured** 1730 GB/s (fp32) gives **1.387**, not the 1.25 you get by assuming peak.
+Substituting into HAP with `r = T_base / t_hw`:
+
+```
+HAP_max = (r - 1) / (r - 1 + 0.387)
+```
+
+On the large cases `r ~ 2.3`, so **`HAP_max ~ 0.77`** -- and the operator measures **0.719-0.771**.
+It is **at** its ceiling on exactly the cases that carry the score. On the small cases `r ~ 8` gives
+0.95, which is why a hidden set skewed small shows a *higher* `case_score_mean` (0.8469) without
+any of it being winnable.
+
+**So before briefing any performance work on a bandwidth-bound operator:** recover the formula,
+count the real touches against `proto.yaml` plus `golden.py`, divide by the **measured** achievable
+bandwidth rather than the datasheet, and compare `HAP_max` to the live `case_score_mean`. If they
+are equal you are done, and it cost no device time. This supersedes nothing in
+`roofline-baseline-can-exceed-the-hardware` -- it gives that observation an exact formula and a
+per-case ceiling.
+
+### AN ABLATION OF CODE BEHIND A DISABLED GUARD IS A NULL CHANGE. PROVE LIVENESS FIRST.
+
+Deleting a barrier is a rigorous upper bound on any correct replacement -- **but only if the
+barrier executes.** On `apply_adam_w` a census found 4 `pipe_barrier(PIPE_ALL)`, an agent reported
+2 of them as compiled out, and the truth was that **all four sit inside `#if PTO_NS == 1` while
+`CMakeLists.txt` passes `-DPTO_NS=2`**. The shipped binary executes **zero**. The "delete all four"
+arm therefore measured **1.002x** -- which is the instrument's noise floor, not a bound on barrier
+cost, because the two builds were the same program.
+
+**The arm looked like a clean negative and had no power at all.** Same family as a lever that is
+only reserving memory and a local A/B over a branch no visible case reaches: a null result is only
+informative once the treatment is known to reach the executing code.
+
+**The check, before pricing any deletion ablation:** resolve the enclosing `#if` chain for every
+site, grep the build files for the macro's actual value, and -- decisive -- confirm the two
+`.aicore_binary` sections **differ**. Identical sections mean you measured noise. A source-level
+grep is a census of *text*, and text is not a count of executed instructions.
+
 ---
 
 ## Phase 1 -- Control
