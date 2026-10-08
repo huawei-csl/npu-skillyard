@@ -104,20 +104,55 @@ What needs the pass-count check is the moment a credit is spent.
 
 ---
 
-Then, and only for an operator that can actually reach a full pass, compare `full_pass` against
-**the currently posted entry**. Two operators in this campaign failed that second test:
+### There are TWO boards, and the hidden one is the campaign's objective
 
-| operator | hidden | full-pass projection | posted entry | verdict |
-|---|---:|---:|---:|---|
-| `grouped_matmul_swiglu_quant` | 71.23 | ~73.9 | **77.17** | fix earns **zero** |
-| `resize_bilinear` | 73.58 | ~79.6 | **87.90** | fix earns **zero** |
+**This section exists because an earlier version of this file taught the wrong board, and the error
+survived three separate re-readings.** It priced every fix against the **per-operator** entry and
+printed `fix earns zero` for two operators, and that verdict was then repeated out loud at the user
+three times for `unique`, `resize_bilinear` and `nms` -- each time against a user who had already
+said, in their own words, that the hidden set is what we are losing on.
 
-Both are real defects worth fixing for correctness and for the paper. Neither is worth a credit or
-a device-hour against the board.
+| board | what it posts | does a hidden PARTIAL count? |
+|---|---|---|
+| **per-operator** | your best **fully-passing** run, standard or hidden | **No.** A partial posts nothing. |
+| **solution** | per-operator columns incl. a separate **hidden** column | **Yes.** The partial's score sits in that column. |
 
-State this projection explicitly before recommending any fix. "It fails 6 cases" is not a reason;
-"fixing 6 cases takes the pass count to 80/80 and moves the entry from X to Y" is -- **both halves**,
-pass count first.
+**The consequence, and it inverts the old rule:** a hidden score increase pays on the solution
+hidden column **even when the operator entry cannot move, and even when the run stays a partial**.
+`full_pass < posted operator entry` therefore does **not** mean "earns zero" -- it means *"earns
+nothing on the operator board"*, which is a statement about one of the two boards.
+
+Worked example, 2026-10-08, `nms`. Operator entry **77.3861 and already #1**; hidden 62.0414 at
+78/80 with a full-pass projection of **63.38**. The old rule prints `fix earns zero`. The truth is
+**+1.33 on the solution hidden column** for the two cases, and the hidden *performance* term --
+`case_score_mean` 0.2675 against 0.5477 on the same submission's standard run -- is worth up to
+**~+18 more** on that same column. The operator board being unmovable concealed the single largest
+prize on the operator.
+
+**So price every fix against the column it actually lands in:**
+
+```
+operator-board gain = (full_pass >= 80/80 reachable) ? max(0, full_pass - posted_operator_entry) : 0
+solution-hidden gain = new_hidden_score - current_hidden_score      # partials included
+```
+
+and report **both**, never just the first. If the user has named the hidden set as the objective,
+the second number is the one that answers them, and the first is a footnote. **Their stated
+objective is not yours to re-rank** -- if they say the hidden column is where the campaign is
+losing, do not answer with an operator-board argument for dropping the work.
+
+One carry-over from the old rule still holds, because it is about a different thing: on an **empty**
+operator slot a partial is actively harmful (it posts a low score with `correctness_passed: false`
+where you had none). That is an argument about *which* run to send, not about whether hidden work
+is worth doing.
+
+And when comparing against a solution entry, compare against **the best entry under our own
+submission tag** -- teammates post under the same tag, so another member's entry is the bar, not
+a rival's.
+
+State both projections explicitly before recommending any fix. "It fails 6 cases" is not a reason;
+"fixing 6 cases takes the pass count to 80/80, moves the operator entry from X to Y, and moves the
+solution hidden column from P to Q" is -- **all three**, pass count first.
 
 **Two calibrations, both measured -- do not substitute intuition for either.**
 
@@ -728,8 +763,9 @@ Two corollaries that are easy to miss:
 
 - `get_credits` first. Base 10/day, `bonus_cap` 30, resets 16:00Z, `max_active_jobs_per_user: 3`.
   **`bonus_earned` above the cap means bonus_balance 0 and no refunds** -- every credit is one-way.
-- Standard first. Spend a hidden credit only when the Phase 0 projection says a full pass would
-  **beat the posted entry**.
+- Standard first. Spend a hidden credit when the Phase 0 projection says a full pass would beat the
+  posted **operator** entry, **or** when the projected hidden score beats our current hidden score
+  -- the latter lands on the solution hidden column even as a partial (see "There are TWO boards").
 - **A NEVER-SENT OPERATOR STILL HAS TO CLEAR A QUALITY FLOOR. Compute its implied HAP first:**
 
   ```
