@@ -715,35 +715,44 @@ funded.
 This is the clause split of STEP 0b-2 applied to controls, and skipping it cost a wrong verdict
 reported with confidence.
 
-At a single lstm point, `w+/-0.1`, fp32 -- the **visible** value convention -- with every arm at the
-**same case_id in the same process** (see the next rule, which is why that qualification matters):
+Measured on a **paired population** -- 45 configs, `w+/-0.1` fp32 (the visible value convention),
+every arm computed in one process from one `build_inputs` call per config, so all three share inputs.
+Arms: ours, a manual per-timestep fp32 LSTM (`torch.matmul`, a legitimate in-family reimplementation
+differing from the golden in association), and the one-ulp reference floor.
 
-| arm | MERE (a mean) | MARE (a max) | verdict |
-|---|---:|---:|---|
-| ours | 2.81e-06 | **0.719** | **FAIL** |
-| in-family CPU fp32, manual per-timestep association | 1.62e-06 | **0.350** | **PASS** |
-| one-ulp reference floor | -- | 0.422 | **PASS** |
+| test | result | reading |
+|---|---|---|
+| sign test, **MARE** (ours worse / better) | **30 / 15, p = 0.036** | ours IS systematically worse |
+| ratio ours/manual on MARE | median **1.27x**, geomean 1.25x | and the effect size is small |
+| sign test, **MERE** | **39 / 45 worse** | ours is worse on the *other* clause too |
+| **McNemar on the VERDICT** | **5 vs 5, p = 1.000** | **no pass/fail difference at all** |
+| failures: ours / manual | **10 / 45 each** | a careful reimplementation fails exactly as often |
 
-Read on MERE, ours and the control are both ~1e-06 and the natural conclusion is "no defect, the
-gate is a lottery". Read on MARE -- **the clause that actually fails** -- ours is **2.1x a passing
-in-family control** and 1.7x the reference's own one-ulp floor, on identical inputs.
+**The two tests answer different questions and only the second prices work.** A statistically
+significant metric deficit (p = 0.036) produced **exactly zero** verdict advantage, because a 1.25x
+MARE excess is swamped by the per-point lottery -- MARE is a max over millions of elements. Closing
+that gap converts nothing: to convert a case you must beat the in-family arm, and the in-family arm
+fails 10 of 45 configs itself.
 
-**The diagnosis the pair suggests:** comparable mean error with a 2x worse max means our error is
-**CONCENTRATED** on a few cancellation positions where a legitimate reimplementation's is not. That
-is a difference in **operation order**, not a precision deficit -- so it is not fixed by a more
-accurate transcendental, and it is not excused as chaos, because an in-family arm and the
-reference's own floor both clear the gate at the same inputs.
+**So always run both:** a sign test on the failing metric to establish the effect exists, and
+**McNemar on the pass/fail verdict** to establish it is collectable. Report both. A fix funded on the
+first alone buys a better number and no points ([[hap-saturates-price-in-points]],
+[[newly-converted-cases-earn-little-hap]]).
 
-**But one point decides nothing, and this is the trap that makes the rule hard to apply.** MARE is a
-max over millions of elements, so it is a per-point coin flip in **both** directions: across five
-points measured this way, ours failed while both controls passed at two of them -- and the in-family
-control failed while ours passed at two others. **A claim of the form "ours is systematically worse
-on the failing clause" requires a PAIRED POPULATION and a sign test**, never a favourable point. The
-same discipline as any other paired measurement here: per-case non-overlap, not an aggregate.
+**Two hypotheses this population killed, both of which a single favourable point supported:**
 
-**So: state which clause fails, compare every control on that clause, and do it over a population.**
-A control that wins on the aggregate and loses on the failing clause is evidence of our defect -- if
-it loses repeatably.
+- *"Equal mean error with a worse max, so the error is CONCENTRATED at cancellation positions -- an
+  operation-order defect."* **False.** Ours is worse on **MERE in 39 of 45** as well as MARE in 30 of
+  45. It is a uniform ~1.25x accuracy deficit, not a concentration pattern. The single point that
+  suggested otherwise (MERE 2.81e-06 vs 1.62e-06, MARE 0.719 vs 0.350) is inside the spread.
+- *"Ours fails where a legitimate implementation passes, so the class is winnable."* **Not
+  supported.** Ours fails 5 configs the manual arm passes and passes 5 the manual arm fails -- a wash.
+  And only **3 of our 10 failures** sit at a point where the reference's own one-ulp floor passes.
+
+**The honest conclusion for such an operator:** when a careful in-family reimplementation fails the
+gate as often as your kernel does, on shared inputs over a population, the gate is not reachable by
+ordinary implementation quality at those shapes. Matching the reference *exactly* might still work,
+but that is a far stronger requirement than "write it correctly", and it must be priced as such.
 
 ### THE ONE-ULP FLOOR DEPENDS ON **WHICH INPUT** YOU PERTURB -- REPORT THE MAX
 
