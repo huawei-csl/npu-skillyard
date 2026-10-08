@@ -332,7 +332,7 @@ leaves compile at a full 20. Check the split first; it decides the value.
 
 | signature | class | action |
 |---|---|---|
-| our own rc message naming an axis and bound | **fitted contract** (C86) | Is the accepted max == the `cases.csv 实测` max? Then it is fitted. **Degrade, never reject**: keep the fast ladder, add a runtime-tiled general path beneath. The hidden set probes **outside `desc.md`**, including axes marked 固定. |
+| our own rc message naming an axis and bound | **fitted contract** (C86) | Is the accepted max == the `cases.csv 实测` max? Then it is fitted. **Degrade, never reject**: keep the fast ladder, add a runtime-tiled general path beneath. The hidden set probes **outside `desc.md`**, including axes marked 固定. **The named axis is a LOWER BOUND on the fitted axes -- see STEP 2d-2.** |
 | `aclnnInplaceZero ... 561103`, or `Op ZerosLike does not has any binary` | **remote image lacks the op** | A device-side zero-fill. Use `torch.empty` + `.copy_(torch.zeros(...))` from a **CPU** tensor. **Invisible locally** -- our image has the binary. Sweep the **live** path: a `TORCH_LIBRARY` registration makes a Python driver dead code. |
 | `no_npu_kernel_detected` | **C73** | A legal no-op must still LAUNCH. Zeroes the whole operator; one operator went 0 -> 86.16 on this. |
 | `Golden执行失败` at `op_runner.py:304` (vs ours at `:395`) | **NOT OURS, BUT IT STILL BILLS COMPILE** | The golden crashed and our kernel was never invoked -- the golden runs FIRST (`evaluator.py:318`, returns at `:321`). **But `evaluator.py:332` sets `failure_type = FAILURE_TYPE_COMPILE_RUNTIME_ERROR`**, so the case costs compile AND function AND performance just like one of ours. It is **unwinnable, not free**: price it as a permanent `cf` and exclude it from any recoverable count. Worked example: a hidden `projSize >= hiddenSize` lstm case, because `torch.nn.LSTM` itself raises at `proj_size >= hidden_size`. |
@@ -568,6 +568,47 @@ own `pip --target` on `PYTHONPATH` first. A first attempt this way scored an unr
 reported `LSTM`, 0.00, in five seconds. If a score arrives implausibly fast or names the wrong
 operator, this is why.
 
+### STEP 2c-2 -- "UNWINNABLE" NEEDS A **PREDICTOR SWEEP**, AND COUNT THE DEGREES OF FREEDOM FIRST
+
+Two cheap moves, in this order, before any search for a bug.
+
+**1. Count the degrees of freedom.** They often collapse the question to one line of reasoning.
+`unique_34` reported **1 of 10291 elements byte-unequal** in a `y` that is sorted, distinct, and drawn
+straight from `x`. Every position is therefore pinned *by value*, so the only freedom left is a pair of
+**distinct bit patterns with equal value** -- at fp16 on a range with no NaN, that is exactly `+-0.0`.
+The diagnosis is *forced*, not guessed, and it replaced a search. (The sibling case looked like the
+same class and was not: `unique_61`'s range is NaN, `NaN != NaN` gives every NaN its own `y` entry, so
+`y` was bit-exact and only `inverse` failed. A 36-config battery across 18 value ranges passed
+everything; the cause came out of arithmetic -- `nNaN = 8105`, `mismatch = 8105-1`,
+`max_diff = 12877-4773` -- matching the report to the digit. **Two failures with one signature can
+have two causes.**)
+
+**2. Then sweep PREDICTORS, do not just observe.** "The golden picked the other one" is an
+observation. Unwinnability is the claim that **no rule derivable from the inputs predicts the golden**,
+and that needs candidates scored on a population:
+
+| predictor for the `+-0.0` representative | agreement with the golden, n=203 |
+|---|---:|
+| the sign ATen's own sort places first among the zeros (**oracle**) | **203/203 = 100%** |
+| `always_pos` (what we ship) | 54.7% |
+| `last_in_flat_order` | 50.7% |
+| `first_in_flat_order` == `stable_sort_first` | 46.8% |
+| `majority_sign` | 39.9% |
+
+Best non-oracle rule: 54.7% against a 50% coin. **That** retires the class -- and `stable_sort_first`
+at 46.8% is the direct proof the answer is not a function of flat order at all.
+
+**The oracle row is what makes it a proof rather than a shrug.** A predictor that agrees 100% *and is
+only computable by running the reference's own internals* (here `torch.unique`'s **unstable** pdqsort
+partition) demonstrates the quantity is an **implementation artifact, not a specification**. Without
+it you cannot distinguish "unspecifiable" from "we have not found the rule".
+
+**Record the permanently-unwinnable classes so they are never re-investigated.** For any
+sorted-`unique` / `sort` reimplementation whose golden is `torch.unique`, two are now proven:
+**(a)** the `+-0.0` representative, and **(b)** **NaN with `return_inverse`** -- `y` is reproducible,
+but the NaN block's `inverse` indices are the unstable sort's permutation. Any operator whose golden
+sorts values that compare equal while being distinct inherits both.
+
 ### STEP 2d -- WIDENING A DECLARED SURFACE CREATES NEW PRECISION EXPOSURE
 
 **A shape fix and an accuracy fix are not independent.** Opening a cap makes larger shapes *reachable*,
@@ -603,6 +644,89 @@ needed 98304 B -- **196608 against a 188416 UB**. No widening exists. Blocking t
 exact because the gate algebra is elementwise in that index, and it had to be **in-kernel**: the
 contraction spans all of `H` and the state is produced by the same recurrence, so no cross-launch
 decomposition exists.
+
+### STEP 2d-2 -- A FITTED CONTRACT COMES IN **PAIRS**, AND ORDERED GUARDS MASK EACH OTHER
+
+**A rejection message names only the FIRST guard that fired.** So the axis it reports is a *lower
+bound* on the set of fitted axes, never the full set. Fixing only the named axis converts the
+**message**, not the case: the same case comes back billed identically, with a different string.
+
+Worked example, `moe_gating_top_k_softmax` (`job_835e2ad9ca05`, 73/80). All 7 failures were
+`compile_runtime_error` -- `TORCH_CHECK` rejections in the op_plugin, before anything reached the
+device -- and every message named **`E`** (6 at `E=2048`, 1 at `E=2003`). The declared-vs-exercised
+audit found the fit in **two** axes:
+
+| axis | declared (`desc.md` 支持范围) | exercised (`cases.csv` 实测) | accepted |
+|---|---|---|---|
+| `E` | 1..2048 | 4..1024 | **1..1024** |
+| `k` | 1..1024 (`k<=E`) | 1..128 | **1..min(E,128)** |
+
+`KCMAX = (EP<128)?EP:128` -- **128 being the largest `k` any visible case uses.** The wrapper checked
+`E` before `k`, so `k` was invisible in every message. The visible cases follow a `k ~ E/8` ladder
+(16->2, 32->4, ... 1024->128), so the hidden `E=2048` cases most likely carry `k=256`: **widening `E`
+alone would have converted nothing.** Measured on the shipped wheel, all inside the declared surface:
+`E=1024,k=256`, `E=512,k=512` and `E=256,k=256` each rejected with
+`k exceeds the kernel's extraction staging (KCMAX=128)`.
+
+**The procedure, and it is free:**
+
+1. Put the **whole** 支持范围 table beside the 实测 column -- every row, not the row the message named.
+2. For each axis, find the constant in our source that bounds it and classify it (tile ladder vs
+   rejection gate, per C76).
+3. **Order the guards and read them as a chain**: guard `i` hides every fit in guards `i+1..n`. Probe
+   each axis *independently, at an otherwise-accepted baseline*, so no earlier guard can mask it.
+4. Only then price the fix. A one-axis projection on a two-axis fit is worth zero.
+
+**The generalisation:** the same masking applies to any ordered validation chain -- shape before
+dtype, rank before layout, a `TORCH_CHECK` cascade, or our own `rc` ladder. **Never infer the size of
+a fitted surface from a failure message.** Infer it from the declared table.
+
+### STEP 2d-3 -- A HOST-SIDE ADMISSION GATE IS A **COST MODEL**. FIT IT ON A LADDER, AND BIAS IT STRICT.
+
+Some of our drivers refuse work they *can* compute, to stay inside the runner's per-case timeout.
+That refusal is not a hardware limit -- it is a **cost model we invented**, it bills exactly like a
+real defect (`compile_runtime_error`: compile AND function AND performance), and it is the easiest
+place in the tree to be confidently wrong in **both** directions.
+
+`unique` shipped three different budgets for the same code:
+
+| revision | budget | derived from | consequence |
+|---|---:|---|---|
+| R2 (the failing job) | 250 ms | "the timeout is 300 s per **operator**" | refused 3 cases that compute the **exact** answer |
+| R4 (uncommitted, nearly resent) | 8000 ms | `len(cases)*300` in `process_pool.py:690` | **admits** a case measured at 46.8 s/case -- it would be **KILLED** |
+| R5 (shipped) | 2600 ms | a 50-point measured ladder | 2 of 3 recovered, the third refused on a stated bound |
+
+**R2 and R4 were both derived from a timeout figure rather than from measurement, and `len(cases)*300`
+is the LOCAL default** -- the remote runner declares `case_timeout_sec: 40` in the job payload. So the
+"fix" would have traded 3 loud refusals for a silent kill.
+
+**Three requirements before a refusal threshold is believable:**
+
+1. **The authoritative timeout, read from the job's own payload** (`case_timeout_sec`), never from a
+   local harness default and never from the per-operator figure.
+2. **A measured per-branch cost model.** Branches differ enormously -- `unique`'s `return_inverse=True`
+   path costs up to 3.9x its `False` path at the same shape.
+3. **A stated over-estimate factor**, so *admission implies a real bound* rather than a hope.
+
+**Fit it on a LADDER, and the ladder must include the smallest legal size.** A 7-point fit (2 small,
+1 mid, 4 large) hid two defects a 50-point ladder exposed:
+
+- **The cost curve is U-shaped, not monotone.** `block_dim = min(vec_cores, ceil(n/tile))` collapses to
+  **one core** once `numel <= tile`, so per-unit cost at `numel=2048` is **1.7x its minimum**. An
+  intercept taken from the smallest point you *happened* to measure is too low.
+- **A `max(floor, a + c*n)` shape under-estimates wherever the floor is still winning but the real cost
+  has already started climbing** -- here the whole 131k-524k band.
+
+**The shape that dominates everywhere: a plain line whose intercept is the WORST RESIDUAL over the full
+ladder.** Then verify no ladder point is under-estimated; one under-estimate is an admitted kill.
+
+**Bias strict.** An over-strict gate loses the cases it refuses, loudly, and you can see them in the
+split. An over-permissive gate loses them to a **timeout kill**, which bills the same and tells you
+nothing. When the penalty for being wrong is asymmetric, so is the threshold.
+
+**This generalises to every cost model the pipeline writes** -- tile-size heuristics, a
+chunk-count estimator, a `block_dim` chooser: endpoints are not a fit, and the smallest legal size is
+where the per-unit cost is worst.
 
 ## STEP 2f-LENIENT -- `compare_tensors(threshold=...)` IS INERT, AND THIS ONE BLESSES A WRONG KERNEL
 

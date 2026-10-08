@@ -638,3 +638,119 @@ Each phase transition uses TPUSH/TPOP/TFREE with distinct FlagIDs.
 | Sync | `set_flag`, `wait_flag`, `pipe_barrier`, `TSYNC` | Intra-core (all pipes) | Any |
 | Cross-core | `set_cross_core_flag`, `wait_flag_dev` | AIC ↔ AIV (SSBuffer) | AIC/AIV |
 | Inter-core FIFO | `TPUSH`, `TPOP`, `TFREE` | L0C↔UB, UB↔L1 (FIFO) | AIC/AIV |
+
+---
+
+## A5-§Measured: MEASURED on CANN 9.1.0 + pto-isa `109c9f72` (2026-10-08)
+
+Everything in this section came from compiling probes on the host, not from reading
+documentation. Where it contradicts the sections above, this section wins.
+
+### On-chip buffer budgets, as the library itself reports them
+
+Printed by `#pragma message` with the `PTO_*_SIZE_BYTES` macros expanded, per arch flag:
+
+| buffer | macro | A2/A3 (`dav-c220`) | A5 (`dav-c310`) |
+|---|---|---|---|
+| UB | `PTO_UBUF_SIZE_BYTES` | 192 KB | **256 KB** |
+| L1 (CBUF) | `PTO_CBUF_SIZE_BYTES` | 512 KB | 512 KB (unchanged) |
+| L0A | `PTO_L0A_SIZE_BYTES` | 64 KB | 64 KB |
+| L0B | `PTO_L0B_SIZE_BYTES` | 64 KB | 64 KB |
+| L0C | `PTO_L0C_SIZE_BYTES` | 128 KB | **256 KB** |
+| BIAS | `PTO_BIAS_SIZE_BYTES` | 1 KB | **4 KB** |
+| FBUF | `PTO_FBUF_SIZE_BYTES` | 2 KB | **4 KB** |
+| ScaleLeft / ScaleRight | `PTO_SCALELEFT_SIZE_BYTES` | **0** | **4 KB each** |
+
+Prefer the macro to a literal in a `static_assert` — `static_assert(X <= PTO_UBUF_SIZE_BYTES)`
+is arch-correct for free, where a hardcoded `196608` silently wastes a third of A5's UB.
+ScaleLeft/ScaleRight do not exist on A2/A3 at all, which is why `TEXTRACT`'s new
+`ScaleLeft`/`ScaleRight` source layouts are A5-only.
+
+### Corrections to A5-§A5InterCore
+
+- **`__DAV_CUBE__` / `__DAV_VEC__` is the right branching macro** (that section already says
+  so, correctly) — but note that `__DAV_C310_CUBE__` / `__DAV_C310_VEC__` / `__DAV_C310__`
+  also exist, so a `C220` -> `C310` search-and-replace "fix" is a trap. See **C128 addendum**.
+- **Use `#if defined(...)`, not `if constexpr (DAV_VEC)`.** The `constexpr bool DAV_CUBE/DAV_VEC`
+  idiom shown in that section compiles the *other* core's Tile types in this core's pass, and
+  those tiles live in address spaces this core cannot name. Preprocessor guards only.
+- **`TFREE(Pipe&)` really is a no-op for the TileData flow** — confirmed by running the C2V
+  seam with and without it; both correct. It is required for the `GlobalData` flow.
+- **`SYNCALL<Mix>` is NOT needed when the seam is a TPipe.** Measured on A2/A3: the pipe arm is
+  exact with no `SYNCALL` anywhere (30/30 repeats), and adding one after `TPUSH`/`TFREE` is
+  harmless but buys nothing. The control: deleting `SYNCALL` from the *GM*-seam arm makes it
+  return wrong data, so the sync is load-bearing there. Not re-verified on A5.
+- **`MAX_SYC_ID` is still unlocated.** It is not in `pto-isa/include`, nor in the CANN 9.1.0
+  `include/` or `compiler/` trees under that name. The "8 FlagIDs (0-7)" figure in
+  A5-§A5InterCore is **unverified**; treat it as a guess and keep `FlagID` small. The
+  `FlagID + 3` budget for `DIR_BOTH` has never been exercised.
+- **The direct vs GM distinction is the whole point of the API on A5, and does not exist on
+  A2/A3.** See **C131**.
+
+### CPU_SIM cannot model a Mix kernel's core structure
+
+- Under `__CPU_SIM` **neither `__DAV_VEC__` nor `__DAV_CUBE__` is defined**, and
+  `pto::cpu_sim::ExecutionContext` carries only `block_idx` / `subblock_id` / `subblock_dim` —
+  there is **no Cube-vs-Vec selector anywhere in `pto/cpu/`**. A Mix kernel written with core
+  guards compiles to nothing under CPU_SIM, exactly as it does on A5.
+- To run one, factor the kernel into two separately-callable halves (`*_cube_half`,
+  `*_vec_half`), compiled under `#if IS_CUBE_PASS || defined(__CPU_SIM)`, and have the host
+  harness run them on two `std::thread`s. The pto CPU `TPipe` connects them through a
+  process-wide `SharedState` keyed by pipe type, so both threads must instantiate the *same*
+  `TPipe` type.
+- **CPU_SIM needs `-std=gnu++20`**: `pto/cpu/trace.hpp` uses `std::remove_cvref_t`, so the
+  project's `gnu++17` fails with `'remove_cvref_t' is not a member of 'std'`. Device builds
+  stay on `gnu++17`.
+- **What a CPU_SIM pass does not prove:** guards (above), intra-core pipe ordering (it has no
+  MTE/M/FIX pipes, so it passes a kernel that is missing every barrier — see **C133**), the
+  `SyncPeriod` credit cadence, and which of the two seam mechanisms the real hardware uses.
+
+### The A5 simulator does not run on this host
+
+`msprof op simulator --soc-version=Ascend950PR_9571` selects the simulator correctly and then
+dies before any kernel is loaded:
+
+```
+aclInit -> error code 507000
+E19999: Call rtRegTaskFailCallbackByModule("GeErrorTracking", ...) fail, ret: 0x7BC78
+        Assert ((RegErrorTrackingCallBack()) == ge::SUCCESS) failed  [ge_executor.cc:322]
+```
+
+The A5 camodel does not implement `rtRegTaskFailCallbackByModule`, which GE's executor asserts
+on during init. It fails identically with a torch-free ACL driver and with a `torch_npu`
+harness, so it is not the harness. The `Ascend910B1` camodel, by contrast, initialises and
+simulates. **There is currently no way to execute an A5 kernel in this project.**
+
+Two practical notes for whoever retries:
+
+- **Do not put the app behind a wrapper script.** `msprof` sets `LD_PRELOAD=libruntime_camodel.so`
+  for the child; a wrapper that re-`source`s `set_env.sh` rewrites `LD_LIBRARY_PATH` and the
+  preload fails with "cannot be preloaded". Pass the interpreter/binary directly:
+  `msprof op simulator ... <python> validate.py kernel.so`.
+- **`--launch-count=1` captures the FIRST kernel launched, which is usually not yours.** On the
+  A2/A3 control the captured kernel was `Fill_...` — torch's own `full()` from the harness's
+  poison-fill. Pass **`--kernel-name=launch_<stage>`** and the output directory becomes
+  `.../device0/launch_<stage>_mix_aic/`, confirmed. Without it the run costs ~15 minutes of
+  cycle-accurate simulation of a memset, and the only way to notice is that the output directory
+  is named after somebody else's kernel. **Always check the captured directory name before
+  reading any number out of a simulator run.**
+
+### The simulator is the project's only instruction trace
+
+Worth knowing, because it was assumed unavailable: there is **no disassembler** for the device
+binary (the nested object in `__aicore_rel_binary` is `elf64-hiipu`, machine `0x1029`; the
+toolchain's own `llvm-objdump` names the symbols but prints `<not available>` for every
+instruction), and **`-S` is rejected on the device side** (`unsupported option '-S' on device
+side` — the `.s` it writes is host-only). So static inspection cannot give an instruction trace.
+
+The simulator can. Each run writes, per core,
+`.../simulator/core0.veccore0/core0.veccore0_instr_exe_*.csv` with columns:
+
+```
+instr,addr,pipe,call_count,cycles,running_time(us),detail
+```
+
+`pipe` is one of `SCALAR`, `VECTOR`, `MTE2`, `MTE3`, `FLOWCTRL`, `ALL`, so the CSV answers
+"did this kernel touch GM on this pipe" directly, and `cycles` is per instruction. This is the
+right tool for any claim about where data actually moved. It is only available for simulator
+targets that initialise, which currently excludes the whole A5 family on this host.

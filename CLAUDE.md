@@ -195,7 +195,19 @@ gaps.
 - **ASCII-only** source and comments (bisheng rejects em-dashes, arrows, unicode).
 - GM access only through MTE (`TLOAD`/`TSTORE`) — never scalar-index a `__gm__` pointer.
 - UB budget: 192 KB (A2/A3) / 256 KB (A5); `static_assert` static UB layouts.
-- Vec intrinsics under `#if defined(__DAV_C220_VEC__)`, Cube under `__DAV_C220_CUBE__`.
+- Vec intrinsics under `#if defined(__DAV_VEC__)`, Cube under `__DAV_CUBE__` -- the
+  **arch-neutral** pair. `__DAV_C220_VEC__`/`__DAV_C220_CUBE__` come from the arch flag and are
+  undefined at `--cce-aicore-arch=dav-c310` (A5), where a kernel guarded on them compiles to a
+  device `.text` byte-identical to an empty kernel, with zero diagnostics (rule C128). Do not
+  substitute the `__DAV_C310_*` pair either -- it exists, but breaks A2/A3 the same way.
+- Write `pto::Shape<...>` and `pto::Stride<...>` **fully qualified**: at A5 the compiler injects a
+  global `enum class Stride` (and `Mode`), so an unqualified `Stride<...>` after
+  `using namespace pto;` is ambiguous and does not compile (rule C129).
+- `call_kernel` goes **outside** any `__CCE_AICORE__`/`__CPU_SIM` guard -- the CCE host pass defines
+  neither, so a guarded one is absent from the `.so` (rule C132).
+- Order a core's own pipes with `set_flag`/`wait_flag` or `pipe_barrier`. The PTO `WaitEvents`
+  parameter does not compile: instructions return an empty `RecordEvent` with no `Wait()` member
+  (rule C133). Skipping the barriers yields an all-zeros output that mimics a dead guard.
 - Cross-core Cube↔Vec handshakes need *both* AIV sub-blocks (don't `if (vid != 0) return;`
   before a handshake); signal READY from the committing store pipe. Prefer stream-serialized
   split launches for stateless single contractions.

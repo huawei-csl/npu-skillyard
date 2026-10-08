@@ -6708,3 +6708,349 @@ A5-incompatible in a way no compile step reports.
 
 So an A5 port is **not** a mechanical retarget: see `A5-§A5InterCore` for the seam API change and
 `COOK-§6.6` for the measured state of `TPUSH`/`TPOP`.
+
+#### C128 addendum — the macro table above is INCOMPLETE, and the trap is ORDERED
+
+Re-probed on CANN 9.1.0 with a real two-pass CCE compile (not `-dM -E`, which reports both
+device passes at once and so cannot show that the guards are mutually exclusive):
+
+```
+dav-c220  VEC pass : __DAV_C220_VEC__  __DAV_VEC__   __CCE_AICORE__
+dav-c220  CUBE pass: __DAV_C220_CUBE__ __DAV_CUBE__  __CCE_AICORE__
+dav-c310  VEC pass : __DAV_C310_VEC__  __DAV_VEC__   __DAV_C310__  __CCE_AICORE__
+dav-c310  CUBE pass: __DAV_C310_CUBE__ __DAV_CUBE__  __DAV_C310__  __CCE_AICORE__
+```
+
+**`__DAV_C310_VEC__`, `__DAV_C310_CUBE__` and `__DAV_C310__` DO exist.** C128 above (and the
+`[[a5-arch-guards-and-cross-core-tpush]]` note) says only the arch-agnostic pair survives at
+`dav-c310`; that is wrong. It matters because the obvious "fix" — swap `C220` for `C310` — empties
+the kernel on A2/A3 instead, moving the bug rather than removing it. **Only `__DAV_VEC__` /
+`__DAV_CUBE__` are live on both**, which is also what pto-isa itself uses: 59 uses of `__DAV_CUBE__`
+and 56 of `__DAV_VEC__` against exactly 1 of `__DAV_C220_CUBE__` across the whole library.
+
+The compiler selects the pass with `-target-cpu <arch>-cube` / `-target-cpu <arch>-vec` (visible in
+`bisheng -v`; `-###` is rejected). There is also a third, host pass at `-target-cpu generic` which
+defines **neither** `__CCE_AICORE__` nor `__CPU_SIM` — see **C132**.
+
+**The empty-kernel claim, now proven at the object level** on a real Mix kernel. Extract the device
+code with `objcopy -O binary --only-section=__aicore_rel_binary`, then the inner `.text` with the
+toolchain's own `llvm-objcopy` (the nested object is `elf64-hiipu`, which system binutils cannot
+read):
+
+| build | device binary | device `.text` |
+|---|---|---|
+| `dav-c220`, `__DAV_C220_*` guards | 3121 B | — |
+| `dav-c220`, `__DAV_*` guards | 3121 B (identical) | — |
+| `dav-c310`, `__DAV_*` guards | 4881 B | 1064 B |
+| `dav-c310`, `__DAV_C220_*` guards | 3401 B | **176 B** |
+| `dav-c310`, hand-written empty kernel | 3401 B | **176 B** |
+
+The legacy-guard A5 build is **byte-identical to an empty kernel**. The neutral guards are a free
+drop-in on A2/A3: same byte count, and a validated kernel still passes 30/30 on real hardware.
+
+**The three A5 defects are ordered — each is invisible until the one before it is fixed.** Porting a
+real kernel from `dav-c220` to `dav-c310` one fix at a time, A5 build only:
+
+| step | fix applied | errors at `dav-c310` | device binary |
+|---|---|---|---|
+| 0 | none (as the generator emits today) | **0** | 3393 B (**empty**) |
+| 1 | arch-neutral guards | 5 (`Stride` ambiguous — **C129**) | build fails |
+| 2 | + qualify `pto::Stride` / `pto::Shape` | 2 (`Invalid Fractal` — **C130**) | build fails |
+| 3 | + per-arch L0A `BLayout` | **0** | 5729 B (real body) |
+
+So "it compiles clean for A5" is strongest evidence of the bug at step 0 and only becomes evidence
+of correctness at step 3. Never read a clean A5 compile as a successful port without checking the
+device `.text` size against an empty kernel.
+
+---
+
+### C129: AFTER `using namespace pto;`, AN UNQUALIFIED `Stride<...>` DOES NOT COMPILE ON A5. QUALIFY `pto::Stride` AND `pto::Shape` ALWAYS.  🔴 **CRITICAL**
+
+For `__NPU_ARCH__ == 3510`, `__clang_cce_runtime_wrapper.h` includes
+`__clang_cce_vector_intrinsics.h`, which declares **`enum class Stride`** and **`enum class Mode`**
+at global scope. That header is *not* included at `__NPU_ARCH__ == 2201`. So on A5:
+
+```
+error: reference to 'Stride' is ambiguous
+  note: candidate found by name lookup is 'Stride'       (__clang_cce_vector_intrinsics.h:114)
+  note: candidate found by name lookup is 'pto::Stride'  (pto/common/pto_tile.hpp:139)
+```
+
+**This hits every kernel we generate**, because every `TLOAD`/`TSTORE` declares a
+`Stride<1,1,1,N,1>`, and the example in `EX-§` writes it unqualified. `Mode` collides too, which
+reaches the `SYNCALL<Mode, ...>` overloads.
+
+**Rule: write `pto::Shape<...>` and `pto::Stride<...>` fully qualified in every kernel, on every
+arch.** It is free on A2/A3 and mandatory on A5. Do not "fix" this by dropping
+`using namespace pto;` — that breaks every other PTO name.
+
+---
+
+### C130: THE L0A (`TileType::Left`) BLOCK LAYOUT IS INVERTED ON A5. IT IS THE ONLY CUBE TILE THAT CHANGES.  🔴 **CRITICAL**
+
+Measured by sweeping 16 operand-layout combinations through `TEXTRACT` and `TMATMUL` at each arch:
+
+| tile | A2/A3 (`dav-c220`) | A5 (`dav-c310`) |
+|---|---|---|
+| `Left` (L0A) | `BLayout::RowMajor`, `SLayout::RowMajor` | **`BLayout::ColMajor`**, `SLayout::RowMajor` |
+| `Right` (L0B) | `BLayout::RowMajor`, `SLayout::ColMajor` | unchanged |
+| `Acc` (L0C) | `BLayout::ColMajor`, `SLayout::RowMajor` | unchanged (`SFractalSize` 512 and 1024 both accepted) |
+| L1 staging (NZ) | `BLayout::ColMajor`, `SLayout::RowMajor` | unchanged |
+
+Getting it wrong gives `TExtract: DstTile Invalid Fractal` or `Non-conforming matrix fractal.`
+Both are compile-time static asserts, so this one is loud — but it is hidden behind C128 until the
+guards are fixed. Write it as a per-arch constant, never a hardcoded layout:
+
+```cpp
+#if defined(PTO_NPU_ARCH_A5)
+static constexpr BLayout LEFT_B = BLayout::ColMajor;
+#else
+static constexpr BLayout LEFT_B = BLayout::RowMajor;
+#endif
+using LeftA = Tile<TileType::Left, half, M, K, LEFT_B, M, K, SLayout::RowMajor, 512, PadValue::Zero>;
+```
+
+`TEXTRACT`'s source rule is the same on both arches: the L1 tile must be NZ
+(`SFractal == RowMajor && !isRowMajor`) or ZN (`SFractal == ColMajor && isRowMajor`). A plain **ND**
+`Mat` tile is rejected on both, and the `Rows == 1` escape clause in that assert does not rescue a
+1-row ND tile — the fractal-size asserts fire instead.
+
+---
+
+### C131: `TPUSH`/`TPOP` IS A **GM FIFO** ON A2/A3. THE DIRECT CORE-TO-CORE PATH IS A5-ONLY.  🔴 **CRITICAL**
+
+**Scope first — `TPUSH`/`TPOP` are overloaded across TWO unrelated pipe types, and this rule is
+about only one of them.** Check which one you are holding before applying either entry:
+
+| type | declared in | selected by | backends |
+|---|---|---|---|
+| **`TPipe<FlagID, DirType, SlotSize, SlotNum, ...>`** | `npu/<arch>/TPush.hpp` | `Direction::DIR_C2V` / `DIR_V2C` / `DIR_BOTH` (+ `_CTRL`, `_GM`) | a2a3 **and** a5 |
+| `GridPipe<TileT, SlotBytes, SlotCount>` | `common/grid_pipe.hpp`, impl. `npu/a2a3/GridTPush.hpp` / `GridTPop.hpp` | `GridDirection`, via the `is_grid_pipe_v` overload | **a2a3 only** — there is no `GridTPush.hpp` under `npu/a5/` |
+
+**This rule (C131) is about `TPipe`. `COOK-§6.6` is about `GridPipe`** — the cross-rank
+neighbour-SRAM ring with the slot-wrap fault, the discarded `TRY` failure signal and the mandatory
+`dsb(DSB_DDR)` publish fence. Do not transfer a conclusion from one to the other; they share only a
+spelling. In particular `GridPipe` has no A5 implementation at all, so a `GridPipe` seam is not a
+portability boundary across arches, whereas a `TPipe` seam is.
+
+For `TPipe`, the same source and the same `Direction::DIR_V2C` lower to two different mechanisms.
+Read from the library, not the docs:
+
+- **`pto/npu/a2a3/TPush.hpp` has only GM-flavoured transfer functions**: `pushAcc2GMFiFo`,
+  `pushVec2GMFiFo`, `pushVec2CtrlFiFo`, `popVecTileFromGMFiFo`, `popMatTileFromGMFiFo`. The producer
+  emits `TSTORE_IMPL` (UB -> GM) and the consumer emits `TLOAD_IMPL` (GM -> L1). A `DIR_V2C` seam on
+  A2/A3 is therefore **UB -> GM -> L1**, a full round trip. The strings `pushAcc2VecFiFo` and
+  `pushVec2MatFiFo` occur **0 times** in the A2/A3 backend and **10 times** in the A5 backend.
+- **A5 adds the direct paths.** `pushVec2MatFiFo` emits `TASSIGN_IMPL` + `TINSERT_IMPL` into a
+  `TileType::Mat` and emits **no** `TSTORE`; `TINSERT` Vec->Mat is documented as the UB -> L1 path
+  and lowers to `copy_ubuf_to_cbuf`. The consumer `popTileFromMatFiFo` is *only*
+  `TASSIGN_IMPL(tile, V2C_CONSUMER_BUF + slotOffset)` — it rebinds the Cube's tile to the L1 FIFO
+  slot and **copies nothing**.
+- The address spaces make it type-enforced: `TileType::Vec -> __ubuf__`,
+  `TileType::Mat -> __cbuf__` (L1), `TileType::Acc -> __cc__` (L0C). Neither can name GM.
+- **A `__gm__` slot pointer in the `TPipe` constructor is not evidence of a GM transit.** All three
+  backends take `TPipe(__gm__ void *GM_SLOT_BUFFER, uint32_t C2V_CONSUMER_BUF, uint32_t
+  V2C_CONSUMER_BUF)`; the GM buffer is what the `*GMFiFo` flavours use and is unused by the A5 tile
+  path.
+
+**So never claim a TPipe seam "avoids GM" on A2/A3.** It does not. What it buys there is correct
+synchronisation, not a shorter path.
+
+**The A5 direct V2C seam needs a producer tile that already has a Cube layout, which a Vec core
+cannot manufacture from an ND input.** Measured: Vec `TLOAD` supports ND->ND, DN->DN and NZ->NZ only
+(ND->NZ conversion is a **Mat**-load feature, i.e. it belongs to the Cube's GM->L1 path), so there is
+no way to get an NZ or ZN tile into UB from an ND GM tensor; and `TINSERT` Vec->Mat with **ND** tiles
+does compile on A5, but the resulting ND `Mat` tile cannot be `TEXTRACT`ed to L0A (C130). Therefore:
+
+> On A5, a direct V2C seam is reachable only as the **second** seam of a chain whose first seam is
+> C2V — Cube produces an `Acc`, Vec pops it (which gives UB a Cube-shaped tile), works on it, and
+> pushes it back as the next matmul's operand. That is the Flash-Attention pattern. A standalone
+> "Vec scales a GM tensor, then Cube multiplies it" stage **cannot** use the direct path; route it
+> through GM or restructure the stage.
+
+**What the A2/A3 validation actually covers.** The C2V `TPipe` seam was validated exact and 30/30 on
+real A2/A3 hardware with `SlotNum = 2` — but with exactly **one** `TPUSH`/`TPOP` pair per launch, so
+`tileIndex` never advanced past 0. **It says nothing about ring iteration.** A separate probe in this
+project found a `TPipe<0, DIR_C2V, 65536, depth>` C2V seam to be bit-accurate for a single tile and
+to **fault as soon as the ring is actually iterated** (`tileIndex > 0`, which brings the
+`shouldWaitFree` / free-notify path into play). Treat multi-tile `TPipe` traffic as unproven on both
+arches and exercise it explicitly before relying on it; a single-tile PASS is the exact shape of
+result that hides this.
+
+Status of the evidence: all of the above is compile-time and library-source. **No A5 kernel has ever
+been executed in this project** — the A5 camodel on this host cannot initialise
+(`aclInit` -> 507000, `rtRegTaskFailCallbackByModule` unimplemented, GE executor asserts), so there
+is no instruction trace and no profile. Treat the direct-path claim as well-founded but
+un-executed. The C2V seam *is* validated end to end on A2/A3 (exact, 30/30).
+
+---
+
+### C132: `call_kernel` MUST LIVE **OUTSIDE** THE DEVICE-ONLY GUARD, AND THE CCE LAUNCHER MUST BE EXCLUDED FROM CPU_SIM.  🔴 **CRITICAL**
+
+The CCE host pass (`-target-cpu generic`) defines **neither `__CCE_AICORE__` nor `__CPU_SIM`**. So a
+`call_kernel` placed inside `#if defined(__CCE_AICORE__) || defined(__CPU_SIM)` is compiled in no
+pass at all: the `.so` builds with rc=0 and the symbol is simply absent —
+`dlsym: undefined symbol: call_kernel` at validation time. Conversely `<<<...>>>` and `__global__`
+do not exist under g++, so the launcher must be guarded out of the CPU_SIM build. The shape that
+works in all three:
+
+```cpp
+#if defined(__CCE_AICORE__) || defined(__CPU_SIM)
+  // tile type aliases, address map, and the compute halves
+#endif
+
+#if !defined(__CPU_SIM)                 // CCE only: device passes AND the host pass
+extern "C" __global__ AICORE void launch_stage(__gm__ uint8_t *a, /* ... */) {
+#if defined(__CCE_AICORE__) || defined(__CPU_SIM)
+    stage_body(/* ... */);              // body exists only in the device passes
+#else
+    (void)a;                            // host pass: signature only
+#endif
+}
+extern "C" void call_kernel(uint32_t bd, void *stream, /* ... */) {
+    uint32_t ffts_len = 0; uint64_t ffts_addr = 0;
+    rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
+    launch_stage<<<(bd ? bd : 1), nullptr, stream>>>(/* ... */, ffts_addr);
+}
+#endif
+```
+
+---
+
+### C133: THE PTO `WaitEvents` PARAMETER IS NOT USABLE. INTRA-CORE ORDERING MUST BE RAW CCE BARRIERS.  🔴 **CRITICAL**
+
+Every PTO instruction advertises `template <..., typename... WaitEvents> RecordEvent OP(..., WaitEvents &...events)`,
+which reads like a dataflow API: capture the producer's `RecordEvent`, pass it to the consumer. **It
+does not compile.** `pto::RecordEvent` is `struct RecordEvent {};` — an empty struct — while
+`WaitAllEvents` does `(events.Wait(), ...)`. No type in pto-isa has a `Wait()` member at all:
+
+```
+error: no member named 'Wait' in 'pto::RecordEvent'   (pto/common/event.hpp:262)
+```
+
+So the returned value cannot be fed back in, and there is no event object to construct instead.
+**Order the Cube and Vec pipelines with `set_flag`/`wait_flag` or `pipe_barrier`, as `COOK-§8` and
+`EX-§` already show.** This is the same ownership point as C52: the barriers are yours.
+
+**The failure mode if you skip them is all zeros, which looks exactly like the C128 dead-guard
+trap.** Measured: a Mix kernel with `TLOAD` -> `TEXTRACT` -> `TMATMUL` and no barrier between them
+ran on real A2/A3 hardware, overwrote its poison-filled output (so the body clearly executed), and
+returned 0.0 for all 256 elements, because the Cube read L1/L0 before MTE2 had landed the tiles.
+Adding `pipe_barrier(PIPE_ALL)` at each stage boundary made it exact. **So an all-zeros output does
+not by itself diagnose a dead guard** — distinguish them with the poison fill: a dead guard leaves
+the poison value in place, a missing barrier overwrites it with zeros. (`pipe_barrier(PIPE_ALL)` is
+the blunt form and C127 applies; use the explicit flag chain in anything performance-relevant.)
+
+---
+
+### C134: A CLEAN COMPILE IS NOT A LEGALITY CHECK. HALF THE SCALAR OPS DO NOT ENFORCE THE LAYOUT RULE THE DOCS GIVE THEM.  🔴 **CRITICAL**
+
+pto-isa is heavily `static_assert`ed, which makes "it compiled" feel like a legality oracle. It is
+not, and the gap is not random. The ISA docs list **"Tile layout must be row-major
+(`TileData::isRowMajor`)"** as a constraint on the scalar arithmetic ops. Measured across 14 A5
+scalar and elementwise headers, exactly half actually assert it:
+
+| enforce `isRowMajor` | do **NOT** enforce it |
+|---|---|
+| `TAndS`, `TOrS`, `TAdd`, `TMul`, `TDiv`, `TMax`, `TMin` | `TAddS`, `TMulS`, `TMaxs`, `TMins`, `TDivS`, `TRemS`, `TFModS` |
+
+`npu/a5/TAndS.hpp` has
+`static_assert(TileDataDst::isRowMajor && TileDataSrc::isRowMajor, "Fix: TANDS only support row major layout.")`;
+`npu/a5/TMulS.hpp` asserts the dtype, `Loc == TileType::Vec` and the valid bounds, and **nothing
+about layout**. So `TMULS` on an NZ tile compiles clean on both arches, even though
+`isRowMajor = (BFractal == BLayout::RowMajor)` is false for NZ
+(`pto_tile.hpp:1444`) and the docs forbid it.
+
+**Rules:**
+
+- **Never justify a tile layout with "it compiles".** Check the documented constraint for the op
+  you are using, per `get_constraints`, and keep elementwise work on ND row-major tiles unless you
+  have a specific reason and a numeric check.
+- **When probing feasibility by compiling, say so.** A compile matrix answers "did an assert fire",
+  which is a *necessary* condition. Do not report it as "legal" or, worse, as "illegal" in the
+  other direction -- an op that fails to assert may still be rejected by a different one downstream,
+  and an op that asserts nothing may still be wrong at runtime.
+- **The asymmetry is the tell.** When two ops in the same family disagree about enforcing the same
+  documented constraint, trust the documentation and the stricter sibling, not the permissive one.
+
+---
+
+### C135: INDEX ARITHMETIC CARRIED THROUGH A **FLOAT** TILE NEEDS A `< 2^24` GUARD AND AN EXACT-INTEGER FALLBACK  🔴 **CRITICAL**
+
+Building index values (row ids, base offsets, ranks) in an fp32 tile is attractive -- the Vec
+engine's broadcast/iota/axpy forms are fast and already there. It is correct **only while every
+intermediate is below `2^24`**, where fp32 represents consecutive integers exactly. Past that it
+rounds, silently, and produces a *plausible* index rather than a wrong-looking one.
+
+Measured in the shipped `moe_gating_top_k_softmax` kernel: `row_idx` was built in fp32 from
+`k * T`, which reaches `1024 * 262144 = 2.7e8` at the operator's **declared** maxima -- **16x past
+the exact-integer limit.**
+
+Two further traps found in the same expression, both of which a dimension probe cannot see:
+
+- **An integer division assumed exact.** `G = W / K_i` with `W = max(8, k)` floors silently. Proven on
+  the shipped `.so`: `k = 3,5,6,7,12,100` gave a wrong `row_idx`; `k = 4,8` were right. Every `k` the
+  visible cases use is a power of two, so **the whole visible set agrees with the bug.**
+- **A burst length computed by truncating division** (`W*4/32`) drops the tail for any `W` that is not
+  a multiple of 8.
+
+The guard that has to be true before the float path may run:
+
+```c
+const bool rbFloatOk = (W % K_i == 0) && (R % G == 0) && (W % 8 == 0) &&
+                       ((int64_t)K_i * (int64_t)NR < (int64_t)(1 << 24));
+```
+
+**Rules:**
+
+- **Bound the PRODUCT, not the operands, and bound it at the DECLARED maxima** -- not at the largest
+  shape any visible case reaches. Use `int64_t` in the guard itself; computing the bound in the type
+  you are trying to validate is circular.
+- **Provide an exact int32 construction underneath** and fall back to it. A float index path is an
+  optimisation, never the only path.
+- **Never assume a division in an index expression is exact.** Assert `a % b == 0` or use a form that
+  does not divide.
+- Related: **C118** (`TSUBS` on an int32 tile rounds its scalar through fp32 above `2^24` -- the same
+  boundary arriving through a *library* path rather than one you wrote) and
+  **"powers of two cannot falsify a mantissa bug"**: a ladder of exactly-representable values is not a
+  test of this class.
+
+---
+
+### C136: NEVER RESTATE A KERNEL'S CAPABILITY IN A HEADER -- **EXPORT** IT AND QUERY IT. WIDEN WITH A NEW TEMPLATE PARAMETER, NOT BY MOVING A SHARED CONSTANT.  🟡
+
+When a kernel has a static instantiation ladder, the host wrapper must know what the ladder covers.
+The failure mode is to write that knowledge down **a second time** -- typically an inline helper in a
+header that describes the instantiation list. Now the capability lives in two places, and nothing ties
+either of them to the declared contract. **That duplication is itself the defect mechanism** behind a
+fitted contract (C76 / C86): the ladder grows, the helper does not, and the wrapper rejects a declared
+shape the kernel could actually serve.
+
+**Export accessors from the translation unit that owns the instantiations** and have the wrapper's
+`TORCH_CHECK` call them: `max_e()`, `fast_max_e()`, `max_k(E)`, `tile_for(E)`. One definition, queried,
+never restated. An accessor returning `0` for "no bound" is better than a large sentinel, because a
+sentinel is still a number someone will compare against.
+
+**And when you widen a cap, add a second template parameter instead of changing the shared constant.**
+`KCMAX` -> a template parameter `KMX` let the 18 pre-existing `(dtype, EP)` instantiations keep their
+old value and therefore a **byte-identical UB layout**, with 9 wide variants added alongside and
+selected only on the new path. The regression gate then asserts **bit-identical outputs** on the whole
+visible set -- a far stronger statement than "both still pass", and it localises any regression to the
+new instantiations by construction. (It also replaced a magic constant with a `constexpr` model of the
+merge tree, `static_assert`ed to reproduce the old value at the old cap: the assert *is* the proof the
+refactor was behaviour-preserving.)
+
+**Price it, because it is not free.** 33 launch symbols plus a general body took `.aicore_binary` from
+191,904 to 342,744 B (**1.79x**), and that reshuffle alone moved two *unchanged, bit-identical* visible
+cases by **+19%** and **-12%** -- an instruction-placement effect, net ~0. Expect a small, real,
+**placement-driven** timing change on code you did not touch, and do not misattribute it to the new
+path.
+
+**Rules:**
+
+- A capability bound is **exported and queried**, never restated.
+- A cap that gates a **rejection** must be traceable to the declared contract or to a named hardware
+  limit (C76).
+- Widen by **adding** an instantiation, not by **changing** one, so the old path stays bit-identical
+  and the regression gate can demand bit-identity.
+- Expect binary growth and placement noise; measure the old build beside the new in the same session.

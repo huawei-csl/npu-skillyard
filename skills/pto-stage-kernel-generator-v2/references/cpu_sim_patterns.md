@@ -32,7 +32,10 @@ Key flags:
   `__DAV_VEC__` / `__DAV_CUBE__` / `__CCE_AICORE__` survive. A kernel guarded on the C220 form
   compiles to an EMPTY kernel on A5 — cleanly, and it can pass against a zeroed buffer. See **C128**.
 - `--cce-aicore-arch=dav-c220` — target NPU architecture (A2/A3)
-- `-std=gnu++17` — C++17 with GNU extensions (NOT c++20)
+- `-std=gnu++17` — C++17 with GNU extensions for the DEVICE build (NOT c++20).
+  **The CPU_SIM build is the opposite: it requires `-std=gnu++20`**, because
+  `pto/cpu/trace.hpp` uses `std::remove_cvref_t`. At gnu++17 it fails with
+  `'remove_cvref_t' is not a member of 'std'`. Measured on pto-isa `109c9f72`.
 - `-DMEMORY_BASE` — required by PTO memory model
 - No `-D__CPU_SIM` — CCE provides its own device runtime, no GCC STL needed
 - No scalar math functions (expf, logf, etc.) — use PTO tile ops (TEXP, etc.)
@@ -58,11 +61,12 @@ The `<<<...>>>` syntax is a CCE compiler extension available in `-xcce` mode.
 
 ## Platform Guards
 
-Kernel compute bodies:
+Vector-only kernel bodies. Use the **arch-neutral** `__DAV_VEC__`, not `__DAV_C220_VEC__`,
+or the body vanishes at `dav-c310` — see **C128** and its addendum:
 ```cpp
 AICORE void stage_kernel(...) {
   set_ffts_base_addr(0);
-#if defined(__DAV_C220_VEC__) || defined(__CPU_SIM)
+#if defined(__DAV_VEC__) || defined(__CPU_SIM)
   auto vid = get_subblockid(); if (vid != 0) return;
   set_mask_norm(); set_vector_mask(-1, -1);
   // ... compute body
@@ -70,14 +74,26 @@ AICORE void stage_kernel(...) {
 }
 ```
 
-Launch functions:
+Launch functions. The CCE **host** pass defines neither `__CCE_AICORE__` nor `__CPU_SIM`,
+so `call_kernel` must sit OUTSIDE that guard or the `.so` exports no such symbol
+(`dlsym: undefined symbol: call_kernel`); and `<<<...>>>` does not exist under g++, so the
+whole launcher must be excluded from CPU_SIM. Full shape in **C132**:
 ```cpp
+#if !defined(__CPU_SIM)
 extern "C" __global__ AICORE void launch_my_kernel(...) {
 #if defined(__CCE_AICORE__) || defined(__CPU_SIM)
   stage_kernel(...);
+#else
+  (void)arg0;   // host pass: signature only
 #endif
 }
+extern "C" void call_kernel(...) { /* rtGetC2cCtrlAddr + <<<>>> */ }
+#endif
 ```
+
+A Mix (Cube+Vec) kernel needs more than this under CPU_SIM: there is no core-role macro
+there at all, so it must be split into two separately-callable halves run on two host
+threads. See `A5-§Measured`.
 
 ## C19: Reading Post-Vec-Op Values
 

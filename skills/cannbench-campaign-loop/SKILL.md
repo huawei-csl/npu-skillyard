@@ -420,6 +420,15 @@ for speed, put a general fallback beneath it so **no declared shape can reach a 
 - **C72 declared-surface probe** -- `tools/declared_surface_probe.py`. Varies the **dtype** axis
   against an accepted baseline case. Note its limit: it is blind to shape and attr, which is where
   C76's five failures all live. The two gates are complements, not alternatives.
+- **Check the `compare: false` outputs -- exactly BECAUSE no gate is watching them.** `proto.yaml` marks
+  some outputs uncompared, so the evaluator ignores them and they earn no function marks. That makes
+  them the one place in the tree where a wrong answer is **free forever**, and it is where the next real
+  defect hides. Audit them when they are a **pure function of the shape** (an index, a count, an
+  offset table) -- no tie freedom means any mismatch is unambiguously our bug.
+  `moe_gating_top_k_softmax`'s `row_idx` was wrong for **892 of the 1024 declared `k` values** (every
+  non-power-of-two `k`) in the shipped build, undetected, because `compare: false` and every visible
+  case uses a power-of-two `k`. Cost: zero marks, but it is a wrong output we were shipping. Free to
+  check: it is derivable on the host.
 - **C73 -- a legal no-op must still LAUNCH.** A profiled window with no NPU kernel trips
   `no_npu_kernel_detected`, which **zeroes the entire operator**. `strided_slice` scored 0 on hidden
   for this and recovered to 86.16 -- the campaign's largest single recovery. An early
