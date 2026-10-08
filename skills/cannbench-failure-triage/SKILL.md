@@ -99,6 +99,82 @@ is where the HAP inversion in the campaign skill gets its `Tb`/`Tc`/`Th`.
 
 ---
 
+## STEP 0b-2 -- `failure_type` IS TOO COARSE. SPLIT `precision_mismatch` BY **WHICH CLAUSE** FAILS.
+
+**`failure_type: precision_mismatch` is one label over two unrelated defect classes, and conflating
+them sent a full day of work at the smaller one.**
+
+The gate is `mere < threshold AND mare < mare_threshold`. **`MERE` is the MEAN relative error and
+`MARE` is the MAX.** So which of the two fails tells you what kind of problem you have:
+
+| clause that fails | what it is | how it looks |
+|---|---|---|
+| **`mere >= threshold`** | **a WRONG ANSWER** | the *mean* is out; tens of percent of positions mismatch |
+| `mere` inside, `mare >= mare_threshold` | a precision **outlier** | a handful of positions out of millions |
+
+A mean relative error above 1 cannot be rounding. It means the output is wrong by a factor.
+
+```bash
+python3 -c "
+import json,sys,collections
+cases=json.load(open(sys.argv[1]))['result']['job']['results']['operators'][0]['cases']
+cnt=collections.Counter()
+for c in cases:
+    outs=(c.get('accuracy') or {}).get('output_results') or []
+    bad=[o for o in outs if not o['passed']]
+    if c['status']=='success': k='PASS'
+    elif not outs: k='NO_OUTPUTS'
+    elif any(o['total_count']==0 for o in bad): k='NANPOS'          # STEP 0c
+    elif any(o['mere']>=o['threshold'] for o in bad): k='WRONG'
+    else: k='MARE_ONLY'
+    cnt[k]+=1
+print(cnt)" <saved get_job output>
+```
+
+**Worked example, lstm `job_179867269adf` (30/80).** `failure_type` said `precision_mismatch` for all
+50. The clause split said:
+
+| class | n | MERE | positions mismatched |
+|---|---:|---|---|
+| **WRONG** | **26** | **0.25 to 168** | **27% to 92%** |
+| MARE_ONLY | 21 | 1.8e-4 to 0.038 (inside the gate) | 2 to 122 of 51,200 to 1,638,400 |
+| NANPOS | 3 | -- | never compared |
+
+The distribution is **bimodal with nothing between**: passing cases sat at `MERE` ~4e-9, the
+MARE_ONLY class at ~1e-4, the WRONG class at ~1e1. A precision story predicts a continuum and does
+not get one.
+
+**The cost of not doing this split.** An fp64 control, eight association variants, the
+k-accumulation order, a tanh decomposition and an mkldnn on/off arm all returned null -- every one of
+them aimed at the 21-case MARE_ONLY class, while the larger 26-case class was a wrong answer nobody
+had examined. The operator was twice called unwinnable on that evidence, against a competitor
+passing **69/80** on the same hidden set while running *slower*. **An external entry that beats your
+pass count is a standing refutation of "unwinnable"; reconcile against it before concluding.**
+
+**Two further reads the same array gives you free:**
+
+- **Mismatch FRACTIONS are diagnostic.** `mismatch_count / total_count` clustered at ~90%, ~67%,
+  ~45%, ~33%, ~9%. "Right for the first N steps, wrong after" is the fingerprint of a loop or
+  recurrence, not of noise -- so dump the error profile **along the loop axis** (timestep, layer,
+  tile index) rather than sweeping shapes blindly.
+- **A size frontier, if there is one, is visible in `total_count`.** Every lstm PASS had
+  `y total_count <= 51200` and `hn total_count <= 1024`, while the WRONG class ran to 33,554,432 and
+  131,072. Treat that as an axis to probe, **not** as a shape: a count field is a count (STEP 0c),
+  and two cases with identical counts and dtype can differ by an attribute -- lstm cases 39 and 90
+  matched exactly on both and one passed while the other was 87.5% wrong.
+
+**Read the thresholds out of the payload, never assume them.** They are per-operator and appear as
+`output_results[i].threshold` (and in the log as `threshold=`/`mare_threshold=`). lstm's are
+**0.05 / 0.5**, not the 1e-2 / 1e-1 default -- assuming the default misprices every case in the set.
+
+**Operational note:** `get_job` can fail on a large hidden payload with
+`IncompleteRead(81558 bytes read, N more expected)` and it is **reproducible, not transient** -- the
+80-case lstm payload is ~850 KB. Retrying does not help. Save the payload once when a call succeeds
+and work from the file; a previously saved payload for an earlier run of the same operator answers
+most questions, since the failure *set* moves slowly between builds.
+
+---
+
 ## STEP 0c -- `MERE=0, MARE=0` CAN MEAN "NEVER COMPARED". CHECK `total_count`.
 
 **A failure reporting `MERE=0.000000, MARE=0.000000` is NOT a case whose values are bit-identical.**
