@@ -610,6 +610,23 @@ for speed, put a general fallback beneath it so **no declared shape can reach a 
   job on the same submission scoring above 50*, so a newly fixed kernel needs a standard run first.
   Budget accordingly, and note the standard run is not wasted -- it re-banks the entry and confirms
   the fix cost no performance.
+- **A job that dies in the runner's own stage is AUTO-REFUNDED. A hung job is not a lost credit.**
+  `conv_3d_backprop_filter` sat in `status: archiving` for ~6h with the runner `online` and the job
+  in its own `storage.terminal_unreported_job_ids`, then resolved to `status: timed_out`,
+  `error_code: inflight_timeout`, `failure_kind: hard_failure`, `failed_stage: archive`
+  (`在途超时：21620s 无阶段事件进展（阈值 21600s）` -- the threshold is **6h** of no stage event).
+  `get_credits` then read `charges: 1, refunds: 1, used: 0`. The **score** is lost
+  (`has_results: false`, `result_score: null`) and must be re-earned; the **credit** is not.
+  So waiting out the 6h is free -- never re-submit in a panic before the timeout resolves, and
+  never let a hung job become a sunk cost that justifies a rushed decision.
+  **Check whether it is the runner, not the site:** `list_runners` showed 8 online 910c runners,
+  all idle, and only runner-3 carried `terminal_unreported_jobs: 1` -- the other seven were at 0,
+  including one with *more* workspace jobs (1125 vs 999). Workspace pressure was not the cause and
+  a re-submit has ~7/8 odds of landing on a clean runner.
+  **And read a failed-to-report job's logs before writing the run off.** This one had already
+  compiled and run **20/20 with perf collected on both cards** before dying in archive, which
+  empirically retired a flagged C66 risk in that zip: the uncommitted `c10_npu::GetDeviceResLimit`
+  core query builds in the remote image. A missing header there would have zeroed the operator.
 - **An upload can time out transiently.** Three timeouts on one operator were hypothesised to be
   size (pre-zipped to 1.2 MB -- still failed, so size was falsified) and a 7-minute pause fixed it.
   If a submit hangs, wait rather than re-cutting the zip.
