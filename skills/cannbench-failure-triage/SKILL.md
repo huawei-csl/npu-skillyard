@@ -359,6 +359,29 @@ leaves compile at a full 20. Check the split first; it decides the value.
 | "the score belongs to this tree" | the shipped object md5 == the measured arm's | a score that does not belong to the shipped bytes is not a score |
 | **"the ablation arm measures the technique"** | the toggle's **definition** -- grep the `#ifdef`'s *body*, not its name | `LSTM_NO_TANHFIX` was **comment-only**: the code it gated had been deleted months earlier, so the arm was byte-identical to base **by construction**. Its clean null is a control on the harness, not evidence about tanh -- and read as evidence it retires the technique. See [[unwired-lever-retires-the-technique]] |
 
+### THE ARMS MUST SHARE THE `case_id`, BECAUSE THE SEED IS DERIVED FROM IT
+
+Inputs come from `DataGenerator` seeded by `case_seed(case_id)` -- a SHA-256 of
+`"<task>_<case_id>"`. **Two probes at the same shapes, dtype and value_range still get completely
+different tensors if they pass different `case_id`s**, and nothing in the output says so: both print
+the same config line, both are internally deterministic, and the metrics differ by 2-3x.
+
+This voided a finished result. One battery assigned ids positionally (`mk(600 + len(res), **kw)`, so
+the id tracked a config's INDEX in the list), a later probe used a fixed `mk(100, ...)`, and the two
+were compared row by row "at the same config". The conclusion -- 2 of 7 points recoverable -- was
+arithmetic on arms that never saw the same numbers. Re-measured with every arm in one process at one
+id, the point that had looked most recoverable **passes outright**.
+
+**The rule: a comparison is valid only between arms built from the same `case_id`, and the safest
+form is to compute every arm inside one process from one `build_inputs` call.** Record the `case_id`
+in every result row. A positional id is especially dangerous: inserting one config upstream
+renumbers everything below it, so a probe silently stops being comparable to its own earlier run.
+
+This is the third distinct way a cross-run comparison has been invalid here, after
+[[stored-baseline-is-not-a-control]] (session drift) and
+[[run-the-control-through-a-new-harness]] (the harness itself was the bug). The common cure is the
+same: **re-measure the control beside the treatment, in the same process, on the same inputs.**
+
 **And the arithmetic trap:** `avg_hap` from a **partial** run is biased -- it is measured on the
 cases that ran *before* the fault, which are the early ones. One such value came out **above** the
 standard set's, which is backwards, and 42 of 80 cases were unobserved.
@@ -692,44 +715,45 @@ funded.
 This is the clause split of STEP 0b-2 applied to controls, and skipping it cost a wrong verdict
 reported with confidence.
 
-At `S2048 B4 In256 H512`, `w+/-0.1`, fp32 -- the **visible** value convention -- lstm measured:
+At a single lstm point, `w+/-0.1`, fp32 -- the **visible** value convention -- with every arm at the
+**same case_id in the same process** (see the next rule, which is why that qualification matters):
 
 | arm | MERE (a mean) | MARE (a max) | verdict |
 |---|---:|---:|---|
-| ours | 4.90e-06 | **0.914** | FAIL |
-| in-family CPU fp32, different GEMM association | 4.92e-06 | **0.179** | **PASS** |
-| one-ulp reference floor | -- | 0.224 | **PASS** |
+| ours | 2.81e-06 | **0.719** | **FAIL** |
+| in-family CPU fp32, manual per-timestep association | 1.62e-06 | **0.350** | **PASS** |
+| one-ulp reference floor | -- | 0.422 | **PASS** |
 
-Read on MERE, **ours is slightly MORE accurate than the control** and the natural conclusion is "no
-defect, the gate is a lottery". Read on MARE -- **the clause that actually fails** -- ours is **5.1x
-the passing control and 4.1x the reference's own one-ulp floor**. Both statements are true of the
-same two runs.
+Read on MERE, ours and the control are both ~1e-06 and the natural conclusion is "no defect, the
+gate is a lottery". Read on MARE -- **the clause that actually fails** -- ours is **2.1x a passing
+in-family control** and 1.7x the reference's own one-ulp floor, on identical inputs.
 
-**The diagnosis the pair forces:** equal mean error with a 5x worse max means our error is
-**CONCENTRATED** on a few cancellation positions where a legitimate reimplementation's is not (3
-mismatches in 4,194,304 at that point). That is a difference in **operation order**, not a precision
-deficit -- so it is not fixed by a more accurate transcendental, and it is not excused as chaos,
-because an in-family arm and the reference's own floor both clear the gate at the same inputs.
+**The diagnosis the pair suggests:** comparable mean error with a 2x worse max means our error is
+**CONCENTRATED** on a few cancellation positions where a legitimate reimplementation's is not. That
+is a difference in **operation order**, not a precision deficit -- so it is not fixed by a more
+accurate transcendental, and it is not excused as chaos, because an in-family arm and the
+reference's own floor both clear the gate at the same inputs.
 
-**So: state which clause fails, then compare every control on that clause.** A control that wins on
-the aggregate and loses 5x on the failing clause is evidence of our defect, not against it.
+**But one point decides nothing, and this is the trap that makes the rule hard to apply.** MARE is a
+max over millions of elements, so it is a per-point coin flip in **both** directions: across five
+points measured this way, ours failed while both controls passed at two of them -- and the in-family
+control failed while ours passed at two others. **A claim of the form "ours is systematically worse
+on the failing clause" requires a PAIRED POPULATION and a sign test**, never a favourable point. The
+same discipline as any other paired measurement here: per-case non-overlap, not an aggregate.
+
+**So: state which clause fails, compare every control on that clause, and do it over a population.**
+A control that wins on the aggregate and loses on the failing clause is evidence of our defect -- if
+it loses repeatably.
 
 ### THE ONE-ULP FLOOR DEPENDS ON **WHICH INPUT** YOU PERTURB -- REPORT THE MAX
 
-One ulp into different inputs gives different floors, and the gap flips verdicts. Measured at seven
-lstm points, perturbing `x` versus perturbing `weight_hh`:
+One ulp into different inputs gives different floors, and the gap can flip a verdict. Measured at
+seven lstm points, perturbing `x` versus perturbing `weight_hh`, the two directions disagreed on the
+**majority** of points: taken on `x` alone 5 of 7 looked like a ceiling, and on `weight_hh` alone 6
+of 7 looked recoverable.
 
-| point | ours MARE | floor(x) | floor(w_hh) | verdict on max |
-|---|---:|---:|---:|---|
-| `H1024 bidir` | 0.556 | **0.824 F** | 0.115 P | ceiling |
-| `H1024 L2 bidir` | 0.501 | **0.574 F** | 0.424 P | ceiling |
-| `H1024 S500` | 0.795 | 0.371 P | 0.326 P | **OURS, 1.59x needed** |
-| `S1024 B64 H512` | 1.612 | 0.422 P | 0.213 P | **OURS, 3.22x needed** |
-
-Taken on `x` alone, 5 of 7 look like a ceiling; on `w_hh` alone, 6 of 7 look recoverable. **Take the
-MAXIMUM over perturbation directions**: that is the most permissive floor, so claiming "ours" only
-when every direction agrees is the conservative direction for the claim you actually act on. Report
-both columns, and the ratio `ours / maxfloor`.
+**Take the MAXIMUM over perturbation directions** -- the most permissive floor -- so that calling a
+case "ours" requires every direction to agree. Report both columns and the ratio `ours / maxfloor`.
 
 **And a reminder the probe itself confirms:** a passing row prints `sv_e=0/0` because the stage-1
 fast path zeroes the band counters, not because the golden has no small values -- the same geometry
