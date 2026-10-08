@@ -214,6 +214,86 @@ bit-exactness over the entire small-value population. **The only route is the st
 
 ---
 
+## STEP 0d -- RECOVERING THE HIDDEN REGIME: THE FREE OBSERVABLES CAN CONSTRAIN THE WRONG PARAMETER
+
+The hidden cases are bit-reproducible from their seeds, so a CPU-only sweep can in principle
+recover each case's generator settings -- **shapes, dtype and `value_range`** -- by matching the
+payload's reported counters. This is free: no device, no credit. But it has a failure mode that
+produces a confident, wrong verdict, and it must be checked before the recovered regime is used
+for anything.
+
+### First: separate the GOLDEN-ONLY fields from the output-dependent ones
+
+Only fields computed from the **reference alone** can be matched by a CPU sweep that does not run
+our kernel. Measured on lstm's payload:
+
+| field | depends on | usable to pin a regime without the device? |
+|---|---|---|
+| `y_numel`, `hn_numel`, `cn_numel` | shapes only | **yes** |
+| `small_value_total_count` = `count(|golden| < sv_thr)` | the golden | **yes** (`sv_thr`: fp32 `2^-14`, fp16 `2^-11`, bf16 `2^-8`) |
+| `cancel_total_count` | tests `|output|` | **no** |
+| `normal_total_count` = total - sv - cancel | derived from the above | **no** |
+| `max_diff`, `mere`, `mare`, `mismatch_count` | ours vs golden | **no** (but see the discriminator below) |
+
+Getting that table wrong is the first way to go wrong: `normal_total_count` *looks* like a pure
+shape/golden quantity and is not.
+
+### The trap: a 1-parameter fit silently ALIASES two parameters
+
+A generator usually has more than one magnitude knob. lstm has two that matter -- `w_ih` (input
+weights) and `w_hh` (recurrent weights) -- and they are **not symmetric** in what they control:
+
+| held fixed | swept | `small_value_frac` | the control's MERE |
+|---|---|---|---|
+| `w_hh` | `w_ih` 0.1 -> 2.0 | **0.0004 -> 0.275 (3 orders)** | barely moves |
+| `w_ih` | `w_hh` 0.75 -> 3.0 | barely moves | **2e-6 -> 122 (8 orders)** |
+
+**The free observable constrains the parameter that does not matter and is nearly blind to the one
+that does.** A sweep over a single combined "scale" fitted the band counters, recovered a gain of
+~6.5, and concluded the class was winnable. Two-parameter, the *same* counter fingerprint is
+matched by regimes whose error differs by **seven orders of magnitude**. The verdict flipped.
+
+**So: sweep every magnitude knob independently and report which observable responds to which.**
+If an observable moves with a parameter the failure does not depend on, it cannot pin the failure,
+however exactly it matches.
+
+### The discriminator: OUR OWN measured metric, against the payload's reported one
+
+When several regimes share the free fingerprint, the payload carries one more number that
+separates them -- **the `mere` it reports for that case**. Run our kernel at each candidate regime
+and keep only the regimes that reproduce it. This costs device time but no credit, and it is
+golden-independent in the sense that matters: it tests *our* behaviour, not a modelled reference.
+
+Worked example (lstm case 41, fingerprint `y_sv=0.09598, cn_sv=0.00854`, payload `mere=130`):
+
+| candidate regime | ours | in-family CPU fp32 | exact fp64 | matches 130? |
+|---|---:|---:|---:|---|
+| `w_hh=1.0, w_ih=1.0` | **1.69e-05** | 1.02e-05 | 1.43e-05 | **no -- excluded** |
+| `w_hh=2.0, w_ih=0.25` | 58.3 | 61.5 | 59.9 | no |
+| `w_hh=3.0, w_ih=0.10` | **119** | 120 | 123 | **yes** |
+
+The branch the 1-parameter fit had chosen is **excluded by our own measurement**: we read 1.7e-05
+there, not 130. The branch that does reproduce 130 has the **exact fp64 answer at 123 and the
+in-family fp32 arm at 120** -- we are within 1-3% of both, which is the signature of a
+chaos-limited case, not of a defect (STEP 2i).
+
+### What a recovered regime is good for
+
+Two legitimate uses, and one illegitimate one:
+
+- **Legitimate:** showing the hidden set probes *outside* the visible value convention. Across
+  lstm's 26 wrong-answer cases, `small_value_frac` runs 0.0000 to 0.663, mapping `w_ih` to roughly
+  **0.05 - 2.0**, against a visible convention of `+/-0.1`. That retires "no visible case hits it,
+  so it cannot happen" (see [[hidden-set-ignores-desc-md]]).
+- **Legitimate:** choosing where to run a reproduction, so the probe is not run at a regime past
+  the point where the reference itself fails -- which is where a reproduction can no longer
+  discriminate our defect from chaos.
+- **Illegitimate:** declaring a class winnable or unwinnable from the recovered regime alone. The
+  parameter that decides that is, on this operator, **not recoverable from golden-only data at
+  all**; the only handle on it is a measured metric.
+
+---
+
 ## STEP 1 -- DISPATCH THE SIGNATURE
 
 ### A. Accuracy / metric signatures
@@ -277,6 +357,7 @@ leaves compile at a full 20. Check the split first; it decides the value.
 | "this cap is architectural" | find the measured evidence for the claim | one *was* (SYNCALL deadlocks above 24: with a barrier, `block_dim` 25 and 32 never return) -- removing it would have caused a silent hang |
 | **"device time did not change"** | **read `elapsed_us`, NOT `t_hw_us`** | `t_hw_us` is the benchmark's **roofline constant**, not a measurement of your kernel: it came back **bit-identical across both arms and all four runs, zero variance**, which read naively is a *perfect null* (0 slower / 20 faster, +0.00%) while `avg_speedup` had moved **0.765 -> 0.662**. `op_times.device_kernels` even names the instantiation, so use it to confirm which build ran |
 | "the score belongs to this tree" | the shipped object md5 == the measured arm's | a score that does not belong to the shipped bytes is not a score |
+| **"the ablation arm measures the technique"** | the toggle's **definition** -- grep the `#ifdef`'s *body*, not its name | `LSTM_NO_TANHFIX` was **comment-only**: the code it gated had been deleted months earlier, so the arm was byte-identical to base **by construction**. Its clean null is a control on the harness, not evidence about tanh -- and read as evidence it retires the technique. See [[unwired-lever-retires-the-technique]] |
 
 **And the arithmetic trap:** `avg_hap` from a **partial** run is biased -- it is measured on the
 cases that ran *before* the fault, which are the early ones. One such value came out **above** the
