@@ -554,6 +554,27 @@ So when the golden is lossy, restate the verdict as: **winnable only by bit-matc
 operation order; never by being more accurate.** See
 [[use-the-operators-own-golden-convention]] for how the same confusion inverted a 7-arm study.
 
+### THE CONTROL MUST BE IN-FAMILY: fp64 IS NOT A CONTROL FOR AN fp32 KERNEL
+
+**"The control passes and ours fails" is evidence of our defect ONLY when the control shares our
+arithmetic family.** An exact fp64 arm injects no per-step rounding, so in any expansive or recurrent
+regime it passes where a correct fp32 kernel fails -- **by construction**. Using it as the control
+measures the precision gap, which the regime then amplifies for free.
+
+Worked example, which manufactured a cap bug that does not exist: three lstm configurations
+(`H1024` at `S=200/512/2048`) showed `control=PASS, ours=FAIL` with H128/H256/H512 passing and H2048
+failing for everyone -- a textbook ours-only band bracketed by passing controls, and it was promoted
+as the strongest signal on the operator. The control was the fp64 arm. Adding a CPU **fp32** arm
+dissolved it: at `H1024_S200` ours is **4.90e-6** against the in-family arm's **4.92e-6**, so **ours
+is MORE accurate and still fails** -- a single-element MARE coin flip with MERE four orders *inside*
+the gate. An H ladder at `S=4` (no amplification) over 128..2048 including 255/256/257, 511/512/513
+and 1023/1024/1025 returns ratio 0.9-1.4 at every H; a static cap would bite there and does not.
+
+**So name the control's dtype and operation order before believing any ours-only failure.** Keep the
+fp64 arm only as the third point for the triangle check in STEP 4, never as the pass/fail control.
+This is the same error as using the wrong golden convention, one level up: not the golden's
+convention but the **control's**.
+
 **And in an EXPANSIVE recurrence, accuracy is actively counterproductive** -- measured per timestep on
 lstm: at `t=0` the error is `6.5e-07` (fp32 epsilon, i.e. the per-step arithmetic is correct), and
 past `|w| ~ 1.4` the Jacobian's spectral radius exceeds 1 and amplifies *any* rounding difference
@@ -694,6 +715,23 @@ so the next session does not re-derive an uncollectable delta.
   than explaining it away.
 - **Do not SIGTERM a running eval** to free a card -- it leaks a device allocation (933 MB held by a
   PID absent from `/proc` for 25+ minutes).
+- **NEVER SIGKILL A RUNNING KERNEL. It leaves the card SILENTLY RETURNING WRONG ANSWERS.** An agent
+  killed a slow probe on card 1; for the next **~9 experiments** that card returned answers **~300x
+  worse than correct -- consistently and reproducibly**, which is precisely why the results were
+  believed. `npu-smi` reported it free and Health OK throughout. A byte-identical 47-config plan read
+  **47/47 dirty**, then **0/47** on a clean card. Deliberate contention does **not** reproduce it, so
+  it is the aborted-kernel state, not contention, and it persists **across processes** for minutes.
+  Four separate "findings" came out of that window and all were false: a universal 257-793x error
+  excess, a `block_dim<=3` clean / `>=4` dirty 500x effect, period-3 non-determinism over identical
+  calls, and a mean error 615x the fp32 floor. **Let a probe finish or time out; never kill it.** This
+  generalises the known bad-card problem from one card to **any** card -- the silent wrong-answer
+  state is reachable by your own actions and the health check cannot see it.
+- **PUT A TRIANGLE-INEQUALITY CHECK IN FRONT OF EVERY ACCURACY TABLE.** Print all three of
+  `|ours-golden|`, `|ours-exact|`, `|exact-golden|`. If `|ours-golden|` exceeds the sum of the other
+  two, that is **arithmetically impossible**: the card is poisoned and every number in the run is
+  void. This is what finally caught the case above (`7.9e-5` against `8.0e-8` and `1.2e-7`) after
+  nine experiments had been accepted. It costs one extra CPU reference per row and it is the only
+  cheap detector for a silently-wrong card.
 - **If your card faults, STOP and report.** Never a host-wide `pkill`; own PIDs by number.
 - **`kernel_eval.cli eval --source-dir <arm> --skip-install` is SAFE** with siblings running. Only
   `run_evaluation.sh --source-dir` triggers `uninstall_packages`.
