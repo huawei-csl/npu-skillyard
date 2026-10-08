@@ -735,22 +735,35 @@ Two practical notes for whoever retries:
   is named after somebody else's kernel. **Always check the captured directory name before
   reading any number out of a simulator run.**
 
-### The simulator is the project's only instruction trace
+### There is NO instruction trace available for a Mix kernel
 
-Worth knowing, because it was assumed unavailable: there is **no disassembler** for the device
-binary (the nested object in `__aicore_rel_binary` is `elf64-hiipu`, machine `0x1029`; the
-toolchain's own `llvm-objdump` names the symbols but prints `<not available>` for every
-instruction), and **`-S` is rejected on the device side** (`unsupported option '-S' on device
-side` — the `.s` it writes is host-only). So static inspection cannot give an instruction trace.
+This matters because it bounds what any claim about "where the data actually moved" can rest on.
 
-The simulator can. Each run writes, per core,
-`.../simulator/core0.veccore0/core0.veccore0_instr_exe_*.csv` with columns:
+**Static inspection cannot give one.** The nested object inside `__aicore_rel_binary` is
+`elf64-hiipu`, machine `0x1029`; the toolchain's own `llvm-objdump` resolves the symbol names but
+prints `<not available>` for every instruction, so there is no disassembler backend. And **`-S` is
+rejected for device code** (`unsupported option '-S' on device side`) — the `.s` it writes is the
+host pass only.
 
-```
-instr,addr,pipe,call_count,cycles,running_time(us),detail
-```
+**The simulator gives one for a vector-only kernel and NOT for a MIX_AIC kernel.** Measured with
+the same recipe on `Ascend910B1`:
 
-`pipe` is one of `SCALAR`, `VECTOR`, `MTE2`, `MTE3`, `FLOWCTRL`, `ALL`, so the CSV answers
-"did this kernel touch GM on this pipe" directly, and `cycles` is per instruction. This is the
-right tool for any claim about where data actually moved. It is only available for simulator
-targets that initialise, which currently excludes the whole A5 family on this host.
+| profiled kernel | `.../0/simulator/core0.veccore0/*_instr_exe_*.csv` |
+|---|---|
+| `Fill_...` (torch's `full()`, AIV-only) | **produced** |
+| `launch_mix_seam_mix_aic` (Cube+Vec) | **absent** — no `simulator/` directory at all |
+
+For the Mix kernel the dump phase still runs and writes `0/dump/aicore_binary.o` and
+`pc_start_addr.txt`, but no per-core trace follows. `--core-id` may be the missing flag; that was
+not established. When the CSV *is* produced its columns are
+`instr,addr,pipe,call_count,cycles,running_time(us),detail`, with `pipe` one of `SCALAR`, `VECTOR`,
+`MTE2`, `MTE3`, `FLOWCTRL`, `ALL` — which would answer "did this kernel touch GM, on which pipe"
+directly. `object_dump.txt` is not a disassembly; it holds the dump path and the kernel name.
+
+**What you can still get for a Mix kernel** is cycle windows only, from
+`tmp_dump/profile_aic_log0.toml` and `profile_aiv_log0.toml`: `start_cycle`, `end_cycle`,
+`duration` per stream/task/subtask/block/core. **No pipe attribution of any kind.** Useful for a
+deterministic cycle comparison between two builds, useless for locating a transfer.
+
+So any "this path does/does not transit GM" claim in this project currently rests on the pto-isa
+source and its address-space types (see **C131**), not on an executed trace — on either arch.

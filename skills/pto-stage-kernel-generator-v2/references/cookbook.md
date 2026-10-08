@@ -4402,38 +4402,3 @@ plausible `_C.abi3.so` md5. **Assert that the resolved `cann_bench.__file__` sta
 site dir**, every arm, every run -- not just that an md5 exists. Also: **compile contention depresses a
 timed pass** (one pass overlapping a build read 58.89 against 59.05/59.06 clean), so keep the host quiet
 during timing.
-
----
-
-## COOK-§P1 (PENDING VERIFICATION, DO NOT RELY ON): MTE2 `TLOAD` MAY WRITE THE WHOLE ENCLOSING 32-BYTE BLOCK
-
-**Status: agent-reported, measured by a subagent, NOT independently probed by this session.**
-Five earlier agent-reported ISA behaviours in this campaign were falsified on probing, so this is
-recorded here to preserve the probe recipe -- **not** as a usable rule. It must not be cited as `COOK-§`
-evidence until a probe confirms it, at which point it becomes a C-rule and this entry is deleted.
-
-**The claim.** An MTE2 GM->UB `TLOAD` of `n` elements writes the **whole enclosing 32-byte block**, not
-just `n` elements. The UB->GM `TSTORE` in the same kernel was reported **byte-exact**, and a Vec op
-(`TCVT`) **is** masked to `validCol`. Consequence if true: a **sentinel-padded UB buffer is unsafe as a
-direct `TLOAD` target** whenever the valid count is not block-aligned -- the load's over-read lands on
-the pad and replaces it with adjacent data.
-
-**Reported symptom** (in `moe_gating_top_k_softmax`'s general path): a tail segment of `<8` floats
-overwrote a `-FLT_MAX` sort pad with the *next row's* leading values, which then joined the sort and the
-sum. Wrong at `E = 2049 / 2050 / 2052`, correct at `E = 2056`. Reported `mere 5.0e-4` vs `thr 1.2e-4`.
-Reported fix: stage partial segments through scratch -- 8-aligned prefix by `ubcopy`, then a `<8`-element
-scalar tail.
-
-**Probe recipe (what would settle it).** Vary `E mod SEG` over `1..8` at `N > 1`, in **fp32**. The
-reported false-negative conditions matter:
-- `N = 1` cannot see it -- the clobbering bytes come from a *neighbouring row*.
-- fp16/bf16 cannot see it -- they reach the buffer through a `TCVT`, which is masked.
-- A pure read-back probe cannot see it either; the pad has to be *load-adjacent* and then *consumed*.
-
-Discriminating controls a probe must include: fill the pad with a known sentinel and read it back after
-the `TLOAD` (does the sentinel survive?); repeat with the load replaced by `ubcopy` (isolates MTE2 from
-the copy path); and confirm the `TSTORE` direction separately, since the claim is **asymmetric** and an
-asymmetry is exactly the kind of detail that turns out to be a misattribution.
-
-**Distinct from** the `>255`-block row-stride cliff (a stride-descriptor overflow) -- this claim is about
-the **granule of a single transfer**, not about row addressing.

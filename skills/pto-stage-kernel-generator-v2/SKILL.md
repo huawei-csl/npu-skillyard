@@ -7054,3 +7054,104 @@ path.
 - Widen by **adding** an instantiation, not by **changing** one, so the old path stays bit-identical
   and the regression gate can demand bit-identity.
 - Expect binary growth and placement noise; measure the old build beside the new in the same session.
+
+---
+
+### C137: A WRITE INTO **UB** IS 32-BYTE-BLOCK GRANULAR -- A SENTINEL OR PAD INSIDE A PARTIALLY-VALID TILE DOES **NOT** SURVIVE. THE GM-SIDE `TSTORE` IS BYTE-EXACT.  🔴 **CRITICAL**
+
+A transfer whose **destination** is UB writes **whole 32-byte blocks**. If `ValidCol * sizeof(T)` is
+not a multiple of 32, the remainder of the final enclosing block **is overwritten** -- exactly to the
+next 32-byte boundary and **never one byte further**.
+
+Measured on A2/A3 (910B2, CANN 9.1.0, pto-isa `109c9f72`, `dav-c220-vec`, `block_dim=1`), by sentinel
+readback, three byte-identical repeat runs:
+
+```
+extra elements clobbered = ((32/sizeof(T)) - ValidCol % (32/sizeof(T))) % (32/sizeof(T))
+```
+
+| `ValidCol mod 8` (fp32) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 0 |
+|---|---|---|---|---|---|---|---|---|
+| extra elements clobbered | 7 | 6 | 5 | 4 | 3 | 2 | 1 | **0** |
+
+Minimal case, one 32-byte block, `ValidCol = 3` fp32 over a `-7777.0` sentinel:
+
+```
+byte-exact would be : [1000, 1001, 1002, -7777, -7777, -7777, -7777, -7777]
+measured            : [1000, 1001, 1002,  1000,  1000,  1000,  1000,  1000]
+```
+
+**It applies to BOTH routes into UB, with different tail contents:**
+
+- **GM->UB `TLOAD`** -- the tail is the **hardware pad**. With the default `PadValue::Null`,
+  `TLoad.hpp` never calls `set_mov_pad_val`, so the tail is **UNDEFINED**. (On this part it was
+  observed to be the burst's *own first element, replicated* -- `src+0` gives `1000.0`, `src+32` gives
+  `1032.0`, and with 4 rows at pitch `n` row *r* gets `1000 + r*n`. **Do not depend on that.**)
+- **UB->UB `TMOV` / `ubcopy`** -- the tail is the **genuine adjacent source data**. Visible in the
+  library source without a probe: `TMov.hpp` computes `blockLen = (validCol*sizeof(T) + 31)/32` in
+  whole blocks.
+
+**So this is NOT an MTE2 property.** Framing it as one is the trap: it leads to "fix it by staging
+through `ubcopy`", and `ubcopy` on a non-aligned prefix clobbers identically.
+
+**UB->GM `TSTORE` IS byte-exact** -- zero bytes past `ValidCol` disturbed, measured `n = 1..24` at
+`nBurst = 1`. The asymmetry is real: `copy_ubuf_to_gm_align_b32` is byte-exact at its destination,
+`copy_gm_to_ubuf_align_b32` is block-granular at its destination. **Do not generalise the UB
+behaviour to the GM direction**, or the reverse.
+
+**THE SAFE PATTERN IS `PadVal`, NOT SCRATCH STAGING.** Declare the tile with
+`PadVal = PadValueCustom(<your sentinel>)` and the tail is deterministically filled with it (measured:
+an explicit `-1.0f` landed as `-1.0` at every `n`). This is sound **by construction**:
+`pto_tile.hpp:1526` `static_assert`s that a RowMajor/NoneBox Vec tile has `Cols*sizeof(T) % 32 == 0`,
+so PTO's `ubPad = (Cols - ValidCol) % (32/sizeof(T))` is always exactly the real tail count -- a
+`Cols=60` fp32 tile does not compile, so the pad count cannot be mis-sized. Staging an 8-aligned
+prefix plus a scalar tail also works, but is strictly more code and is only safe **because** the
+prefix is aligned.
+
+**THERE ARE NO FALSE-NEGATIVE CONDITIONS.** All three exemptions this effect was first reported with
+were measured **FALSE**: fp16 shows it (same rule at 16 elements/block, so the granule is
+dtype-*scaled*, not dtype-exempt); `nBurst = 1` shows it; and a strided GM source (`gmGap > 0`) shows
+it. It is also **not an over-read** -- the neighbouring row's data never appeared in any of four
+shapes built to look for it.
+
+**Probe recipe -- one launch settles it.** Pre-fill a UB arena with a sentinel via a block-aligned
+full-width `TLOAD`; `TLOAD` `ValidCol = n` with `n % (32/sizeof(T)) != 0` into the same address; read
+the **whole** arena back with a block-aligned full-width `TSTORE`; report the highest index differing
+from the sentinel. **Never infer this from a downstream numeric error** -- that is what produced the
+wrong mechanism the first time. Include four arms or you will mis-attribute it: the opposite direction
+(`TSTORE`), a `TMOV` arm (else you blame MTE2), a source-offset arm (else you blame an over-read), and
+a Vec positive control (C128).
+
+**Scope -- what was NOT measured.** `TileType::Vec` same-layout ND->ND only: `TileType::Mat` (L1), NZ
+and DN loads are untested, and the ISA doc claims block-aligned **Mat** loads write only the logical
+valid region. A2/A3 only -- A5's documented behaviour differs materially (`PadVal`-governed). `float`
+and `half` only, so the `32/sizeof(T)` form is interpolated from two widths. `PadValue::Zero`
+untested. `TSTORE` byte-exactness established at `nBurst = 1` only. Single core, `block_dim = 1`, so
+nothing here speaks to cross-core interaction.
+
+---
+
+### C132 (STRENGTHENED): THE `__global__` **DEFINITION** MUST BE UNGUARDED -- ONLY ITS **BODY** GOES INSIDE THE ARCH GUARD
+
+`call_kernel` living outside the device-only guard is **necessary but not sufficient**. Guarding the
+`__global__` *definition* under `#if defined(__DAV_VEC__)` makes the host pass emit an undefined
+reference (`U <kernel_name>`) instead of the launch stub, and the `.so` then fails `dlopen` with
+`undefined symbol`. **A forward declaration does NOT fix it.**
+
+```c
+// WRONG -- host pass sees no definition, .so fails dlopen
+#if defined(__DAV_VEC__)
+extern "C" __global__ AICORE void probe(...) { /* body */ }
+#endif
+
+// RIGHT -- definition always visible, body compiled only for the Vec pass
+extern "C" __global__ AICORE void probe(...) {
+#if defined(__DAV_VEC__)
+    /* body */
+#endif
+}
+```
+
+Also: **`-dM -E` under `--cce-aicore-arch=dav-c220` reports BOTH `__DAV_VEC__` and `__DAV_CUBE__`
+from a single invocation**, so a `-dM` dump cannot be used to reason about which pass sees which
+guard. Probe guard visibility by compiling and inspecting the emitted symbols, not by dumping macros.
