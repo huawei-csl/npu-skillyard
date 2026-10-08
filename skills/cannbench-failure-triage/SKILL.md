@@ -687,6 +687,54 @@ measurement costs nothing.** Run it before any numerics work, and before pricing
 "ours is 1% from the one-ulp floor" retires a fix that "ours is 615x the fp32 epsilon" would have
 funded.
 
+### COMPARE THE CONTROL ON THE **FAILING CLAUSE**, NOT ON THE AGGREGATE
+
+This is the clause split of STEP 0b-2 applied to controls, and skipping it cost a wrong verdict
+reported with confidence.
+
+At `S2048 B4 In256 H512`, `w+/-0.1`, fp32 -- the **visible** value convention -- lstm measured:
+
+| arm | MERE (a mean) | MARE (a max) | verdict |
+|---|---:|---:|---|
+| ours | 4.90e-06 | **0.914** | FAIL |
+| in-family CPU fp32, different GEMM association | 4.92e-06 | **0.179** | **PASS** |
+| one-ulp reference floor | -- | 0.224 | **PASS** |
+
+Read on MERE, **ours is slightly MORE accurate than the control** and the natural conclusion is "no
+defect, the gate is a lottery". Read on MARE -- **the clause that actually fails** -- ours is **5.1x
+the passing control and 4.1x the reference's own one-ulp floor**. Both statements are true of the
+same two runs.
+
+**The diagnosis the pair forces:** equal mean error with a 5x worse max means our error is
+**CONCENTRATED** on a few cancellation positions where a legitimate reimplementation's is not (3
+mismatches in 4,194,304 at that point). That is a difference in **operation order**, not a precision
+deficit -- so it is not fixed by a more accurate transcendental, and it is not excused as chaos,
+because an in-family arm and the reference's own floor both clear the gate at the same inputs.
+
+**So: state which clause fails, then compare every control on that clause.** A control that wins on
+the aggregate and loses 5x on the failing clause is evidence of our defect, not against it.
+
+### THE ONE-ULP FLOOR DEPENDS ON **WHICH INPUT** YOU PERTURB -- REPORT THE MAX
+
+One ulp into different inputs gives different floors, and the gap flips verdicts. Measured at seven
+lstm points, perturbing `x` versus perturbing `weight_hh`:
+
+| point | ours MARE | floor(x) | floor(w_hh) | verdict on max |
+|---|---:|---:|---:|---|
+| `H1024 bidir` | 0.556 | **0.824 F** | 0.115 P | ceiling |
+| `H1024 L2 bidir` | 0.501 | **0.574 F** | 0.424 P | ceiling |
+| `H1024 S500` | 0.795 | 0.371 P | 0.326 P | **OURS, 1.59x needed** |
+| `S1024 B64 H512` | 1.612 | 0.422 P | 0.213 P | **OURS, 3.22x needed** |
+
+Taken on `x` alone, 5 of 7 look like a ceiling; on `w_hh` alone, 6 of 7 look recoverable. **Take the
+MAXIMUM over perturbation directions**: that is the most permissive floor, so claiming "ours" only
+when every direction agrees is the conservative direction for the claim you actually act on. Report
+both columns, and the ratio `ours / maxfloor`.
+
+**And a reminder the probe itself confirms:** a passing row prints `sv_e=0/0` because the stage-1
+fast path zeroes the band counters, not because the golden has no small values -- the same geometry
+genuinely has 222 of them. Never read a zeroed band counter as a clean band.
+
 ### THE REFERENCE IMPLEMENTATION CAN CHANGE WITH AN ATTRIBUTE -- CHECK WHICH GOLDEN A CASE GETS
 
 "Bit-match the reference's operation order" presumes there is **one** reference. There may not be.
