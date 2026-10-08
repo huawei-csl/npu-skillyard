@@ -7231,6 +7231,59 @@ side. An `Inf -> FLT_MAX` NaN-preserving clamp removed our manufactured NaN and 
 configs**, because the reference's own dot products also produce NaN on mixed-sign infinities and our
 NaN was already *matching*. Fix the stale read, not the arithmetic.
 
+### C141: A FEATURE WHOSE DEFAULT LIVES IN AN `#ifndef`/`#define 0` **INSIDE THE KERNEL TU** IS INVISIBLE TO A BUILD-SYSTEM AUDIT -- AND A DETECTOR WHOSE HANDLER SITS BEHIND IT FALLS THROUGH TO THE PATH IT JUST REJECTED  🔴 **CRITICAL**
+
+Measured on `apply_adam_w`, 2026-10-09. This is the **fourth** shape of the unwired-lever
+failure (C34 = a knob that reserves but never binds; the deleted-but-named flag; the guard whose
+`#if` chain is false). This one is the worst, because the code reads as *defensive* and audits
+as *covered*.
+
+**The mechanism, in two halves that are each individually reasonable.**
+
+1. The host constant-folder **correctly detects that its own fold is invalid**:
+   `folded_faithful` tests `isfinite(s2)`, fails, and sets `apply_wd |= AW_MODE_STAGED`.
+2. The handler for that mode is `#if AW_STAGED_PATH` -- and the default is
+   ```c
+   #ifndef AW_STAGED_PATH
+   #define AW_STAGED_PATH 0
+   #endif
+   ```
+   at `kernel_adamw.cpp:175`, with **no mention in `CMakeLists.txt` and none in `build.sh`**.
+
+So the detection is wired, the destination is not built, and the kernel **silently takes the
+exact path the detector just rejected** -- here emitting an all-NaN output from one poisoned
+host scalar.
+
+**The audit failure is the part to internalise.** An agent reviewing this cited
+*"`CMakeLists.txt:57-62` defaults `AW_STAGED_PATH` to `"0"`"*. Those lines are the
+`PTO_ISA_INCLUDE` block; the macro appears **nowhere** in the build files. The grep over the
+build system returns zero hits, and zero hits reads as *"not a tunable"* or *"default-on"* when
+it actually means *"the default is hidden in the source"*. The conclusion happened to be right;
+the evidence cited did not exist.
+
+**The checks, cheapest first:**
+
+- For every `#if <MACRO>` in a kernel TU, resolve the default **in the TU itself**
+  (`grep -n "ifndef\|define" ` the macro) before looking at the build files. Zero build-file
+  hits is a finding, not a clearance.
+- **Export the resolved value and assert on it from the host.** This kernel already does the
+  right thing -- `extern "C" int32_t kernel_staged_path(void) { return AW_STAGED_PATH; }` -- so
+  the value is queryable at runtime and nobody needs to re-derive it from text. Do this for
+  every compile-time tunable (and see C136: export a capability, never restate it).
+- **A detector must have a reachable destination.** If a guard can set a mode, `static_assert`
+  that the mode's handler is compiled in, or make the detector's failure branch do something
+  unconditional (clamp, or return a documented error) rather than fall through. A detection
+  whose only effect is setting a bit that nothing reads is strictly worse than no detection: it
+  makes the hazard look handled.
+- A source-level census of `#if`-guarded text is a census of **TEXT**. Confirm two builds'
+  `.aicore_binary` sections differ in size or bytes before believing a toggle does anything.
+
+**Corollary for triage, not just generation.** When you find a defect class and the source
+already contains a guard that names it, do **not** record it as "already handled". Resolve the
+guard's destination first. The fix here is known, designed and costs nothing on the fast path --
+and it is worth exactly 0.00, because the class is empirically unreachable by the scored case
+set. That is a decision the reachability evidence makes, not one the guard's existence makes.
+
 ### C132 (STRENGTHENED): THE `__global__` **DEFINITION** MUST BE UNGUARDED -- ONLY ITS **BODY** GOES INSIDE THE ARCH GUARD
 
 `call_kernel` living outside the device-only guard is **necessary but not sufficient**. Guarding the

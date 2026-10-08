@@ -1236,6 +1236,96 @@ IEEE model that showed the reference degenerates the same way.
 **The rule: when a model of device arithmetic disagrees with the device, compile the expression and
 read the constants before you believe the model.** Probe the mechanism, not the symptom.
 
+## STEP 2n -- THE COMPARATOR'S NON-FINITE GATES ARE **ASYMMETRIC**, AND A MIXED-PRECISION SEAM CAN BE CLOSED BY **REDUCTION**
+
+Three results from the `apply_adam_w` 16-bit round. The first changes how you PRICE every
+non-finite divergence; the second is the cheapest way to close a mixed-precision dark region;
+the third is the second control-design self-bug this operator has produced.
+
+### ONLY `isnan` POSITION IS ZERO-TOLERANCE. A ONE-SIDED `Inf` IS **SUBSTITUTED AND FORGIVEN**.
+
+Read directly off `compare.py`, verified 2026-10-09:
+
+| clause | site | behaviour |
+|---|---|---|
+| `isnan(ours) != isnan(golden)` anywhere | `compare.py:389-399` | **unconditional hard fail**, `"NaN位置不匹配"`, returns immediately |
+| one side `Inf`, other finite | `compare.py:402-440` | the `Inf` is **replaced by the dtype's max finite**, sign preserved, and comparison **continues** into MERE/MARE |
+| both `Inf`, **same** sign | `compare.py:442-445` | treated as matched and **excluded** from the rest of the comparison |
+| both `Inf`, **opposite** sign | same | hard fail, `"Inf符号不匹配"` |
+
+The comment is explicit that the substitution exists for the saturation case
+(`NPU fp32->fp16 截断到 inf, golden fp64->fp16 未越界`).
+
+**Two consequences, both of which have been mispriced in this campaign.**
+
+1. **A saturate-vs-`Inf` disagreement is NOT a defect class.** It costs you a magnitude
+   comparison against `max_finite`, not a case. The double-rounding edge that looks lethal --
+   golden `fp64 65519.9 -> fp32 65520.0 -> fp16 Inf` versus `fp64 -> fp16 65504` -- is absorbed
+   exactly here: **both sides become +-65504 and the relative error is 0.** Do not open a
+   work item for it.
+2. **So the whole non-finite risk of a narrowing store reduces to `isnan` POSITION.** Which
+   is a far smaller target than "reproduce the reference's non-finite behaviour", and it is
+   the hook for the reduction below.
+
+### A MODEL-FREE SEAM TEST, AND WHY THE `isnan` HALF IS A **REDUCTION** AND NOT A SAMPLE
+
+When a 16-bit path widens to fp32, runs the **same** arithmetic macro as the fp32 path, and
+narrows one output, do **not** build a host model of the chain -- that is what fabricated a
+24-attribute-set defect class on this operator (STEP 2m). Test the seams against each other:
+
+```
+kernel_16bit(X16)  ==bitwise==  narrow( kernel_fp32(X16.float()) )
+```
+
+Both arms contain the identical arithmetic, so **the arithmetic cancels out of the verdict**
+and a bit-exact result proves the load widen and the store narrow simultaneously, with no
+model anywhere. It is also cheap to make exhaustive on the axis that matters: sweep **all
+65536 16-bit bit patterns** on each operand port (co-prime strides to decorrelate the ports).
+Measured: 3,479/3,480 BITEXACT per dtype, the one miss being the planted control.
+
+**Then close `isnan` over the whole wide space, which is a theorem you can check exhaustively.**
+Narrowing fp32 -> fp16/bf16 over **all 2^32 patterns** gives
+`NaN created from a non-NaN: 0` and `NaN destroyed from a NaN: 0` -- `isnan` is preserved
+exactly (as IEEE requires: a narrowing of a finite or infinite value is never NaN, and a
+narrowing of a NaN is always NaN). Combined with the measured seam equivalence:
+
+```
+isnan(our_16bit_out) == isnan(our_fp32_result)      and
+isnan(golden_truncated) == isnan(golden_fp64)
+```
+
+therefore **the 16-bit NaN-position gate IS the fp32 NaN-position gate**. If the fp32 path is
+already closed, the 16-bit path is closed *by reduction* -- not "no failures observed", which is
+what a grid alone buys you. `round-to-Inf` is RNE, not saturation, on both sides: the fp16 edge
+is exactly **65520.0** (65519.99609375 is the largest fp32 kept finite); bf16's is
+**3.39617752923046e38**. Confirmed independently.
+
+**The one residue, and it is cosmetic.** bf16 narrowing canonicalises a NaN payload on device
+(`0x7FFF`) where `torch` truncates the fp32 payload (`0x7FC0`) -- 79.8M element-trials. The gate
+is `torch.isnan`, which cannot see a payload, so it is invisible. fp16 showed **0** payload diffs.
+
+**Also check whether a dtype makes the class unreachable rather than rare.** The overflow
+threshold `sqrt(FLT_MAX/(1-beta2))` is ~5.83e20; a lossless widen means the fp32 operand
+magnitude is *exactly* the stored 16-bit value, so fp16 caps at 65504 and the threshold sits
+**8.9e15x** above it -- unreachable at **every** beta2 (worst case beta2=0 is still 2.8e14x
+above). bf16 shares fp32's 8-bit exponent and reaches it. The empirical contrast on identical
+code is the cleanest confirmation available: the all-max-finite row gave **fp16 0 real failures,
+bf16 217**. A magnitude bound through the actual load path is worth more than any grid.
+
+### A POSITIVE CONTROL WHOSE DETECTOR CANNOT TOLERATE BENIGN NOISE READS AS `DID NOT FIRE`
+
+The bf16 edge probe printed `CONTROL DID NOT FIRE` -- and the injection was there all along.
+The classifier demanded `nbad == 1`, while every bf16 trial carries ~254 benign NaN-payload
+diffs, so the count never equalled 1. Found only by reading the record: the injected slot held
+`dev_bits 0xff81` against `exp_bits 0xff80`.
+
+**The rule: a control's detector must be as tolerant as the GATE it stands in for.** Here the
+gate is `torch.isnan`, which ignores payload, so a bit-exact detector is *stricter than the
+thing it is modelling* and fails on noise the gate does not even see. Classify a control by
+**position and class**, never by a raw count of differing elements -- and when a control does
+not fire, suspect the detector before the injection. That is now twice on this operator: STEP 2m
+has the `error_msg`-level miss that reported 0 of 10,624 real failures.
+
 ## STEP 2j -- ENUMERATE HOST OPS BY WHAT **DISPATCHES**, NOT BY WHAT LOOKS LIKE A CALL
 
 The `561xxx` family is "the runner has no binary for this op". Three confirmed members:
