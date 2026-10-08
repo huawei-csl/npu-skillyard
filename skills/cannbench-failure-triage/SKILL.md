@@ -635,6 +635,84 @@ So when the golden is lossy, restate the verdict as: **winnable only by bit-matc
 operation order; never by being more accurate.** See
 [[use-the-operators-own-golden-convention]] for how the same confusion inverted a 7-arm study.
 
+### A PERTURBATION BELOW THE DTYPE'S ULP IS A NO-OP, AND THE PROBE REPORTS `0` FOR IT
+
+The floor probe perturbs an arm and asks whether the perturbed arm still passes. **If the
+perturbation is smaller than one ulp of the tensor it is applied to, it rounds away and the
+"perturbed" arm is the SAME computation** -- so the probe reports `mere = 0` and a confident
+`RECOVERABLE`.
+
+Measured: a floor arm multiplied the **case-dtype** tensor by `(1 + 2^-23)`. That is one fp32 ulp,
+but at fp16 (ulp `2^-10`) and bf16 (ulp `2^-7`) it rounds back to the identical value. Three
+`RECOVERABLE` verdicts came out of that arm and **all three dissolved** when the probe was re-run at
+a precision where the perturbation survives.
+
+**The guard is one assert, not a convention:** after perturbing, check the perturbed tensor actually
+**differs** from the original (`(a != b).any()`), and record it as a column in the result table. A
+probe that cannot show its own perturbation landed is not evidence. This is the fourth distinct way a
+gate or probe reads clean on a wrong input, after
+[[threshold-arg-is-inert-use-custom-thresholds]],
+[[negative-control-must-not-sit-on-the-boundary]] and
+[[negative-control-must-perturb-the-whole-tensor]].
+
+### THE RIGHT FLOOR FOR A CHAOTIC OPERATOR: PERTURB THE REFERENCE'S **INPUT** BY ONE ULP
+
+Both standard floors fail on a chaotic, lossy-golden operator. Substituting an **exact** arm is
+out-of-family (next section) and substituting the **reference rounded to case dtype** is a tautology
+that returns `0.000`. There is a third construction with neither defect, and it needs **no kernel, no
+device, no oracle**:
+
+> Run the operator's own `golden.py` **against itself**, with one input nudged by a single ulp.
+
+That measures the quantity that actually decides the case -- **how much the reference's own answer
+moves under a perturbation no implementation can avoid** -- and the comparison is in-family by
+construction, because both arms *are* the reference.
+
+Worked example (lstm, `S100 B64 In256 H256` fp32, `a` = the recurrent weight half-range):
+
+| `a` | golden vs golden-with-input-nudged-1-ulp | verdict |
+|---|---|---|
+| 0.1 | MERE 2.2e-06 | PASS |
+| 0.3 | MERE 3.1e-06 | PASS |
+| 0.5 | MARE 5.09 | **FAIL** |
+| 0.85 | 2.25 / 21.5% mismatch | **FAIL** |
+| 1.0 | **8.94 / 37.04% mismatch** | **FAIL** (our kernel there: 8.836 / 37.6%) |
+
+The knee is at `a` ~ 0.3-0.7 and **it moves down with H and S**: at `H1024, S200-512, a=0.5` the
+one-ulp floor is already MERE 5.1-16.1 at 71-81% mismatch -- the exact signature of four hidden cases
+-- with our kernel inside 1% of it.
+
+**A case whose reported error sits at this floor is not winnable by being more accurate, and the
+measurement costs nothing.** Run it before any numerics work, and before pricing an accuracy fix:
+"ours is 1% from the one-ulp floor" retires a fix that "ours is 615x the fp32 epsilon" would have
+funded.
+
+### THE REFERENCE IMPLEMENTATION CAN CHANGE WITH AN ATTRIBUTE -- CHECK WHICH GOLDEN A CASE GETS
+
+"Bit-match the reference's operation order" presumes there is **one** reference. There may not be.
+PyTorch emits, at `aten/src/ATen/native/RNN.cpp:1473`:
+
+```
+UserWarning: LSTM with projections is not supported with oneDNN. Using default implementation.
+```
+
+So `proj_size > 0` cases are scored against the **plain ATen per-timestep loop** and `proj_size == 0`
+cases against **oneDNN's fused RNN** -- two different operation orders, in one operator, selected by
+an attribute. A matching program aimed at the wrong one does nothing.
+
+**Two consequences, both of which bit us:**
+
+- A conclusion established on one branch does not transfer. `|y| <= 2` holds for `proj_size == 0`
+  (`y = o * tanh(c)`), so `max_diff_y` near 2.000 there is a saturated sign disagreement. With
+  projection, `y = W_hr @ (o * tanh(c))` is **unbounded** and the same cases read `max_diff_y`
+  **13.35 / 13.47**. The out-of-range-emission family is cleared only on the non-projection branch.
+- A reference quirk is branch-local. oneDNN suppressing a NaN that IEEE produces
+  ([[onednn-suppresses-nan-that-ieee-produces]]) cannot explain a `proj_size > 0` case, because
+  oneDNN never ran for it.
+
+**Grep the probe logs for dispatch warnings.** They are free, they appear on stderr where nobody
+reads them, and they name which reference the case was actually scored against.
+
 ### THE CONTROL MUST BE IN-FAMILY: fp64 IS NOT A CONTROL FOR AN fp32 KERNEL
 
 **"The control passes and ours fails" is evidence of our defect ONLY when the control shares our
