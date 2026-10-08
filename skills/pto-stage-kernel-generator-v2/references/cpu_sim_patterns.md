@@ -26,7 +26,11 @@ source /usr/local/Ascend/cann/set_env.sh   # -> ASCEND_HOME_PATH (default: cann-
 ```
 
 Key flags:
-- `-xcce` — CCE language mode; auto-defines `__CCE_AICORE__`, `__DAV_C220_VEC__`
+- `-xcce` — CCE language mode; auto-defines `__CCE_AICORE__`
+- **`__DAV_C220_VEC__` / `__DAV_C220_CUBE__` come from the ARCH FLAG, not from `-xcce`.** They are
+  defined at `--cce-aicore-arch=dav-c220*` and are **UNDEFINED at `dav-c310` (A5)**, where only
+  `__DAV_VEC__` / `__DAV_CUBE__` / `__CCE_AICORE__` survive. A kernel guarded on the C220 form
+  compiles to an EMPTY kernel on A5 — cleanly, and it can pass against a zeroed buffer. See **C128**.
 - `--cce-aicore-arch=dav-c220` — target NPU architecture (A2/A3)
 - `-std=gnu++17` — C++17 with GNU extensions (NOT c++20)
 - `-DMEMORY_BASE` — required by PTO memory model

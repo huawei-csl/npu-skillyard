@@ -6651,3 +6651,60 @@ only what has headroom. If the budget is saturated, **a documented residue with 
 alias pair is the correct outcome** — and say so with the arithmetic rather than forcing a conversion.
 C127 remains right that an *undocumented* `PIPE_ALL` is a defect; it is wrong to assume a high share is
 recoverable.
+
+---
+
+### C128: THE `__DAV_C220_*` GUARDS ARE SCOPED TO THE **ARCH FLAG**, NOT TO `-xcce`. ON A5 THEY VANISH AND THE KERNEL COMPILES TO NOTHING.  🔴 **CRITICAL**
+
+**Measured on CANN 9.1.0, by compiling a macro probe at each arch:**
+
+```
+--cce-aicore-arch=dav-c220 : __DAV_C220_CUBE__ __DAV_CUBE__ __DAV_C220_VEC__ __DAV_VEC__ __CCE_AICORE__
+--cce-aicore-arch=dav-c310 :                   __DAV_CUBE__                  __DAV_VEC__ __CCE_AICORE__
+```
+
+`__DAV_C220_VEC__` and `__DAV_C220_CUBE__` come from the **arch flag**, not from the `-xcce` language
+mode. Under `dav-c310` (A5) they are **undefined**, and only the arch-agnostic `__DAV_VEC__` /
+`__DAV_CUBE__` / `__CCE_AICORE__` survive.
+
+**The consequence is the worst failure shape there is.** Our convention puts every Vec intrinsic
+under `#if defined(__DAV_C220_VEC__)` and every Cube intrinsic under `__DAV_C220_CUBE__`. Compiled
+for A5, every one of those blocks is preprocessed away, so the kernel:
+
+1. **compiles cleanly** -- no warning, no error;
+2. links and launches;
+3. writes **nothing** to its outputs;
+4. and if the harness zero-fills the output buffer and the expected answer is near zero, **it can
+   PASS.**
+
+Measured exposure in this project: **57 of our kernels use `__DAV_C220_VEC__` and 34 use
+`__DAV_C220_CUBE__`; none uses the bare arch-agnostic form.** So the entire banked kernel set is
+A5-incompatible in a way no compile step reports.
+
+**The rules:**
+
+- **For a kernel that must build on both arches, guard with `__DAV_VEC__` / `__DAV_CUBE__`** (plus
+  `__CPU_SIM` where the CPU-sim path is needed). Reserve `__DAV_C220_*` for code that is genuinely
+  A2/A3-specific, and when you use it, pair it with an `#else`/`#error` so a new arch cannot silently
+  empty the block.
+- **Any port to a new arch needs a POSITIVE CONTROL that the kernel body executed** -- have each core
+  write a known non-zero sentinel and assert it, before trusting a single numeric result. An
+  all-zeros output is the expected symptom of a dead guard, and "it passed" is not evidence the
+  kernel ran. This is the same class as
+  `[[unwired-lever-retires-the-technique]]`: the object measured was not the code you think you built.
+- **Never attribute a predefined macro to the language mode when it comes from a target flag.** The
+  corrected statement now lives in `BUILD-§` (`cpu_sim_patterns.md`), which previously said `-xcce`
+  "auto-defines `__CCE_AICORE__`, `__DAV_C220_VEC__`" -- true only at `dav-c220`, and the attribution
+  was what made the A5 trap invisible.
+
+**Arch flag -> `__NPU_ARCH__` -> pto-isa macro**, measured, for reference:
+
+| flag | `__NPU_ARCH__` | pto-isa (`common/arch_macro.hpp`) |
+|---|---|---|
+| `dav-c220` | 2201 | `PTO_NPU_ARCH_A2A3` |
+| `dav-c310` | 3510 | `PTO_NPU_ARCH_A5` + `PTO_URMA_SUPPORTED` |
+| `dav-m310` | 3102 | **neither** -- 3102 matches no branch (3101 and 3510 do). Treat a build at
+  this arch as unsupported until proven otherwise; it is a candidate upstream gap. |
+
+So an A5 port is **not** a mechanical retarget: see `A5-§A5InterCore` for the seam API change and
+`COOK-§6.6` for the measured state of `TPUSH`/`TPOP`.
