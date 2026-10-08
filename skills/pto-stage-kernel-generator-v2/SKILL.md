@@ -7131,6 +7131,69 @@ nothing here speaks to cross-core interaction.
 
 ---
 
+### C138: A CHUNK STRIDE DERIVED FROM A **NUMERIC** BOUND MUST STILL BE FORCED TO THE **ALIGNMENT** GRANULE, OR THE VEC INSTRUCTION FAULTS THE CORE  🔴 **CRITICAL**
+
+When a table or tile is built in chunks, the chunk length is often sized by an *arithmetic* limit --
+exactness, overflow headroom, a cost bound. That number has no reason to be a multiple of the
+vector alignment granule, and the moment the chunk base is used as a **vector destination** the core
+faults:
+
+```
+errorStr: The UB address accessed by the VEC instruction is not aligned.
+```
+
+Measured in the shipped `resize_bilinear` fast path: `rb_build_wtab` chose
+`blk = (16000000 - wD) / |wA|` -- the `2^24` fp32-exactness bound of **C135** -- and stepped a 4-byte
+UB array by `blk`. Any `blk % 8 != 0` leaves the destination 32-byte unaligned. Instances were
+predicted analytically and then **5 of 5 faulted deterministically on every lane**
+(`scale_factor` 3.14159 -> blk 76, 2.71828 -> 317, 0.99999 -> 79, 1.00001 -> 78, 0.999999 -> 7).
+
+**Why no visible case saw it:** reachable only through a `scale_factor` path. From `output_size`
+alone `wA = 2W <= 8192`, which makes `blk == cw` (the full chunk) and the stride never lands
+off-granule. A fitted-contract audit on *dimensions* is blind to it -- the trigger is an **attribute**.
+
+The fix is two lines, and the second one matters:
+
+```c
+if (blk < cw) { blk &= ~7; if (blk < 8) blk = 8; }   // snap to the granule
+// and a precondition `lim >= 8`, routing anything smaller to the general path
+```
+
+**So: any chunk length that will index a vector destination gets snapped to the granule, and the
+residue that cannot be snapped gets ROUTED, not clamped.** This is the dual of **C137** -- that rule
+is about the 32-byte granularity of what a UB write *touches*; this one is about the 32-byte
+alignment of *where* it starts.
+
+### C139 (EXTENDS C135): AN INTEGER OVERFLOW IS WORSE THAN WRONG ARITHMETIC WHEN A DOWNSTREAM OPTIMISATION ASSUMES THE SEQUENCE IS **MONOTONE**  🔴 **CRITICAL**
+
+C135 treats a too-narrow index type as a *precision* problem. It is also a **control-flow** problem,
+and that failure mode is louder and lands later.
+
+Measured in the shipped `resize_bilinear` fast path: the H numerator is carried in int32 as
+`g.num = hA*g.i0 + hB`. With a large-numerator `scale_factor` (`hA ~ 2e6`) and `Ho >~ 1075` it
+overflows and the row sequence **stops being monotone**. A contiguous-span tracker downstream had
+`nlo = (lo < 0) ? a0 : lo` -- it never reduces `lo`, because it was written on the assumption that
+rows only advance. Fed a non-monotone sequence it emits a garbage source row, and:
+
+```
+errorStr: The GM address accessed by scalar exceeds 48 bits.
+```
+
+The escalation is size-dependent and therefore easy to mis-triage: at `H = 1024` (no overflow) the
+same configuration returns a **silently wrong answer** (MERE 1.54e-3, 1.16M of 4.19M elements
+mismatched); at `H = 2048 / 4096 / 8192` it **faults 20 of 20**. One defect, two signatures,
+separated only by a shape threshold.
+
+**So when you widen an index type, audit every consumer for an ORDERING invariant, not just for
+range.** A span tracker, a monotone-merge, a "has the row advanced" early-out and a run-length
+coalescer are all silently licensed by monotonicity that an overflow revokes. State the invariant in
+a comment at the consumer, and prefer routing an overflowing shape to an int64 path over widening a
+single variable and hoping the consumers cope.
+
+**Caveat on the evidence, recorded as the agent reported it:** the trigger was characterised and the
+routing fix validated 25 of 25, but **the exact arithmetic path from the wrapped numerator to the
+>48-bit address was NOT isolated.** The effect is measured; the intermediate steps are inferred.
+
 ### C132 (STRENGTHENED): THE `__global__` **DEFINITION** MUST BE UNGUARDED -- ONLY ITS **BODY** GOES INSIDE THE ARCH GUARD
 
 `call_kernel` living outside the device-only guard is **necessary but not sufficient**. Guarding the

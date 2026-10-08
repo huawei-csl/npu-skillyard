@@ -300,7 +300,7 @@ Two legitimate uses, and one illegitimate one:
 
 | signature | class | cause | action |
 |---|---|---|---|
-| `MERE=MARE=0.000000` + `NaN位置不匹配` | **NaN-position gate** (C100) | Control flow expressed as arithmetic: `0*Inf` or `Inf-Inf`. The comparator returned dataclass defaults -- it exited **before measuring**. NOT bit-exactness. | Diff **NaN masks only**, CPU-fp64 golden, over the four distributions the generator emits: `[-inf,inf]`, `[nan,nan]` (~50% NaN), dtype-boundary magnitudes, zeros. Fix with **selects, not multiplies**. |
+| `MERE=MARE=0.000000` + `NaN位置不匹配` | **NaN-position gate** (C100) | Control flow expressed as arithmetic: `0*Inf` or `Inf-Inf`. The comparator returned dataclass defaults -- it exited **before measuring**. NOT bit-exactness. **And NON-FINITE INPUT IS NECESSARY** whenever the op's weights are convex (finite in => finite out), which rules out every finite-data shape in one step -- prove the convexity, then search only the non-finite configs. | Diff **NaN masks only**, CPU-fp64 golden, over the four distributions the generator emits: `[-inf,inf]`, `[nan,nan]` (~50% NaN), dtype-boundary magnitudes, zeros. Fix with **selects, not multiplies**. Recover the reference's tap structure with ONE-HOT INF INJECTION (see STEP 2k). |
 | `MERE=MARE=0.000000` + `bit-exact 比较失败: 1/N 个元素字节不等` | **bit-exact operator** (threshold is `0.000000e+00`) | Representative selection. `-0.0 == +0.0` is true but the bit patterns differ; same for NaN payloads and Inf sign. | Find which element the reference emits among equals, and match its bits. |
 | `相消兜底` / small-value band, `NPU/CPU = N/0` | **absolute-bound band** | Gate is `count_npu / max(count_cpu,1) <= 2`, i.e. **up to 2 offenders are tolerated**. `CPU=0` is the fingerprint: the reference is exactly clean there, so the ratio branch never runs. | Target **count <= 2**, not zero, and not "get MARE down". Fix the **denominator**: more precision (one int8 plane = 127x), or compensated summation. |
 | `normal` band, `ours/cpu = 1/0` | **strict band** | With `normal_cpu_error_count == 0`, **any** non-zero count fails. | Here the target genuinely **is** zero. A case with a *worse* MARE can pass if its CPU count is non-zero -- so MERE/MARE margins do not predict this. |
@@ -510,6 +510,72 @@ launch above 20, and `bd = 8, 10` passed while `bd = 24` faulted on two differen
 
 **And state which part a local result came from.** An A2 20/20 is not evidence about the runner; it is
 evidence that the kernel is correct on 24 cores.
+
+## STEP 2k -- FOUR TECHNIQUES FROM THE `resize_bilinear` RUN, ALL MEASURED
+
+### ONE-HOT INF INJECTION RECOVERS A REFERENCE'S EXACT (INDEX, WEIGHT) STRUCTURE
+
+For any **gather / interpolate / index** operator you can extract which input elements the
+reference touches, and with what weights, **without reading its source**: set one input element to
+`+Inf`, run the reference, and every output position that comes back non-finite is one the tap
+touched with a non-zero weight. Sweep the one-hot position to get the whole map; vary the magnitude
+to get the weights.
+
+On `resize_bilinear` this ran **1936 `(S, T, align_corners, axis)` configurations** and found
+**exactly one** divergence from our kernel's rule -- all 84 mismatching configs had `T == S` -- then
+**75 weight probes** localised a second. It is the cheapest high-confidence oracle in this campaign
+so far, and it beats inferring behaviour from documentation.
+
+What it found there is worth knowing in its own right: **torch's `interpolate` short-circuits any
+axis with `output_size == input_size` to a PURE IDENTITY** (`compute_source_index_and_lambda`'s
+early branch sets `index0 = index1 = t`, `lambda = 0`) and **discards the coordinate map entirely**.
+Invisible on finite data, because `lambda` is 0 either way; on non-finite data
+`0 * neighbour = NaN` where `0 * self` does not. Verified for scale factors 1.0 / 1.00001 / 1.004 /
+1.0009 and both `align_corners`, where the output is **bit-equal to the input**. A fix that only
+corrected `index1` and left `index0` on the real map read **MERE 5.02**.
+
+### A REPORTED ERROR MESSAGE MAY NAME TWO AXES AND BE REACHABLE FROM ONLY ONE -- READ THE `return`
+
+`resize_bilinear`'s rejection message named both a `W <= 4096` cap and an "exactly representable
+rational `scale_factor`" requirement, so the failing cases looked like two classes. Reading the
+**return codes** instead settled it: `rc = -1` is reachable only from
+`if (W > KMAXW || 2*Wq > 2*KINH) return -1;`, and `W <= 4096 => 2*Wq <= 8192 < 14336`, so the second
+clause **cannot fire**. All four cases were `W > 4096` alone, and `rc = -6` (the rational predicate)
+never fired in the hidden run at all.
+
+That turned 4 of 6 conversions from *hoped-for* into **provable**, and it is why the agent lowered
+its own estimate from +3.25 to **+2.50 certain** -- the remaining 2 were a different, unfixed class.
+**Enumerate which `return` statements can produce the observed code before you believe the prose.**
+Cf. STEP 2d-2: an ordered guard names only the FIRST axis, so the message is a lower bound in one
+direction and an over-count in the other.
+
+### A DEVICE FAULT POISONS THE STREAM FOR THE REST OF THE **PROCESS**: EXIT, DO NOT CATCH
+
+A fault-counting harness that catches the exception and continues in the same process records every
+subsequent config as a fault too. Measured: **125 recorded faults de-cascaded to 24 real ones --
+a 5x inflation** -- once the harness called `os._exit()` on the first fault and the sweep ran one
+process per config. Any harness that counts faults, or that runs a battery across a shape sweep,
+**must use one process per case and exit on the first fault.** Otherwise the fault count is a
+function of iteration order. (This is the measurement-side companion to the rule that killing a
+kernel poisons the CARD; here the blast radius is the process.)
+
+### EXPORT A FORCED-FALLBACK ESCAPE HATCH SO A HIDDEN-ONLY BRANCH BECOMES TESTABLE
+
+A new general/fallback path that only out-of-contract shapes reach is, by construction, a branch the
+visible set never exercises -- and an unexercised branch voids the projection (lstm went from a
+projected 80/80 to 29/80, both failures in UNMEASURED paths). The cheap fix is to **export a symbol
+that forces the fallback** (`rb_force_general(1)`, flipped via `ctypes` on the wheel's own `.so`),
+then run the entire battery twice: once with natural routing, once with everything forced down the
+new path. On `resize_bilinear` that gave the **identical 535 ok / 1 FAIL on all 544 shapes** instead
+of evidence on only the 176 that route there naturally. Near-zero cost, and it is the strongest
+available answer to the unexercised-branch problem.
+
+### AND: A `x2.0` WHOLE-TENSOR NEGATIVE CONTROL IS **BLIND** ON ALL-NON-FINITE DATA
+
+`2.0 * Inf == Inf`, so on a shape whose every element is non-finite the negative control is a no-op
+and the row proves nothing. Measured: 10 of 544 rows, all on `[1,2,1,1]` with an Inf generator --
+2 elements, both non-finite. Special-value rows need a **companion** control that changes the
+non-finite STRUCTURE (flip a NaN to a finite value, or an Inf to a NaN), not the magnitude.
 
 ## STEP 2b -- A `MANUAL` VERDICT IS NOT A PASS
 
