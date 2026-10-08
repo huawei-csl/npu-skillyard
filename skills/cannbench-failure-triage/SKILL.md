@@ -724,6 +724,68 @@ ladder.** Then verify no ladder point is under-estimated; one under-estimate is 
 split. An over-permissive gate loses them to a **timeout kill**, which bills the same and tells you
 nothing. When the penalty for being wrong is asymmetric, so is the threshold.
 
+#### THE DECISIVE CORRECTION, MEASURED 2026-10-08: A CONVERTED CASE CAN HAVE **NEGATIVE** VALUE
+
+The paragraph above argues "bias strict" because a kill bills like a refusal. **That reason is far
+too weak.** `unique`'s hidden rerun (`job_6eba55dc71a4`) measured the real one:
+
+| | before (`job_cd91cad814ab`) | after the "fix" |
+|---|---:|---:|
+| accuracy passes | 75/80 | **77/80** -- the fix WORKED |
+| `compile_runtime_fail_cases` | 3 | **1** |
+| `anti_cheat_failed_cases` | 0 | **2** |
+| **operator score** | **60.3626** | **0** |
+
+The two cases the fix converted -- `unique_30` and `unique_76` -- came back
+`status: "success"`, accuracy **passed**, `elapsed_us: 0`, `op_times: {}`, and
+`anti_cheat_invalidated: true`. The operator's verdict:
+
+```
+score_error_code: "cpu_fallback_detected"
+score_error: "api_statistic.csv 检测到 aclrtMemcpy,疑似将计算外包到 CPU,反作弊触发。"
+compilation_score 0, function_score 0, performance_score 0, score 0
+```
+
+**So the over-strict refusal was LOAD-BEARING.** It refused those cases *before any device work*,
+so the host round-trips on that path never executed and the anti-cheat never fired. Admitting them
+executed the wide-span batched path -- which allocates a second workspace and does a second
+`meta.cpu()` read-back -- and tripped `cpu_fallback_detected`, which **zeroes all three score terms
+for all 80 cases**. A +1.25 projection became **-60.36**.
+
+**The rule this forces:**
+
+- **Price a conversion as `min(gain, -(whole operator))`, not as a gain.** Before admitting any
+  previously-refused class, audit the newly-reachable path for host round-trips
+  (`.cpu()`, `.item()`, `.tolist()`, a device `zeros`/`empty` allocation, any per-chunk host loop)
+  and count them against the anti-cheat budget. A path no case has ever executed has never had its
+  round-trips counted.
+- **The anti-cheat is an ALL-OR-NOTHING operator-level verdict**, not a per-case penalty. Two cases
+  out of eighty zeroed seventy-eight passing ones. It is the only failure class where fixing five
+  cases can cost more than leaving them broken.
+- **An over-strict gate can be protecting you from a path's own defects.** Before relaxing one, ask
+  what the refusal was preventing from running -- not just what it was refusing to answer.
+
+#### AND: A CHANGE CONFINED TO CASES YOUR LOCAL HARNESS CANNOT RUN IS **UNMEASURABLE** LOCALLY
+
+The same run had a clean local A/B: 5 interleaved passes, OLD 69.7522 / NEW 69.7355, delta -0.0167 =
+0.30x the control arm's own spread, reported as "noise, not a regression". **That measurement was
+vacuous for this change.** The local evaluator runs only the 20 visible cases; the wide-span path is
+unreachable from any of them. The arms were byte-identical in every line of code that actually
+executed -- the `.so` md5 was *identical by design* and the driver's only changed branch is behind
+`if u == -9`.
+
+So "no local regression" said nothing, and could not have said anything. When a change's whole
+effect lives in cases the local harness cannot execute:
+
+- **State that the local A/B has zero power over it**, instead of reporting it as reassurance. A null
+  result on code that never ran is not evidence of safety.
+- **Drive the new branch directly** with a synthetic harness at the real shapes -- which this run did
+  do, 50 cost-ladder points and 197 battery checks, all bit-exact. That proved *correctness* of the
+  new path and still could not see the anti-cheat, because the battery was not the evaluator.
+- **The only instrument that sees an anti-cheat trip is the evaluator's own profiled window.** If the
+  newly-reachable path cannot be put under it locally, the conversion is unverified, and its
+  downside is the whole operator.
+
 **This generalises to every cost model the pipeline writes** -- tile-size heuristics, a
 chunk-count estimator, a `block_dim` chooser: endpoints are not a fit, and the smallest legal size is
 where the per-unit cost is worst.
