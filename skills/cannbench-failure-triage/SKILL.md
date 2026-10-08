@@ -193,6 +193,74 @@ a zero metric:
 I misread the first as the second on lstm and priced three cases as a cheap NaN-propagation fix. They
 are "we emit a NaN where the reference does not", which is a different and harder defect.
 
+### AND THE TWO READINGS IN THAT TABLE'S SECOND ROW ARE **INDISTINGUISHABLE**. DO NOT GUESS.
+
+The row above offers "genuinely bit-identical, **or** the all-NaN-matched early return" as if the
+payload could separate them. **It cannot**, and I got this wrong on lstm after writing the row.
+Two different early returns emit the same zeros:
+
+| return | what it sets |
+|---|---|
+| **F090 all-NaN/Inf matched** (`compare.py:481-495`) | `mere=0, mare=0, max_diff=0, mean_diff=0, mismatch_count=0, total_count=numel`, bands 0 -- all **hardcoded literals** |
+| **stage-1 fast path** (`compare.py:517-535`) | the same shape, `mere/mare/max_diff` from real data, bands explicitly 0 |
+
+So a bit-identical output and an output that was **entirely NaN on both sides** both read
+`mere=0, mare=0, max_diff=0.0, bands 0`. **`max_diff == 0.0` is not evidence of bit-identity.**
+And the tempting discriminator -- "a genuine comparison populates `normal_total_count`" -- is
+**false**, because the fast path returns before computing it.
+
+**Discriminate STRUCTURALLY, with an invariant of the algorithm.** On lstm: NaN propagates through
+the recurrence, so a NaN in `y` at timestep `t` forces `h_t`, hence `h_S = hn`, to be NaN. Therefore
+"`y` fails the NaN-position gate while `hn`/`cn` pass" is **logically incompatible** with `hn`/`cn`
+being finite and equal -- the only consistent reading is all-NaN on both sides. I had instead
+concluded "the recurrence is proven correct, so the bug is in how `y` is shaped", and briefed a
+search for a degenerate shape. The real cause was nowhere near it.
+
+**The rule: find a relation that ties a PASSING output to the FAILING one, and test the readings
+against it.** Two outputs of the same recurrence are not independent observations.
+
+## STEP 0c-2 -- THE EVALUATOR RUNS MANY CASES PER PROCESS. HOST STATE LEAKS BETWEEN CASES.
+
+`process_pool.py:build_task_units` takes **`isolate_each_case: bool = False`** by default and groups
+cases -- `split_into_chunks(cases, card_count)`, then chunks of up to `max_cases_per_task_unit = 64`.
+Per-case isolation is enabled **only** for PyPTO Pro submissions (`detect_pypto_pro_submission()`).
+For an ordinary CCE wheel on a 2-card runner:
+
+| run | cases per child process |
+|---|---:|
+| standard, 20 cases | **10** |
+| hidden, 80 cases | **40** |
+
+Confirmed in a live runner log (`[eval-child] Card 0: 10 用例开始评测`, with no
+`启用单 case worker 隔离` line).
+
+**So any cached host allocation is cross-case shared state**, and this generates a defect class that
+no single-case test can reach: a case whose inputs contain `NaN`/`Inf` leaves them in a cached
+workspace, and **the next completely clean case of the same shape returns NaN**. Measured on lstm
+62/63/66 -- the cache is keyed by **shape only**, pad rows `[n, alignUp(n,64))` are written over `n`
+but **read** over the aligned extent, and **`0 * NaN == NaN`**, so a zero pad does not neutralise it.
+A "the residue contributes exactly 0" argument holds for **finite data only**.
+
+Reachability is not hypothetical: `value_range: ('nan','nan')` appears **51 times** and
+`('-inf','inf')` **50 times** across the visible case sets of other operators in
+`tasks/level*/*/cases.csv`. Non-finite inputs are the benchmark's own edge convention.
+
+**Two things follow.** Audit every cached or reused host buffer: either key the cache on
+content-affecting state, or re-zero on entry every row no other write path covers. And build the
+repro as an **ordered pair** -- poisoning case, then clean case, same shape, in one process -- because
+a battery that runs each config independently will report the kernel clean.
+
+### SUPPRESSING A NON-FINITE ONLY HELPS WHERE THE REFERENCE STAYS FINITE
+
+An `Inf -> FLT_MAX` NaN-preserving clamp on every Cube operand did exactly what it was designed to do
+(manufactured NaN 24 -> 0, workspaces clean, bit-identical on the visible 20) and **broke 9 configs
+that had been passing**. `_gen_special` fills ~5% at *each* end with `-Inf`/`+Inf`, so the
+**reference's own** dot products also see mixed-sign infinities and produce NaN -- our NaN already
+**matched**, and saturating it converted a match into a mismatch. Net **0 fixed / 9 broken**.
+
+On a zero-tolerance position gate, a non-finite is only worth removing where you have shown the
+reference is finite at that position. Check the reference's value **before** clamping, not after.
+
 ### The small-value band is unreachable when the golden is lossy
 
 `compare.py:586-590`: `small_value_passed = sv_error_count / max(sv_cpu_error_count, 1) <= 2`.

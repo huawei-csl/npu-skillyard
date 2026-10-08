@@ -7194,6 +7194,43 @@ single variable and hoping the consumers cope.
 routing fix validated 25 of 25, but **the exact arithmetic path from the wrapped numerator to the
 >48-bit address was NOT isolated.** The effect is measured; the intermediate steps are inferred.
 
+### C140: A CACHED OR REUSED WORKSPACE MUST RE-ZERO EVERY ROW NO WRITE PATH COVERS, BECAUSE `0 * NaN == NaN`  🔴 **CRITICAL**
+
+A host-side workspace cache keyed on **shape alone** is shared by every call of that shape -- and the
+cann-bench evaluator runs **10 cases per child process on the standard set and 40 on hidden**
+(`build_task_units(isolate_each_case=False)` is the default). So a call whose inputs contain
+`NaN`/`Inf` leaves them in the cache, and **the next completely clean call of the same shape reads
+them back**.
+
+A one-time host zeroing at allocation does **not** save you, because the dangerous rows are the ones
+the kernel writes over the *logical* extent and reads over the *aligned* extent:
+
+```
+written over H rows            read over Hp = alignUp(H, 64) rows
+                               -> rows [H, Hp) hold whatever the LAST call left there
+```
+
+Those pad rows multiply against weight columns that are legitimately zero, and **`0 * NaN == NaN`**,
+so the NaN reaches the output. The usual comment -- *"the residue contributes exactly 0"* -- is true
+**for finite data only**, and that is exactly the kind of claim that survives review.
+
+**The rule.** For every tile a kernel reads over an aligned or padded extent:
+
+1. Enumerate the rows written by each PREP/write site and subtract them from the rows read.
+2. Zero the difference **on entry, once per call**, in byte ranges disjoint from the other sites so
+   it cannot race with them.
+3. Verify the fix is **bit-identical on a clean workspace** (it must be -- those rows are already
+   zero there), and that the control **FAILS first** on an ordered pair (poisoning call, then clean
+   call, same shape, one process).
+
+Cost is bounded by `alignUp(n, 64) - n` rows per unit per call, and is exactly zero when the extent
+is already aligned.
+
+**Corollary, measured and reverted:** do **not** instead clamp the non-finites away on the operand
+side. An `Inf -> FLT_MAX` NaN-preserving clamp removed our manufactured NaN and **broke 9 passing
+configs**, because the reference's own dot products also produce NaN on mixed-sign infinities and our
+NaN was already *matching*. Fix the stale read, not the arithmetic.
+
 ### C132 (STRENGTHENED): THE `__global__` **DEFINITION** MUST BE UNGUARDED -- ONLY ITS **BODY** GOES INSIDE THE ARCH GUARD
 
 `call_kernel` living outside the device-only guard is **necessary but not sufficient**. Guarding the
