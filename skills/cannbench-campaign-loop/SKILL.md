@@ -271,6 +271,40 @@ scale that case's measured noop/memory floor by its own local->remote time ratio
 projected time still sits **above** it (gcd case 15: 96.97 us projected against ~89; case 7: 13.51
 against ~13.4). A ratio that extrapolates through the memory wall is not a ratio.
 
+#### AND A HIDDEN GAIN CANNOT BE SCALED FROM A STANDARD GAIN -- EVEN FOR THE IDENTICAL BINARY
+
+Measured on the same gcd submission, both case sets, same device `.text`:
+
+| | standard 20 | hidden 80 |
+|---|---:|---:|
+| cases the lever fires on | 3 of 20 (15%) | **10 of 80 (12.5%)** |
+| realised gain | **+0.8564** | **+0.2414** |
+
+Nearly the same hit **rate**, a **3.5x** smaller gain. The 10 hidden hits account for +0.2193 of the
++0.2414, so the lever fires exactly as designed -- the hits simply land where a microsecond is cheap.
+Two of the three visible hits were the top-`dPts/us` small cases (+0.29 and +0.41 between them); the
+largest hidden hit moved **710 us for +0.0059 points** because it sits at 10.7 ms where `dPts/us ~= 0`.
+
+**So do not quote a hidden projection as `standard_gain * transfer`.** Project it the same way you
+project anything else: identify which hidden cases the lever's *condition* is true on, and price each
+at that case's own `dPts/us` from the previous hidden run's payload. When you cannot identify them --
+a value condition rather than a shape condition -- say the gain is unpriced rather than scaling the
+standard number.
+
+#### A DARK BRANCH: PRICE IT AS A COIN FLIP, NOT AS A PROJECTION RISK
+
+`GCD_TINY` carried an int64 sub-branch no visible case could reach. The rule
+"[[unexercised-branch-voids-the-projection]]" (lstm's 80/80 became 29/80) argues for a constructed
+test first. The hidden run exercised it on **three int64 cases, all passing**, 80/80, anti_cheat 0.
+
+**The discriminator between the two outcomes:** is the dark branch reached by a **contract** the
+hidden set systematically probes (lstm: a whole dispatch path -- a projection risk, test it first), or
+by a **value condition** that is merely rare (gcd: all magnitudes in `{0,1}` *and* int64 -- a coin
+flip)? And check the downside: because the hidden column keeps the **best** hidden score per operator,
+a worse run cannot displace the banked one, so the exposure is one credit rather than the entry. When
+that is the shape, **the hidden run is a cheaper and better branch test than a local probe** -- it
+exercises the branch with the benchmark's own edge-probing generator instead of a shape you guessed.
+
 #### CORRECTION, measured by shipping it: the time-ratio method holds for **DEVICE** levers only
 
 The gcd candidate shipped on the projection above and posted **84.41289 (+0.85636)** against my
