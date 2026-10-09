@@ -7290,9 +7290,20 @@ the evidence cited did not exist.
   instantiations**, device `.text` 176356 -> 176168, which is the kind of evidence that actually
   settles whether a barrier is live.
 
-  **And pick the section per knob:** a **host-side** knob leaves the device section identical and
-  must be judged on the **host** `.text` (one measured at +624 bytes). A knob reported as
-  "no device change" when it is host-side has not been measured at all.
+  **And pick the section per knob -- but the host section is NOT a reliable instrument.** A
+  **host-side** knob leaves the device section byte-identical, and the obvious next move is to hash
+  the **host** `.text` instead. **CORRECTED 2026-10-09, by two independent agents on the same day:
+  on this toolchain the host `.text` is NOT DETERMINISTIC** -- one measured **3 distinct hashes
+  across 3 builds of identical source at an identical 35,596 bytes**, and another saw host hashes
+  move for arms that changed only device code. The host section embeds build-path-dependent
+  material, so it produces both false positives and false negatives.
+
+  **For a host-side knob, use a BEHAVIOURAL liveness proof instead:** export the thing the knob
+  decides and read it back. One agent dumped the planner's `kernel_plan` through `ctypes` and
+  showed the work-item geometry per case (`[52,49,52,52,49] -> [47,47,43,47,47]` on exactly the 5
+  treated cases, byte-identical on the other 15) -- which is stronger evidence than any hash,
+  because it demonstrates the knob changed the decision rather than merely changing some bytes.
+  Confirm a knob is host-only by showing its **device** `.text` is byte-identical to the control.
 
 **Corollary for triage, not just generation.** When you find a defect class and the source
 already contains a guard that names it, do **not** record it as "already handled". Resolve the

@@ -302,8 +302,15 @@ source-level grep is a census of *text*, and text is not a count of executed ins
 
 **Do NOT hash `.aicore_binary` itself** -- its `.strtab` carries the source filename, so a pure
 **rename** moved the hash by 8 bytes and would be reported as a live code change. Hash the device
-`.text` within it, after confirming the compiler is deterministic for your source. A host-side knob
-leaves the device section identical and must be judged on the **host** `.text` instead.
+`.text` within it, after confirming the compiler is deterministic for your source.
+
+**And do NOT fall back to the host `.text` for a host-side knob.** CORRECTED 2026-10-09 by two
+independent agents: the host section is **not deterministic** on this toolchain -- one measured
+**3 distinct hashes over 3 builds of identical source at an identical 35,596 bytes**, and another
+saw host hashes move for arms that changed only device code, because that section embeds
+build-path-dependent material. Prove a host-side knob by **exporting the decision it makes and
+reading it back** (e.g. dump the planner's per-case geometry through `ctypes`), and confirm it is
+host-only by showing the **device** `.text` is byte-identical to the control.
 
 ---
 
