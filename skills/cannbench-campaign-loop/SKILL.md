@@ -1185,6 +1185,25 @@ Every scan in this campaign that was not controlled was wrong. Six separate bad 
 exposed the last one. And when an agent reports an ISA behaviour or a root cause, probe it before
 writing it into the cookbook -- several such claims have been falsified.
 
+## THE FULL-PASS PROJECTION IS ACCURATE TO ~0.1 -- WHEN THE CONVERTED CASES FAILED ON PRECISION
+
+`projection = 50 + 50*case_score_mean` has now been validated end to end. `grouped_matmul`'s 77/80
+partial carried `case_score_mean` 0.6903051, giving **84.5153**. The fixed kernel's hidden full pass
+delivered **84.6175** -- within **0.10**, and it took #1 of 45 entries.
+
+**But the accuracy of that projection depends on WHY the cases were failing**, and this refines the
+"newly converted cases earn little HAP" rule in the optimizer skill:
+
+| failure class of the converted cases | what to project |
+|---|---|
+| **precision only** (compile already a full 20) | the run's **own `case_score_mean`** -- the cases already ran at full speed and were timed; only the comparator rejected them |
+| **cap / shape rejection** (`compile_runtime_error`) | **discount it** -- the case never ran, so after the fix it executes a path that was never tuned, often a slow fallback |
+
+grouped_matmul's three were all `precision_mismatch` on the small-value band, and
+`case_score_mean` actually **rose** 0.6903051 -> 0.6923509: the converted cases scored slightly
+*above* the mean of the other 77. So for a precision-only conversion, project at the mean and expect
+to land on it; discount only when a rejection is being converted.
+
 ## A CORRECTNESS GAP PRICED OFF A SUPERSEDED PARTIAL IS A PHANTOM
 
 When surveying for "correctness-recoverable" prizes, the tempting arithmetic is
