@@ -913,6 +913,29 @@ and B alone do not multiply to AB, the pairing is leaking. One case read
 `alias_y` alone is a no-op. Single-arm gave 0.791 / 1.000 / 0.791. The non-composition was
 visible for free, with no re-measurement.
 
+## 3.8b ONE OBJECT WITH A RUNTIME FLAG IS THE RIGHT A/B -- BUT PROCESS-GLOBAL STATE LEAKS BETWEEN ARMS
+
+The best way to A/B a kernel change is **one shared object with a runtime flag**, so the two arms are
+provably the same compilation and the C141 "is the lever even live" question cannot arise. Keep doing
+that. It has one failure mode, and it is silent.
+
+**The flag is usually a global in the `.so`, and a harness that constructs both arms' ABIs up front
+sets it twice before either runs. The second write wins for BOTH arms.** Measured on
+`grouped_matmul`: a surface scan built both arms up front and the second arm's setting applied to the
+whole sweep, which nearly produced a false "all tail configurations clean" conclusion on a
+**~50%-reproducible wrong-answer defect**. The arms differed in nothing at all and the scan read as a
+clean bill of health.
+
+**The guard:** set the flag **immediately before each arm runs**, not at construction, and have the
+measured run **read the flag back from inside itself** and emit it with its results. An arm that
+cannot show which configuration it actually ran under is not evidence.
+
+Note how this inverts §3.8's advice. There, separate processes were the fix for a shared *hardware*
+resource. Here, a single process is what makes a shared *software* global dangerous -- so when you
+move to one-object-plus-flag to kill a compilation confound, you take on a state confound, and the
+read-back is what retires it. The general form: **any state that outlives an arm is a confound,
+whether it lives in the cache, the clock or a global.**
+
 ## 3.9 CACHE-BYPASS ALIASES: measure LAST, in the FINAL configuration
 
 Across eleven measured cases the alias trigger mispredicted on every one where it was

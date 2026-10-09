@@ -998,6 +998,36 @@ gate or probe reads clean on a wrong input, after
 [[negative-control-must-not-sit-on-the-boundary]] and
 [[negative-control-must-perturb-the-whole-tensor]].
 
+### AND THE PERTURBATION'S *UNITS* MUST MATCH THE GATE'S BUDGET
+
+The rule above is about a perturbation too small to survive rounding. This is the fifth way, and it
+is nastier because the perturbation lands perfectly and the probe still reads clean: **a
+PROPORTIONAL poison cannot reach an ABSOLUTE-budget gate.**
+
+`compare_tensors`'s small-value band is an **absolute** `2^-16` budget. It does not scale with the
+magnitude of the cell. So on `grouped_matmul`, a whole-tensor multiplicative `x(1 + 1e-3)` poison --
+whole-tensor, well above every ulp, exactly what the preceding rules demand -- **PASSED**, because
+the band cells have `|golden| < 2^-8` and a relative `1e-3` there is only `3.9e-06`, **a quarter of
+the budget.** The poison was a thousandth of the signal and still arithmetically incapable of
+tripping the gate it was standing in for.
+
+Corrected and re-measured on the same cases:
+
+| poison | result |
+|---|---|
+| whole-tensor `x(1 + 1e-3)` (proportional) | **PASSES** -- cannot reach an absolute budget |
+| whole-tensor `+3.05e-05` (additive, 2x the budget) | **FAILS**, 805/814 band cells |
+| whole-tensor `x1.05` | FAILS |
+| whole-tensor `+1e-05` (additive, inside the budget) | **PASSES** -- correctly |
+
+**So the procedure is: read which clause you are standing in for, read whether its budget is
+absolute or relative, and size the poison in THOSE units.** Then run the sub-budget poison too --
+without it you have shown the gate can fail, but not that it discriminates, and a gate that fails
+everything is as useless as one that passes everything.
+
+This generalises past the band. Any gate with a floor term (`max(|ref|, eps)`, an absolute epsilon,
+a fixed-point quantum) has a magnitude regime where proportional perturbations are free.
+
 ### THE RIGHT FLOOR FOR A CHAOTIC OPERATOR: PERTURB THE REFERENCE'S **INPUT** BY ONE ULP
 
 Both standard floors fail on a chaotic, lossy-golden operator. Substituting an **exact** arm is
