@@ -1620,7 +1620,7 @@ dependent-op drain or GM access latency. "Idle" was *waiting*, not *available*.
    redesign would remove. Whatever that measures is an upper bound no implementation can beat, it
    costs two throwaway builds, and a wrong-answer arm needs no correctness battery.
 
-### ABLATE THE WHOLE LOOP, NOT ONLY THE WORK YOUR REDESIGN WOULD REMOVE
+### ABLATION DELTAS DO NOT DECOMPOSE: A SATURATING SCORE IS CONCAVE IN TIME
 
 The rule above prices a **lever**. It does not tell you whether the **target** is inside the loop at
 all, and that is a different question with a different arm. Build both:
@@ -1641,11 +1641,33 @@ optimisation reaches it.** Measured on lstm, clean serial, card 4, spreads <1.5%
 | **empty time loop** | **59.861** | **+6.23** |
 | empty loop + inter-phase seams removed | 63.003 | +9.37 |
 
-The second row retires the whole family: hoisting the input projection, keeping the loop-carried
-state resident, collapsing per-step barriers and batching the gates are all bounded by **+2.50**.
-The third row retires something much larger -- **an infinitely fast recurrence still loses**, so the
-cost is the fixed structure around the loop (prologue, the hoisted contraction, the epilogue, and the
-cross-core seams between them), and only the fourth row clears the target.
+The second row retires one family: hoisting the input projection, keeping the loop-carried state
+resident, collapsing per-step barriers and batching the gates are all bounded by **+2.50**.
+
+**Now the trap, which cost a full follow-up investigation.** Reading row 3 as "an infinitely fast
+recurrence still loses, therefore the prize is OUTSIDE the loop" is **WRONG**, and the follow-up
+measured it wrong by 9x. `HAP = (B-h)/((T-h)+(B-h))` is **concave in T**, so a 9.37-point ablation
+does **not** decompose into "+6.23 recurrence, +3.14 seams". The same microseconds are worth far
+more once `T` is already near the baseline. Measured `dPts/us` on that kernel:
+
+| at | `dPts/us` |
+|---|---|
+| shipped `T` | 0.00000 (largest case) to 0.01193 (smallest), median **0.00080** |
+| `T = 35 us` | **0.01217 - 0.01993**, every case |
+
+**A 15x swing in the value of a microsecond.** So seam removal is worth +3.14 *after* the recurrence
+is free and **+0.42 on the real kernel** -- measured directly, at its physical upper bound, by
+deleting every seam from the real algorithm: **+0.8176** total with the cross-core flags also free,
+of which the seam half is **+0.4227**. An independent projection had put it at +0.32, within 0.1.
+
+**The correct reading of row 3 is "BOTH halves are required and neither alone suffices"**, and the
+loop half (+6.23) is the larger one. The whole-family ceiling, every seam deleted *and* a free Cube
+GEMM *and* the accuracy-critical ops deleted, measured **57.42 -- still 3.08 short.**
+
+**So: price every ablation in `dPts/dT` at THAT ARM'S OWN `T`, never at the control's.** An ablation
+ladder ordered by raw delta ranks levers by how far they move an unreachable arm, not by what they
+are worth where you actually stand. And state a target as a **mean HAP** (60.5 = 0.2100) rather than
+a score, because that is the quantity the per-case budget is linear in.
 
 Two corollaries, both of which were got wrong once before being measured:
 
@@ -1684,3 +1706,39 @@ leaders sit ~7 points above the best fused vendor implementation available on th
 competitor entry does. (Note the caveat that keeps this honest: that vendor column was taken with
 fp32 inputs at every shape rather than the case dtype, which flatters the vendor on the fp16/bf16
 cases -- all of which are large cases with `pts/us ~= 0`, so it does not move the total.)
+
+### COUNT THE INDEPENDENT SLICES AND THE UB HEADROOM BEFORE BRIEFING A PARTITION CHANGE
+
+"Repartition so each core owns a slice and needs no barrier" is the standard answer to a
+synchronisation cost. It is **free to falsify** and usually dead on arrival. Two counts, both from
+`cases.csv` and a `sizeof` audit, before any device time:
+
+1. **Independent slices on the proposed axis, per case, against the core count.** On lstm the
+   proposed axis was batch. Measured: `nchunk = ceil(B/16)` is **1 in 19 of 20 cases** and max batch
+   is 32, so the axis yields **at most 2** slices against `block_num = 24`. "Each core owns a slice"
+   therefore means *one core runs everything and 23 idle*, collapsing a 5-200-way contraction to
+   1-2-way. The repartition is not a win with a sync cost, it is a **catastrophic serialisation**.
+2. **UB headroom if a core must hold its whole slice.** Same kernel: the recurrence arena is
+   `576*H + 12288` B against a 184320 B cap, i.e. **95.6% of UB already at H=256**. Holding the
+   slice **overflows 11 of 20 cases**, by 1.5x to **72x**; the max resident timesteps are 8 at
+   H=64, 3 at H=128 and **0** at H=256 against cases needing 15-200.
+
+And check the **direction of the dependency against the hardware's on-chip paths** before
+specifying "keep it on chip": a Cube-produced operand consumed by Vec has **no on-chip route on
+A2/A3** (C131 -- the Cube/Vec FIFO is GM-staged; the direct path is A5-only), so a brief that says
+"no GM transit" is specifying something physically impossible, not something ambitious.
+
+**Also: name the dependency CLASS per seam, not just its existence.** Each of that kernel's four
+seams resolved to a genuine **all-to-all** (a consumer block reads rows written by many producer
+lanes on many blocks). An all-to-all is removable *only* by making every consumer's owner also be
+its producer -- i.e. by collapsing every phase onto the slowest partition, which is count 1 again.
+A per-block producer/consumer pairing can be replaced by a directional flag; an all-to-all cannot.
+
+**Worth banking from the same measurement, since it prices the lever generally:** a
+`SYNCALL<Mix>` on A2/A3 is `pipe_barrier(PIPE_ALL)` plus a **four-stage chained** cross-core
+handshake (AIV broadcast -> AIC wait -> AIC all-gather -> AIC wait -> AIC broadcast -> AIV wait),
+measured at **1.69-2.30 us** each on cases too small for any phase to hide it. On large cases the
+ablation delta is **not** barrier cost at all but the **lost Vec/Cube overlap** the barrier forbids
+(297 us over 3 barriers = 99 us each, which is PREP(Vec) no longer being serialised against
+IPROJ(Cube)). Two different mechanisms behind one number; separate them before quoting a per-barrier
+cost, and note the large one lands on exactly the cases whose `dPts/us` is ~0.
