@@ -1742,3 +1742,50 @@ ablation delta is **not** barrier cost at all but the **lost Vec/Cube overlap** 
 (297 us over 3 barriers = 99 us each, which is PREP(Vec) no longer being serialised against
 IPROJ(Cube)). Two different mechanisms behind one number; separate them before quoting a per-barrier
 cost, and note the large one lands on exactly the cases whose `dPts/us` is ~0.
+
+### A WRONG-ANSWER ARM CAN BENCHMARK FASTER, BECAUSE THE MISSING SYNC *IS* THE WIN
+
+The most dangerous measurement in this skill. **Skipping a required wait is indistinguishable from
+an optimisation, and it measures as a clean, replicable gain.**
+
+Measured on `dequant_swiglu_quant`: a first double-buffer attempt put the slot-drain `wait_flag`
+*after* the `TCVT` that fills the slot. It **failed 6 of 20 cases** (every `nch >= 3`) and measured
+**+0.314 points faster**. Fixed -- wait moved before the quantise -- it is 20/20 on 3 seeds and
+genuinely faster (+0.393 on the 10 multi-chunk cases). The broken arm's number was *in the same
+direction and the same magnitude* as the real one.
+
+**So the correctness gate runs BEFORE the number is believed, not after it is reported.** An arm
+that has not passed the full case set has produced no performance information at all. This is the
+inverse of the ablation rule: a *deliberately* wrong arm is a legitimate upper bound, but a
+*accidentally* wrong arm is a fabricated win, and the two look identical in a timing table.
+
+Corollary, same kernel: a **clean compile is not legality**. `-DDSQ_R0_R=37` passed the UB-budget
+`static_assert` and failed exactly the 3 cases using that regime, because `kRcol = 32` is the static
+row count of every per-row scalar tile and nothing checked `kR <= kRcol` -- so a `TLOAD` overflowed
+one UB region into the next. The compiler endorsed a configuration derived from correct UB
+arithmetic. The fix is a `static_assert(kR <= kRcol, ...)`: **when you add a tuning knob, add the
+assert that bounds it against every static tile it indexes**, or the knob's domain is unchecked.
+
+### UB ADDRESS LAYOUT IS ITSELF A TUNING AXIS
+
+Two arms with **identical logic** and a **128-byte difference in where one small buffer sits**
+measured **+0.040 vs +0.458 points** -- the placement was worth ~0.42 points, about 1.6%. Inserting
+the new slot right after an existing buffer shifted every later region, including a large resident
+tile, by 128 bytes and gave up essentially the whole win; placing it past the end of the map kept it.
+
+**So when you add a UB buffer, append it rather than inserting it**, and treat the address map as
+something to sweep rather than something derived. On a kernel whose win is already measured in
+tenths of a point, this axis is the same size as the lever you came for.
+
+### A `*_ON` FLAG IN A RUNTIME `if` IS STILL INSTANTIATED -- AND CONSTRAINS EVERYTHING ELSE
+
+`else if (DSQ_R6_ON && ...)` is a **runtime** condition, so a documented "switched off by the source
+default, not emitted" was **false in both halves**: the shipped binary carried **21** body
+instantiations, **6 of them the supposedly-absent regime**, unreachable at runtime -- and that dead
+regime's own UB `static_assert` **constrained the tiling of every other regime**. Converting the
+flags to preprocessor gates removed it and shrank device `.text` by **14%** (176356 -> 151492),
+measured at **0.000 points**: hygiene, not performance, but it unblocked the ladders that mattered.
+
+**Two mechanical notes:** count the right symbol -- `_Z10launch_dsq` counts 124-byte thunks and is
+useless; count the body symbol. And an in-tree doc comment about what is emitted is a **claim**,
+not evidence; this run falsified two of them plus a `CMakeLists.txt` that stated the wrong default.

@@ -7275,8 +7275,24 @@ the evidence cited did not exist.
   unconditional (clamp, or return a documented error) rather than fall through. A detection
   whose only effect is setting a bit that nothing reads is strictly worse than no detection: it
   makes the hazard look handled.
-- A source-level census of `#if`-guarded text is a census of **TEXT**. Confirm two builds'
-  `.aicore_binary` sections differ in size or bytes before believing a toggle does anything.
+- A source-level census of `#if`-guarded text is a census of **TEXT**. Confirm two builds differ in
+  the **device code** before believing a toggle does anything -- but hash the RIGHT thing:
+
+  **CORRECTION (2026-10-09): the `.aicore_binary` hash is the WRONG metric and it produces false
+  positives.** It moved **8 bytes** when a source file was merely **renamed** (`k_a0_control.cpp` ->
+  `k_bar.cpp`, 7 characters), because `.strtab` inside the section carries the filename. An agent
+  following the old instruction would have reported a pure rename as a live code change.
+
+  **The correct metric is the device `.text` INSIDE `.aicore_binary`.** By that metric a whole knob
+  refactor was provably byte-identical to the shipped kernel. Verify compiler determinism first
+  (same source -> identical `.text` over 3 builds), then diff `.text` per symbol -- removing one
+  `pipe_barrier(PIPE_ALL)` showed up as **12 bytes (3 instructions) removed from most of 21
+  instantiations**, device `.text` 176356 -> 176168, which is the kind of evidence that actually
+  settles whether a barrier is live.
+
+  **And pick the section per knob:** a **host-side** knob leaves the device section identical and
+  must be judged on the **host** `.text` (one measured at +624 bytes). A knob reported as
+  "no device change" when it is host-side has not been measured at all.
 
 **Corollary for triage, not just generation.** When you find a defect class and the source
 already contains a guard that names it, do **not** record it as "already handled". Resolve the

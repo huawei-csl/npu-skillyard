@@ -296,9 +296,14 @@ only reserving memory and a local A/B over a branch no visible case reaches: a n
 informative once the treatment is known to reach the executing code.
 
 **The check, before pricing any deletion ablation:** resolve the enclosing `#if` chain for every
-site, grep the build files for the macro's actual value, and -- decisive -- confirm the two
-`.aicore_binary` sections **differ**. Identical sections mean you measured noise. A source-level
-grep is a census of *text*, and text is not a count of executed instructions.
+site, grep the build files for the macro's actual value, and -- decisive -- confirm the two builds'
+**device `.text` inside `.aicore_binary`** differ. Identical device code means you measured noise. A
+source-level grep is a census of *text*, and text is not a count of executed instructions.
+
+**Do NOT hash `.aicore_binary` itself** -- its `.strtab` carries the source filename, so a pure
+**rename** moved the hash by 8 bytes and would be reported as a live code change. Hash the device
+`.text` within it, after confirming the compiler is deterministic for your source. A host-side knob
+leaves the device section identical and must be judged on the **host** `.text` instead.
 
 ---
 
