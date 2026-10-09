@@ -1184,3 +1184,54 @@ Every scan in this campaign that was not controlled was wrong. Six separate bad 
 **Run a positive control on a known-bad case before believing any scan returned zero.** That is what
 exposed the last one. And when an agent reports an ISA behaviour or a root cause, probe it before
 writing it into the cookbook -- several such claims have been falsified.
+
+## A CORRECTNESS GAP PRICED OFF A SUPERSEDED PARTIAL IS A PHANTOM
+
+When surveying for "correctness-recoverable" prizes, the tempting arithmetic is
+
+```
+gain = (arithmetic full-pass ceiling of the kernel that produced the partial) - (partial's posted score)
+```
+
+**That number is meaningless if the operator's best hidden run is now a FULL PASS.** The prize was
+already collected; you are subtracting a current score from a *superseded* kernel's ceiling.
+
+Measured, `weight_quant_batch_matmul`: a survey priced it at **+5.83**, from a recorded control
+ceiling of 76.58 minus a 2026-09-29 partial's 70.7754. But the very next day
+`job_dbbef1bd4ed4` **succeeded at 80/80, 72.1974** -- and the operator is absent from
+`hidden_partials.json` for exactly that reason. **There was no partial left to recover and the
+correctness prize was ZERO.** An agent spent a session establishing that.
+
+Worse, the ceiling it was priced against was computed on the **pre-fix, wrong-answer**
+configuration, and the fix that converts those cases is **not free**: `WQ_PLANES 2->3` +
+`WQ_RADIX 127->254` costs **-2.218 points** (exact permutation p=0.0286, complete separation), and
+the re-association a further -0.2..-0.35. So `76.58 - 2.22 - 0.3 ~= 74.1`, the session projected
+74.58, and it **delivered 72.1974**. A second clean instance of accuracy being anti-correlated with
+score, and another case where deltas do not decompose because the score saturates.
+
+**The gate, and it is free:** before pricing any correctness gap, check whether the operator's best
+hidden run already passed. `hidden_best_per_op.tsv` / absence from `hidden_partials.json` answers it.
+If the best run is a full pass, the correctness column is **closed** and the only remaining prize is
+performance.
+
+## VERIFY THE TREE IS THE CONFIGURATION THAT EARNED THE BANKED ENTRY
+
+A submission tree is a working directory, and sessions leave candidates in it. **Check the shipped
+source's hash against the recorded shipped identity before packaging anything.**
+
+Measured: `weight_quant_batch_matmul`'s tree held sha1 `d0ee8d0e` -- the unsubmitted **a03** tiling
+variant -- while the recorded shipped identity was `b00ecc68`. a03 had never been through the hidden
+set. **The next person to package that operator would have shipped it silently**, with no step in
+the normal flow catching it, because the packaging audit checks *file extensions*, not *identity*.
+
+Why it matters even for a "pure tiling" change: **a tile change is a summation-order change.**
+Hidden cases whose M or N selects a different tile round differently -- 2 of 20 visible cases moved,
+so ~8 of 80 edge-probing hidden cases would -- and that operator had two cases sitting at only
+**1.2x** headroom on the comparator's stage-1 fast path. A banked full pass is guaranteed **only for
+the configuration that earned it** (band totals pin a CONFIGURATION, never an IMPLEMENTATION).
+
+**So:** record the shipped sha1 with every banked entry, diff it before packaging, and keep rejected
+candidates in a `variants/` directory *outside* the build path rather than in place. If a candidate
+is worth shipping, that is a priced decision with its own credits -- a03's was +0.704 local
+projecting to ~72.90 against a live 72.20, i.e. inside the coin-flip band and not worth risking a
+22-point full pass.
