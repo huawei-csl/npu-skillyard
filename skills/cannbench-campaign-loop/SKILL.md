@@ -240,6 +240,49 @@ per-case claim below ~10% on an unchanged path is reliable -- use the aggregate.
 process table reads EMPTY under concurrency**: test for the literal `No process in device` sentinel,
 never a process-line count, or a contended card reads as free.
 
+### DO NOT BORROW A TRANSFER RATIO. THE BANKED JOB'S PAYLOAD MAKES IT A MEASUREMENT.
+
+A local gain has to be converted to board points before it can be priced against a credit, and the
+tempting shortcut is to multiply by a transfer ratio measured on **another operator**. That ratio is a
+**score** ratio and it does not transfer. Done on `gcd`, borrowing gru's 0.73-0.90x, it **under-quoted
+the candidate by ~25%** and nearly argued away a shippable change.
+
+`get_job(<the banked job>)` is free, costs no credit, and carries per-case **`elapsed_us`,
+`baseline_perf_us` and `t_hw_us`** for every remote case. The procedure:
+
+1. Re-sum `50 + 50*mean(hap)` over the remote payload and **check it reproduces the posted score**
+   (gcd: 83.5565 to four decimals). If it does not, you have the wrong job or the wrong case set.
+2. Apply the candidate's measured per-case **TIME RATIOS** -- not its score delta -- to the **remote**
+   `elapsed_us`, and re-sum. A time ratio is a property of the kernel; it transfers.
+3. Bracket it by running the unnamed cases at both edges of their measured band.
+
+| | |
+|---|---:|
+| gcd local gain | +0.970 |
+| remote projection, optimistic / central / pessimistic | **+1.0088 / +0.9811 / +0.9537** |
+
+**~1:1.** And the thing that made the borrowed ratio look necessary -- the identical binary scoring
+**86.25 local vs 83.5565 remote** -- is an **anchor-table** artifact (we hold `910b2.json` and
+`950pr.json`, never a 910c table). An anchor offset says nothing about sensitivity, so do not read one
+as evidence that local gains shrink remotely.
+
+**One check that keeps the projection honest.** For the two or three cases carrying most of the gain,
+scale that case's measured noop/memory floor by its own local->remote time ratio and confirm the
+projected time still sits **above** it (gcd case 15: 96.97 us projected against ~89; case 7: 13.51
+against ~13.4). A ratio that extrapolates through the memory wall is not a ratio.
+
+### COUNT THE CREDITS AGAINST THE **POSTED** ENTRY, NOT THE OPERATOR'S BEST RUN
+
+"A hidden run costs two credits" is true and is **not** the cost of improving an entry. The entry is
+the best **fully-passing** run, standard or hidden, so when the posted entry is the **standard** one a
+single standard run posts the improvement by itself -- **one credit.**
+
+`gcd`'s posted entry is a standard 83.5565; its hidden run is a clean 80/80 but scores **81.9515**,
+*below* it, and therefore contributes nothing to the solution column. The agent quoted two credits for
+a one-credit move. **Read which case set the live entry came from before quoting a price**, and
+remember that re-running hidden to refresh a column that is already dominated by the standard entry
+buys nothing.
+
 ### `t_hw` IS A CLOSED-FORM FORMULA. RECOVER IT AND THE HAP CEILING FALLS OUT FOR FREE.
 
 `t_hw` is not a measurement. On a memory-bound elementwise operator it is
