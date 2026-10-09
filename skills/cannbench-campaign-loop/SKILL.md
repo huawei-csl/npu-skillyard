@@ -271,6 +271,46 @@ scale that case's measured noop/memory floor by its own local->remote time ratio
 projected time still sits **above** it (gcd case 15: 96.97 us projected against ~89; case 7: 13.51
 against ~13.4). A ratio that extrapolates through the memory wall is not a ratio.
 
+#### CORRECTION, measured by shipping it: the time-ratio method holds for **DEVICE** levers only
+
+The gcd candidate shipped on the projection above and posted **84.41289 (+0.85636)** against my
+central **+0.9811** -- over-quoted by 0.125, **below even the pessimistic edge**, at a realised
+transfer of **0.882x**, which is the TOP of the borrowed 0.73-0.90 band the procedure was meant to
+replace. The per-case payload decomposes the miss exactly, and the split is the lesson:
+
+| lever | kind | predicted dPts | **realised dPts** |
+|---|---|---:|---:|
+| `GCD_TINY` -- a value fast path collapsing the Stein loop to one `vmax` | **device** | +0.813 | **+0.8601** |
+| `GCD_BALANCE_ALL` -- rebalances tile count against the core count | **host-only** | +0.172 | **+0.0034** |
+
+Predicted vs actual time ratios: case 15 **0.622 -> 0.6239**, case 7 **0.711 -> 0.6937**, case 14
+**0.852 -> 0.8207** (the device lever transferred to within 6% and over-delivered) against case 16
+**0.855 -> 0.9975**, case 12 0.959 -> 0.9966, case 2 0.974 -> 0.9984, case 18 0.975 -> 1.0028 (the
+host lever did **nothing**).
+
+**The mechanism, and it is counter-intuitive: C66 compliance is what destroys the transfer.** The
+device lever's speedup is arithmetic, hence a property of the kernel. The host lever's gain is
+**computed from a queried hardware parameter** -- `kernel_vector_cores()` reads
+`aclrtGetDeviceResLimit(ACL_RT_DEV_VECTOR_CORE)` with a 48 fallback. The local box reports a count
+that makes the target case's 199 tiles "5 rounds for 4.15 rounds of work"; the remote reports a
+different count, so the imbalance the lever removes is not there to remove. The device `.text` is
+byte-identical across the two and **the query is correct** -- it is the *benefit* that was fitted to
+the local core count, not the code. A correctly portable kernel can therefore carry a win that
+exists only on the box it was measured on.
+
+**So split the projection by lever kind:**
+
+1. **Device-side lever** (arithmetic, fewer instructions, a fast path, better tiling *within* a
+   fixed core count): project by the per-case time ratio. Expect +/-6%.
+2. **Host-side lever whose gain depends on a queried parameter** (core count, memory limit, device
+   topology, block_dim derived from any of them): **project ZERO** unless you have confirmed the
+   parameter is equal on both sides. You cannot confirm it from the local box -- `get_job`'s
+   `setup_info.environment` names the chip, and the per-case `elapsed_us` of a prior run is the only
+   remote evidence you have.
+
+Splitting gcd that way gives +0.81 -- 0.05 low instead of 0.12 high. **State both halves separately
+in the quote**, so the part that may evaporate is visible before the credit is spent.
+
 ### COUNT THE CREDITS AGAINST THE **POSTED** ENTRY, NOT THE OPERATOR'S BEST RUN
 
 "A hidden run costs two credits" is true and is **not** the cost of improving an entry. The entry is
