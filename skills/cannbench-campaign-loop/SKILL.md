@@ -665,6 +665,48 @@ exactly the one nobody measures.**
 
 ---
 
+### THE BOARD IS THE CEILING TEST FOR **PERFORMANCE** TOO, NOT JUST ACCURACY
+
+The `roi_align` lesson above -- *do not conclude "unreachable" from "we also fail"* -- has a
+performance twin, and it cost more. Before recording any **structure-limited** or
+**at-the-floor** verdict, read the top entries' `case_score_mean` and invert the operator's HAP
+form to get their runtime. A competitor 3x faster at the **same pass count** means the verdict is
+about *our* structure and nothing else.
+
+**Worked failure, 2026-10-09 -- `lstm`.** Our own measurements said serialisation-bound and sitting
+at the floor of the structure: the `block_dim` sweep fit **90-94% serial**, a fixed **7.9 us/step**
+with 75-96% idle, and an ablation capped a redesign at **+1.030** against a modelled +4.75. Recorded
+verdict: vec-resident NO-GO. Then the board:
+
+| entry | score | `case_score_mean` | `avg_speedup` | implied T |
+|---|---:|---:|---:|---:|
+| SLAI_8 | **61.1405** | 0.2228 | 0.3704 | **~32 us** |
+| SLAI | 60.9685 | 0.2194 | 0.3605 | ~33 us |
+| SLAI_5 | 60.6023 | 0.2120 | 0.3530 | ~34 us |
+| m0_73877465 | 60.4453 | 0.2089 | 0.3390 | ~35 us |
+| **ours** | **53.7597** | **0.0752** | **0.0933** | **~112 us** |
+
+All five are **20/20**, so the entire **7.38-point** gap is the performance term. Implied runtimes
+come from inverting lstm's floor-case `HAP = 9/(T+8)`. **Four independent teams at the same plateau
+is a demonstration, not an outlier.** Every measurement we took of our own kernel was correct; the
+inference that the floor we hit was the *problem's* floor was not.
+
+**The checks, all free:**
+
+- `get_operator_rank` on any terminal job, and read `top3` + `personal_best` **together**. A
+  `case_score_mean` beside ours at an equal pass count is a direct ratio of runtimes, with the
+  baseline cancelling out.
+- Invert the HAP form for their `case_score_mean` and compare the implied runtime against your
+  **measured** floor. If their time is below the floor you recorded, the floor is a property of
+  your schedule, not of the operator.
+- **Re-read your own `RESULTS.json` before pricing a redesign.** It already carried
+  `best_A3 = 58.36, their_speedup = 0.251, gap = -4.09` for lstm; nobody looked, and the redesign
+  was priced against a model instead. The gap is now -7.38.
+- Separate the two boards before saying "frozen". A **hidden** ceiling below the posted entry
+  freezes what *hidden* can do; it says nothing about the entry, which a faster kernel improves
+  directly. Conflating them retires live headroom -- see
+  "There are TWO boards" above.
+
 ### Score it locally first
 
 Use cann-bench's own evaluator, never a hand-rolled gate:
