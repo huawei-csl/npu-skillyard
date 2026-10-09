@@ -1483,3 +1483,69 @@ so the next session does not re-derive an uncollectable delta.
 4. **Every number with its control**, and every unmeasured thing labelled UNMEASURED (remote cost
    always is: the local->remote gap has run 1.35 to 7.5 points).
 5. **The verdict**: close it, fix-but-never-send, or permanently unspendable -- with the evidence.
+
+## A RACE'S RATE IS A PROPERTY OF THE WHOLE BINARY -- AN UNRELATED FIX CAN MAKE IT CERTAIN
+
+A flaky wrong-answer defect has a *rate*, and that rate is not a property of the defect alone. **An
+unrelated change elsewhere in the kernel can move it, including all the way to 100%.**
+
+Measured on `grouped_matmul`, same hazard, two sources:
+
+| source | BAD fraction on an exposed shape |
+|---|---|
+| shipped object | ~88% (14/20, two processes) |
+| **+ an unrelated split-K accumulation fix** | **120/120 -- certain** |
+
+So shipping the split-K fix *alone* -- validated, bit-identical on all 20 visible cases, a genuine
++6 in projection -- would have converted an ~88%-flaky failure into a **deterministic** one on every
+exposed shape. **Strictly worse than the unfixed object**, and nothing in its own validation could
+have shown it, because no visible case is in the exposed class.
+
+**The rule: when two fixes land on one operator, measure each defect's rate under BOTH, not just
+under the source it was found on.** A known flaky defect is a gate on every *other* change to the
+same kernel until it is closed. And a fix whose own regression bar is "bit-identical on the visible
+set" has said nothing about a class the visible set does not contain.
+
+## PIN THE SCHEDULE BEFORE CALLING A CONFIGURATION UNEXPOSED
+
+A "this config is safe" probe is worthless if the config silently changed the schedule. The cost
+model picks tile widths from the shape, so varying the shape to test a hypothesis **also moves the
+tiling**, and a clean read can be the new tiling rather than safety.
+
+Measured: a first pass reported `K=1920: 0/10` and `K=1024: 0/6` and concluded the trigger needed a
+ragged final k-step. Both were artifacts of `ntile` switching 64 -> 128. **At a pinned `nt=64`,
+`K=1920` is BAD and `K=1024` is 20/20 BAD** -- so the ragged-k hypothesis was false and the real
+trigger is independent of K entirely.
+
+**Pin every schedule parameter you are not deliberately varying**, and report the pinned values
+beside each negative. Related: a **low-rate** schedule is not safety either -- one negative
+(`M=1026`) was a schedule where the hazardous transition lands rarely, not one where it cannot.
+
+## `block_dim` IS A FREE STRUCTURAL PROBE FOR A SCHEDULE-DEPENDENT HAZARD
+
+When a defect depends on *which work items share a core*, `block_dim` reorders that assignment with
+**no code change at all**. Enumerate the dispatch by hand, predict which `block_dim` values put the
+suspect transition on some core, then measure. Agreement is a structural proof.
+
+Measured, 6 of 6 agreement, 12 runs each:
+
+| `block_dim` | transition present (predicted) | BAD |
+|---|---|---|
+| 1 / 8 / 12 / 24 | yes | 11/12, 8/12, 8/12, 1/12 |
+| **9 / 18** | **no -- falls on a core boundary** | **0/12, 0/12** |
+
+This also gives you a **high-rate detector**: `block_dim=1` forced the rate from ~70% to 25-28/30,
+which is what makes a 30-run verdict affordable. Note this is a different use of the knob from the
+serial-fraction fit -- here it is varying *assignment*, not *parallelism*.
+
+## A HIGH MATCH RATE IN A LARGE VALUE SPACE IS A COINCIDENCE, NOT A MECHANISM
+
+A tempting diagnosis for a wrong answer is "the bad value is a *correct* value from somewhere else",
+which would name a stale buffer or an aliased read. It was tested here and **discarded as a matcher
+artifact**: 126 of 128 wrong elements matched some value elsewhere in the tensor -- but with ~522k
+candidate values spanning a range of ~90, **every** value matches something by chance, and the
+recovered source indices were scattered rather than forming a stride or an offset.
+
+**The test is not the hit rate, it is whether the recovered mapping has STRUCTURE** -- a constant
+offset, a consistent stride, a single contiguous block. Inspect the mapping. A hit rate alone, in a
+space this large, has no power at all.
