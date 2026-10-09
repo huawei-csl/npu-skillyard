@@ -1596,3 +1596,68 @@ dependent-op drain or GM access latency. "Idle" was *waiting*, not *available*.
 3. **Then price the lever by ABLATION, not by model**: build an arm that simply deletes the work the
    redesign would remove. Whatever that measures is an upper bound no implementation can beat, it
    costs two throwaway builds, and a wrong-answer arm needs no correctness battery.
+
+### ABLATE THE WHOLE LOOP, NOT ONLY THE WORK YOUR REDESIGN WOULD REMOVE
+
+The rule above prices a **lever**. It does not tell you whether the **target** is inside the loop at
+all, and that is a different question with a different arm. Build both:
+
+| arm | contents | what it bounds |
+|---|---|---|
+| **family ceiling** | delete exactly the work the redesign removes | no implementation of that redesign beats this |
+| **empty loop** | delete the *entire* loop body, keep the prologue, epilogue and seams | **everything inside the loop, forever** |
+
+**If the empty-loop arm still misses the target, the prize is not in the loop and no amount of loop
+optimisation reaches it.** Measured on lstm, clean serial, card 4, spreads <1.5%, against a target of
+60.5 set by four competitors at 60.45-61.14:
+
+| arm | score | delta |
+|---|---:|---:|
+| shipped | 53.633 | -- |
+| family ceiling (free recurrent GEMM, no cross-core flags, no GM traffic) | 56.134 | +2.50 |
+| **empty time loop** | **59.861** | **+6.23** |
+| empty loop + inter-phase seams removed | 63.003 | +9.37 |
+
+The second row retires the whole family: hoisting the input projection, keeping the loop-carried
+state resident, collapsing per-step barriers and batching the gates are all bounded by **+2.50**.
+The third row retires something much larger -- **an infinitely fast recurrence still loses**, so the
+cost is the fixed structure around the loop (prologue, the hoisted contraction, the epilogue, and the
+cross-core seams between them), and only the fourth row clears the target.
+
+Two corollaries, both of which were got wrong once before being measured:
+
+1. **An op count is not a cost.** Deleting **75% of the vector instructions** in that loop bought
+   only **1.35x** (77 -> 19 ops, 53.611 -> 54.596). Implied ~51 cycles/op against the ~130 the
+   flat-per-iteration figure suggests, i.e. **~60% of the step was never Vec math** -- it was
+   per-step cross-core flag ops (15%), GM transit (22%) and empty-loop residue (22%: three
+   `PIPE_ALL`, two intra-core flag pairs, the loop scalar).
+2. **An ablation delta is not additive with the control, so convert it to marginal value on the real
+   kernel before quoting it.** Those seams are 4-5 us absolute on the small cases where the points
+   live and 60-190 us on cases whose `pts/us` is ~0; projecting their *absolute* saving onto the
+   shipped kernel gives **+0.32**, not +9.37. But that projection answers "delete the barriers",
+   where the phases then race -- it does **not** answer "restructure so there is nothing to
+   synchronise". **Name the legal restructure that achieves the same removal before you price an
+   ablation as unreachable**, and price it as unreachable only if no such restructure exists.
+
+### THE VENDOR'S FUSED OP IS NOT THE CEILING EITHER
+
+[[baseline-ceiling-test-not-cap-provenance]] says the board is the ceiling test. The vendor's own
+fused operator is a *second* tempting proxy and it is just as wrong, in the same direction.
+
+Measured, lstm, profiled across all 20 case shapes through the benchmark's own harness
+(`torch.nn.LSTM` -> `DynamicRNN`; the run README's "the vendor op cannot initialise" is **stale**, it
+runs on this box now):
+
+| | score |
+|---|---:|
+| ours | 53.633 |
+| **Huawei's fused `DynamicRNN`** | **53.320** |
+| per-case oracle (best of the two) | 53.871 |
+| board leader | 61.141 |
+
+**We already beat the vendor's fused RNN on 6 of the 7 cases carrying 87% of the points**, and the
+leaders sit ~7 points above the best fused vendor implementation available on the hardware. So
+"the vendor is no faster than us" and "the vendor fails this gate too" bound **nothing**. Only a
+competitor entry does. (Note the caveat that keeps this honest: that vendor column was taken with
+fp32 inputs at every shape rather than the case dtype, which flatters the vendor on the fp16/bf16
+cases -- all of which are large cases with `pts/us ~= 0`, so it does not move the total.)
