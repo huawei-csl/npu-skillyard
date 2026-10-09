@@ -1684,6 +1684,77 @@ Two corollaries, both of which were got wrong once before being measured:
    synchronise". **Name the legal restructure that achieves the same removal before you price an
    ablation as unreachable**, and price it as unreachable only if no such restructure exists.
 
+### CLASSIFY THE LEVER BEFORE YOU CHOOSE THE CASE: A `dPts/us` TABLE PRICES **FIXED-COST** LEVERS ONLY
+
+The rule above ("price at that arm's own `T`") has an operational consequence I got wrong on a second
+operator before measuring it. **When every case sits at a similar HAP, the `dPts/us` ranking does not
+select a work target at all.** Measured on `quant_matmul`, whose 20 cases all sit at **HAP 0.36-0.62**:
+
+| lever shape | how it prices | measured |
+|---|---|---|
+| **relative** -- a faster inner loop, a better tile, less traffic | **flat across every case.** A 20% cut of `(T - t_hw)` on one case is worth +0.1269 to +0.1393 -- within 10% over all twenty, because the `B` spread and the HAP saturation cancel | `C -20% -> +2.725`, `-22% -> +3.035`, `-25% -> +3.514` |
+| **fixed microseconds** -- a launch, a barrier, a prologue, an ABI narrowing | ranked hard by `dPts/us`, **42x spread** | 2 us off the best case = **+0.349**; the same 2 us off the worst = **+0.0084**; all 20 cases = +0.70 |
+
+**So there is no cheap subset for a relative lever -- the gap needs a uniform cut**, and a brief that
+names "the top three `dPts/us` cases" as the work target for a tiling or traffic change is pointing at
+nothing. Write **both** columns before briefing.
+
+**Quote the AGGREGATE required ratio, never the per-case median.** Those are not the same number and
+the `structure_limit` gate fires on different sides of them: `quant_matmul`'s per-case required
+speedup had **median 2.2x (range 1.04-3.09x)** while the honest aggregate requirement was **1.281x**
+-- off by 1.7x. The free cross-check: sum the per-case deficit to the target HAP and compare it to the
+gap. That sum was **8.735 points against a 2.956 gap** (the gap is 34% of it), which confirms the
+aggregate reading is the right one.
+
+### PROBE THE RING **DEPTH** BEFORE DESIGNING ANYTHING: A NULL IN BOTH DIRECTIONS MEANS WORK, NOT A STALL
+
+An ablation ladder that exposes a budget does not tell you whether that budget is a **schedulable
+stall** (reachable by pipelining, double buffering, more ring slots) or **work on the critical path**
+(reachable only by removing the work). **Changing a ring's depth constant discriminates them for one
+build each**, keeps the answer correct, and is live-provable by a distinct device `.text`.
+
+`quant_matmul` exposed **525 us of MTE1+MMAD not hidden under MTE2 (+5.50 points)** and **150 us of
+Vec epilogue (+2.08)** -- a **+8.70** perfect-overlap ceiling against a **+3.088** target, so only 44%
+recovery was needed and the target read as reachable. Two probes retired it:
+
+| probe | delta | reading |
+|---|---:|---|
+| L1 prefetch ring **4 -> 2** (halve the MTE2 lead) | **-0.088** | not latency-starved |
+| Cube->Vec workspace ring **2 -> 4** (+8 FFTS flags) | **+0.078** | not credit-starved |
+
+**Neither direction moves => no scheduling lever reaches that budget.** Run these before designing the
+restructure, not after building it.
+
+**The corroborating signature, when you have a load-floor arm: an exposure that GROWS as the thing it
+hides behind gets faster is two real copies partially overlapping, not a gap.** MTE1 was +36 us over a
+306.91 us *strided* load floor and **+81 us** over the 227.70 us *packed* floor (~57% absorption) --
+because the L1 panel is read out to L0 exactly once, so MTE1 moves the same bytes inward that MTE2
+moved in, through a shared L1 port. Cutting it needs **fewer L1->L0 re-reads, i.e. a larger L0C tile**,
+and L0C was **128K/128K** with L0B **64K/64K** -- both at cap. Verdict structural, 0 credits spent.
+
+### ENUMERATE THE LEGAL TILING LATTICE, DO NOT SAMPLE IT -- AND CHECK WHETHER THE TRAFFIC FACTOR IS EVEN YOURS TO CHOOSE
+
+The `static_assert`s in a Cube kernel define a **finite** set of legal `(NT, KT1, KT0, L1BUF)` points.
+Enumerate it in a few lines of host arithmetic, rank by traffic factor, and measure only the
+non-dominated points. `quant_matmul` has **47 legal points**; 5 were non-dominated; **the shipped point
+was the best of them**, which is a complete answer rather than a sampled one.
+
+And compute the **constrained** optimum, not the unconstrained one. GM->L1 traffic is
+`B*M*K*N*(1/MT + 1/NT)`, minimised at `2/sqrt(MT*NT)`, so with `MT*NT` pinned by the L0C capacity the
+best achievable factor was `2/sqrt(32768) = 0.01105` against a shipped **0.01172** -- **6% off, and
+pinned by L0C rather than by the tile choice.** A tiling sweep cannot recover what the accumulator
+capacity already decided. Check that before you brief a tiling campaign.
+
+### LAUNCH ARGUMENTS COST ~134 ns EACH, **PER BLOCK DISPATCH** -- SO MEASURE IT AT PRODUCTION `block_dim`
+
+Measure it with a two-arity pair of **empty** kernels (same body, `return` immediately) interleaved in
+one process. On `quant_matmul`: 26 arguments vs 10 arguments was **-2.14 us median** (range -0.90 to
+-2.86 over 17 cases) at `block_dim = 24`, and **-0.08 us (none) at `block_dim = 2`**. It is therefore
+a **per-block-dispatch** cost of ~**134 ns/arg**, not a per-launch one, and a probe taken on a small
+case at a low `block_dim` reads it as free. Priced: a realistic narrowing (11 int32 flags -> 1
+bitfield, 2 int64s derived on device, -12 args) was **+0.360**, which is a fixed-us lever and so must
+be priced by the `dPts/us` column above, not by the flat one.
+
 ### THE VENDOR'S FUSED OP IS NOT THE CEILING EITHER
 
 [[baseline-ceiling-test-not-cap-provenance]] says the board is the ceiling test. The vendor's own

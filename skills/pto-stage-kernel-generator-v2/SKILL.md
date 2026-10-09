@@ -7335,3 +7335,32 @@ extern "C" __global__ AICORE void probe(...) {
 Also: **`-dM -E` under `--cce-aicore-arch=dav-c220` reports BOTH `__DAV_VEC__` and `__DAV_CUBE__`
 from a single invocation**, so a `-dM` dump cannot be used to reason about which pass sees which
 guard. Probe guard visibility by compiling and inspecting the emitted symbols, not by dumping macros.
+
+### C142: A **RUNTIME** DISPATCH OVER TEMPLATE INSTANTIATIONS MAKES **EVERY** INSTANTIATION'S `static_assert` BINDING -- THE WIDEST ONE CAPS THE TILE FOR ALL THE OTHERS  🟡
+
+Measured on `quant_matmul`, 2026-10-09. `call_kernel` selects between `QMM_LAUNCH(16/32/64/128)` on a
+**runtime** `mt`, so all four `cube_side<MTv>` instantiations are emitted and **all four sets of
+`static_assert` must hold simultaneously**. The binding pair came from `MT=128`:
+
+```
+L0C = 128 * NT * 4 <= 128 KB       ->  NT <= 256
+L0B = 2 * KT0 * NT <= 64 KB
+```
+
+**That is why `NT` was capped at 256 for every regime, including the `M = 1` GEMV cases that would
+want a much wider N tile** -- a shape class that never reaches the `MT=128` branch was nevertheless
+paying its capacity constraint. Nothing in the source says so; the cap looks like a global tuning
+choice.
+
+**The tell, and it is cheap:** if a template parameter is chosen by a runtime value, the compile-time
+capacity envelope is the **intersection** over the whole instantiation set, not the one for the branch
+you are looking at. Resolve `#if`/`#ifndef` chains **by hand** to the values that actually compile
+before you believe any cap, and when a per-shape-class tile would help, give that class **its own
+instantiation** rather than widening a shared constant (which is C136 from the other direction).
+
+**Corroborating instance for C141.** On the same operator, `grep -rn 'QMM_'` across `CMakeLists.txt`,
+`build.sh`, `setup.py`, `cmake/` and the csrc `CMakeLists.txt` returned **one hit, and it was a
+comment** -- `register_cce_kernel_flags` is deliberately never called. **Zero `-D` hits is therefore
+NOT a clearance:** the `#ifndef` defaults inside the TU (256/256/128/4) are what compiles, and they
+have to be swept as source constants. An audit that greps the build system and reports "knob not
+wired" has measured nothing.
