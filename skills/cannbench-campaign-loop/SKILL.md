@@ -271,6 +271,49 @@ scale that case's measured noop/memory floor by its own local->remote time ratio
 projected time still sits **above** it (gcd case 15: 96.97 us projected against ~89; case 7: 13.51
 against ~13.4). A ratio that extrapolates through the memory wall is not a ratio.
 
+#### MEASURED THREE TIMES: THE HIDDEN/STANDARD RATIO RANGED **0.28x TO 4.1x**, AND "UNPRICED" ARGUES FOR SPENDING THE CREDIT
+
+Three levers, one campaign, each measured on both case sets:
+
+| lever | firing condition | standard | hidden | **ratio** |
+|---|---|---:|---:|---:|
+| `gcd` `GCD_TINY` | all magnitudes in `{0,1}` | +0.8564 | +0.2414 | **0.28x** |
+| `arnq` `safebar`+`waveceil`+`aliasmix` | `M % bd != 0`, ragged tail | +0.7156 local | **+0.8108** | **1.13x** |
+| `depthwise` `a2_perkw` | gain scales with `Kh` (1x1 **0.967x = a LOSS**, 5x5 1.046x) | +0.1092 local | **+0.4508** | **4.1x** |
+
+The ratio is not a property of the operator and not a transfer constant -- it is set by **where the
+lever's firing condition lands on the hidden set**. `GCD_TINY`'s hidden hits fell where a microsecond
+is worthless (its largest moved **710 us for +0.0059 points** at 10.7 ms). `a2_perkw` scales with
+kernel height, and the hidden 80 carries larger kernels than the visible 20, so it paid **4x more**.
+
+**To price a hidden gain:** open the PREVIOUS hidden run's per-case payload, mark the cases satisfying
+the firing condition, and price each at its own `dPts/us`. Never multiply the standard delta.
+
+**And when the condition is not evaluable from the payload, the gain is UNPRICED -- which is a reason
+to spend the credit, not to withhold it.** This is where I went wrong and had to be overridden:
+I had **withdrawn** the depthwise candidate as "below the noise floor" (+0.1092 bracketed, **0.60x its
+own spread**, with the control drifting +0.144 between brackets). Every one of those numbers was
+correct *about the standard set* -- and irrelevant, because the posted entry lives on the **hidden**
+set, where the same binary was worth **+0.4508 and a rank**. A standard-set noise analysis is evidence
+about the standard set only.
+
+**The gate that should govern instead is correctness, and it can be made near-airtight for free.**
+For a pure scheduling or layout change, prove **bit-identical output against the banked kernel** over
+a sweep of the lever's own risk axis, and show the probe has power with a **positive control**:
+
+```
+depthwise a2_perkw (moved one PIPE_V->PIPE_S drain out of the inner (kh,kw) loop):
+  BIT-IDENTICAL over 189 finite configs (12,302,784 elements) + 216 non-finite (3,067,956)
+  K in {1,2,3,4,5,6,7,9,16}, stride 1-4, padding 0-8, dilation 1-16, all 3 dtypes
+  POSITIVE CONTROL: same probe catches the known-bad a1_dropvs arm at 23/189 + 21/216
+```
+
+Bit-identical output **plus** the banked kernel already passing 80/80 **implies** the candidate passes
+80/80 for every case inside the swept envelope. That is an equivalence proof with a demonstrated
+detector behind it -- strictly stronger than "it scored higher locally", and it does not depend on
+resolving a sub-noise performance delta at all. When you have it, ship and let the board measure the
+performance.
+
 #### AND A HIDDEN GAIN CANNOT BE SCALED FROM A STANDARD GAIN -- EVEN FOR THE IDENTICAL BINARY
 
 Measured on the same gcd submission, both case sets, same device `.text`:
